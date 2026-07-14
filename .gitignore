@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.installed.cfg
+*.egg
+uv.lock
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+.ssh/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Test and analysis artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Generated agent-mesh runtime artifacts in examples
+examples/**/.agent-mesh/messages.db
+examples/**/.agent-mesh/messages.db-shm
+examples/**/.agent-mesh/messages.db-wal
+examples/**/.agent-mesh/views/
+examples/**/.agent-mesh/archive/
+examples/**/.agent-mesh/.mail-lock/
+examples/**/.agent-mesh/.mail-lock.fd
+examples/**/.agent-mesh/.events-journal-*
+
+# Keep events.jsonl tracked everywhere
+!**/.agent-mesh/events.jsonl
+!**/.agent-mesh/bodies/
+!**/.agent-mesh/bodies/**

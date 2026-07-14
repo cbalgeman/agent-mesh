@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-mesh"
+version = "0.2.0"
+description = "Durable, append-only message substrate for multi-agent collaboration"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "agent-mesh contributors" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    # Stdlib-only by design for core. Optional integrations can wrap the CLI.
+]
+
+[project.scripts]
+agent-mesh = "agent_mesh.cli.mail:main"
+agent-q = "agent_mesh.cli.q:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
