@@ -21,7 +21,7 @@ This is the complete message a human should need to send to another human:
 
 ```text
 Give your agent the Agent Mesh repo and your target repo. Ask your agent to read
-the README and adoption docs. Your agent will walk you through the rest.
+the README, adoption, and privacy docs. Your agent will walk you through the rest.
 ```
 
 Do not push CLI details, config tables, migration mechanics, or workflow policy
@@ -34,8 +34,8 @@ If the human gives you only the repository path or URL, treat this as the task:
 
 ```text
 Add agent-mesh to my target repository. Use the agent-mesh repo I gave you as
-the implementation source. Read its README, adoption, configuration, and
-migration docs, inspect my target repo, summarize the setup decisions I need to
+the implementation source. Read its README, adoption, configuration, privacy,
+and migration docs, inspect my target repo, summarize the setup decisions I need to
 make, and ask me only for missing choices. Wait for my response, record my
 durable approved choices in the Agent Mesh decision log, then implement the
 approved setup, run verification, create a smoke-test request, start the
@@ -51,6 +51,7 @@ repo:
 - `README.md`
 - `docs/adoption.md`
 - `docs/configuration.md`
+- `docs/privacy.md`
 - `docs/migration.md`
 
 Use `docs/migration.md` when the target repository already has coordination
@@ -73,6 +74,7 @@ generated compatibility views.
    - optional aliases such as `reviewers` or `all`;
    - whether this is fresh setup or a migration from an existing workflow;
    - whether compatibility views are needed;
+   - whether Agent Mesh state stays `local-only` or is explicitly `git-shared`;
    - whether to add `CLAUDE.md` / `AGENTS.md` workflow instructions;
    - whether to suggest hooks or install agent skills.
 6. Ask the human only for choices that cannot be inferred; then wait for the human's response before implementing the setup.
@@ -116,7 +118,7 @@ agent-mesh decision propose \
   --title "Agent Mesh project setup" \
   --tier note \
   --context "The human reviewed the onboarding choices." \
-  --decision "Use human and agent as participants; use agent as the default recipient."
+  --decision "Use human and agent as participants; use agent as the default recipient; keep Agent Mesh state local-only."
 agent-mesh decision accept D001 \
   --by human \
   --notes "Confirmed by the human during Agent Mesh onboarding."
@@ -141,7 +143,8 @@ Basic human plus one agent:
 agent-mesh init \
   --participants human,agent \
   --default-sender human \
-  --default-recipient agent
+  --default-recipient agent \
+  --state-sharing local-only
 ```
 
 Claude primary plus Codex reviewer:
@@ -150,12 +153,19 @@ Claude primary plus Codex reviewer:
 agent-mesh init \
   --participants human,claude,codex \
   --default-sender human \
-  --default-recipient claude
+  --default-recipient claude \
+  --state-sharing local-only
 ```
 
 For a personal setup, replace `human` with the user's preferred local identity.
 If the human wants Claude to orchestrate and Codex to review, keep Claude as
 `default_recipient` and add Codex as a participant or alias target.
+
+State sharing is a separate approval choice. Recommend `local-only` unless the
+human explicitly wants the canonical coordination history in Git and confirms
+that every repository reader may see it. For that case only, initialize with
+`--state-sharing git-shared`. Git-shared mode allowlists config, events, and
+externalized bodies; attachments and generated runtime state remain local.
 
 ## Fresh Setup Commands
 
@@ -167,7 +177,8 @@ python3 -m pip install -e /path/to/agent-mesh
 agent-mesh init \
   --participants human,agent \
   --default-sender human \
-  --default-recipient agent
+  --default-recipient agent \
+  --state-sharing local-only
 agent-q status
 agent-q verify-chain .agent-mesh/events.jsonl
 agent-mesh projects list
@@ -329,6 +340,8 @@ agent-q decisions list
 Stop and ask the human before proceeding when:
 
 - participant names or default sender identity are unclear;
+- Git-shared state is requested without confirmation that repository readers may
+  see the coordination history;
 - an existing coordination system has more than one plausible source of truth;
 - a migration would overwrite live files;
 - chain verification fails;

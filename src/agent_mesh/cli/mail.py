@@ -18,6 +18,8 @@ import tempfile
 from agent_mesh.config import (
     AgentMeshConfig,
     ConfigError,
+    STATE_SHARING_CHOICES,
+    STATE_SHARING_LOCAL_ONLY,
     default_config_text,
     ensure_project_dirs,
     load_config,
@@ -99,6 +101,15 @@ def _build_parser() -> argparse.ArgumentParser:
     init.add_argument("--participants", default="user,agent")
     init.add_argument("--default-recipient")
     init.add_argument("--default-sender")
+    init.add_argument(
+        "--state-sharing",
+        choices=STATE_SHARING_CHOICES,
+        default=None,
+        help=(
+            "Git policy for .agent-mesh state; new projects default to local-only, "
+            "and git-shared must be selected explicitly"
+        ),
+    )
     init.add_argument(
         "--no-register",
         action="store_true",
@@ -309,15 +320,25 @@ def cmd_init(args: argparse.Namespace) -> int:
                 participants=participants,
                 default_sender=default_sender,
                 default_recipient=args.default_recipient or (participants[0] if participants else "codex"),
+                state_sharing=args.state_sharing or STATE_SHARING_LOCAL_ONLY,
             ),
             encoding="utf-8",
         )
     config = load_config(root)
+    if args.state_sharing is not None and args.state_sharing != config.state_sharing:
+        raise ConfigError(
+            "--state-sharing does not rewrite an existing config; edit "
+            "[version_control].state_sharing in .agent-mesh/config.toml, then rerun init"
+        )
     ensure_project_dirs(config)
     write_agent_dir_gitignore(config)
     rebuild_all(config)
     render_all(config)
     print(f"initialized agent-mesh project at {agent_dir}")
+    if config.state_sharing == STATE_SHARING_LOCAL_ONLY:
+        print("state sharing: local-only (all .agent-mesh paths are ignored by Git)")
+    else:
+        print("state sharing: git-shared (canonical config, events, and bodies may be tracked)")
     if not args.no_register:
         project = register_project(root)
         print(f"registered Workbench repo {project.id} at {registry_path()}")

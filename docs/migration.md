@@ -54,9 +54,16 @@ Work in a temporary copy or a feature branch first:
 cd ~/your-project
 agent-mesh init --participants human,builder,reviewer \
   --default-sender human \
-  --default-recipient builder
+  --default-recipient builder \
+  --state-sharing local-only
 agent-q verify-chain .agent-mesh/events.jsonl
 ```
+
+Keep the shadow mesh `local-only` unless the project owner explicitly approves
+sharing canonical coordination history through Git. Older Agent Mesh configs
+without `[version_control].state_sharing` retain the former Git-shared behavior;
+review and migrate that setting before assuming an existing mesh is private. See
+`docs/privacy.md` before committing migration output.
 
 If existing users expect markdown files, configure compatibility views to shadow
 paths rather than live paths:

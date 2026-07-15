@@ -4,6 +4,26 @@ This page documents project-local `.agent-mesh/config.toml` changes. `agent-mesh
 configuration is intentionally repo-scoped: package defaults stay generic, and each
 consumer project decides which humans/agents, aliases, and compatibility views it wants.
 
+## Choose whether Agent Mesh state is shared through Git
+
+New projects record this privacy-first default:
+
+```toml
+[version_control]
+state_sharing = "local-only"
+```
+
+`local-only` keeps every `.agent-mesh/` path out of a normal Git add. The
+alternative, `git-shared`, must be selected explicitly and exposes only the
+canonical config, event log, and externalized bodies through a deny-by-default
+allowlist. It never allows attachments, databases, Workbench bookmarks, or
+unknown future files.
+
+Treat this as a durable onboarding decision. Git-shared state is appropriate only
+when everyone with repository access is allowed to read the coordination history.
+See `docs/privacy.md` for upgrade behavior, removal of already tracked state, and
+the pre-publication checklist.
+
 ## Choose the project identity used in IDs
 
 `[project].default_sender` is the identity used when `agent-mesh request`,
@@ -54,6 +74,9 @@ participants = ["human", "builder", "reviewer", "observer"]
 [features]
 hash_chain = true
 body_externalization = false
+
+[version_control]
+state_sharing = "local-only"
 
 [paths]
 events_log = ".agent-mesh/events.jsonl"

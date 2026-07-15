@@ -10,6 +10,9 @@ from typing import Any
 
 
 DEFAULT_CONFIG_NAME = "config.toml"
+STATE_SHARING_LOCAL_ONLY = "local-only"
+STATE_SHARING_GIT_SHARED = "git-shared"
+STATE_SHARING_CHOICES = (STATE_SHARING_LOCAL_ONLY, STATE_SHARING_GIT_SHARED)
 
 
 class ConfigError(RuntimeError):
@@ -76,6 +79,7 @@ class AgentMeshConfig:
     default_sender: str = "human"
     default_recipient: str = "agent"
     body_externalization: bool = False
+    state_sharing: str = STATE_SHARING_LOCAL_ONLY
     paths: ProjectPaths = field(default_factory=ProjectPaths)
     compatibility_views: CompatibilityViews = field(default_factory=CompatibilityViews)
     routing: RoutingConfig = field(default_factory=RoutingConfig)
@@ -146,6 +150,7 @@ def load_config(start: str | Path | None = None) -> AgentMeshConfig:
     agents_data = _table(data.get("agents", {}), "agents")
     features_data = _table(data.get("features", {}), "features")
     paths_data = _table(data.get("paths", {}), "paths")
+    version_control_data = _table(data.get("version_control", {}), "version_control")
 
     project_name = str(project_data.get("name", root.name))
     participants = _list_of_strings(
@@ -161,6 +166,12 @@ def load_config(start: str | Path | None = None) -> AgentMeshConfig:
     )
     body_externalization = bool(
         features_data.get("body_externalization", data.get("body_externalization", False))
+    )
+    # Configs created before state sharing was explicit used the Git-shared policy.
+    # Preserve that behavior so an upgrade never creates a false local-only signal.
+    state_sharing = _state_sharing(
+        version_control_data.get("state_sharing", STATE_SHARING_GIT_SHARED),
+        "version_control.state_sharing",
     )
     paths = ProjectPaths(
         events_log=_config_path(paths_data.get("events_log", ".agent-mesh/events.jsonl"), "paths.events_log"),
@@ -256,6 +267,7 @@ def load_config(start: str | Path | None = None) -> AgentMeshConfig:
         default_sender=default_sender,
         default_recipient=default_recipient,
         body_externalization=body_externalization,
+        state_sharing=state_sharing,
         paths=paths,
         compatibility_views=compat,
         routing=routing,
@@ -270,10 +282,12 @@ def default_config_text(
     participants: list[str] | None = None,
     default_sender: str = "human",
     default_recipient: str | None = None,
+    state_sharing: str = STATE_SHARING_LOCAL_ONLY,
 ) -> str:
     people = participants or ["user", "agent"]
     recipient = default_recipient or ("agent" if "agent" in people else people[0])
     participants_json = json.dumps(people)
+    sharing = _state_sharing(state_sharing, "version_control.state_sharing")
     return (
         "schema_version = 1\n"
         "\n"
@@ -288,6 +302,9 @@ def default_config_text(
         "[features]\n"
         "hash_chain = true\n"
         "body_externalization = false\n"
+        "\n"
+        "[version_control]\n"
+        f"state_sharing = {json.dumps(sharing)}\n"
         "\n"
         "[paths]\n"
         "events_log = \".agent-mesh/events.jsonl\"\n"
@@ -325,26 +342,25 @@ def default_config_text(
     )
 
 
-AGENT_DIR_GITIGNORE_TEXT = """# Generated agent-mesh runtime artifacts
-messages.db
-messages.db-shm
-messages.db-wal
-workbench.html
-attachments/
-views/
-archive/
-.mail-lock/
-.mail-lock.fd
-.events-journal-*
-events.jsonl.partial-*
+LOCAL_ONLY_AGENT_DIR_GITIGNORE_TEXT = """# Privacy default: keep all Agent Mesh state local.
+# This pattern also ignores this generated policy file, so no .agent-mesh path is
+# selected by a normal `git add -A`.
+*
+"""
 
-# Canonical tracked state
-!config.toml
+
+GIT_SHARED_AGENT_DIR_GITIGNORE_TEXT = """# Explicit Git-shared mode: deny by default, then allow canonical state only.
+*
 !.gitignore
+!config.toml
 !events.jsonl
 !bodies/
 !bodies/**
 """
+
+
+# Backward-compatible import name; the package default is privacy-first.
+AGENT_DIR_GITIGNORE_TEXT = LOCAL_ONLY_AGENT_DIR_GITIGNORE_TEXT
 
 
 def ensure_project_dirs(config: AgentMeshConfig) -> None:
@@ -357,8 +373,16 @@ def ensure_project_dirs(config: AgentMeshConfig) -> None:
 
 def write_agent_dir_gitignore(config: AgentMeshConfig) -> None:
     target = config.agent_dir / ".gitignore"
-    if not target.exists() or target.read_text(encoding="utf-8") != AGENT_DIR_GITIGNORE_TEXT:
-        target.write_text(AGENT_DIR_GITIGNORE_TEXT, encoding="utf-8")
+    text = agent_dir_gitignore_text(config.state_sharing)
+    if not target.exists() or target.read_text(encoding="utf-8") != text:
+        target.write_text(text, encoding="utf-8")
+
+
+def agent_dir_gitignore_text(state_sharing: str) -> str:
+    sharing = _state_sharing(state_sharing, "version_control.state_sharing")
+    if sharing == STATE_SHARING_LOCAL_ONLY:
+        return LOCAL_ONLY_AGENT_DIR_GITIGNORE_TEXT
+    return GIT_SHARED_AGENT_DIR_GITIGNORE_TEXT
 
 
 def config_from_agent_dir(agent_dir: str | Path) -> AgentMeshConfig:
@@ -426,6 +450,13 @@ def _dict_of_strings(value: Any, name: str) -> dict[str, str]:
     ):
         raise ConfigError(f"{name} must be a table of string values")
     return dict(value)
+
+
+def _state_sharing(value: Any, name: str) -> str:
+    if not isinstance(value, str) or value not in STATE_SHARING_CHOICES:
+        choices = ", ".join(repr(choice) for choice in STATE_SHARING_CHOICES)
+        raise ConfigError(f"{name} must be one of: {choices}")
+    return value
 
 
 def _adapter_declarations(value: Any) -> dict[str, AdapterDeclaration]:

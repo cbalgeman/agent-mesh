@@ -38,9 +38,18 @@ use the agent-mesh handoff substrate.
 - Run `agent-q status` and targeted `agent-q list/locate/body` before
   responding.
 - Read `.agent-mesh/config.toml` to learn participants, routing defaults,
-  response_mode, and compatibility view paths before writing.
+  response_mode, state sharing, and compatibility view paths before writing.
 - For code changes, run decision/quality preflight once those event domains
   are available.
+
+## Privacy and Git
+- Treat `.agent-mesh/` as project data. Never force-add ignored Agent Mesh
+  files.
+- `state_sharing = "local-only"` means no `.agent-mesh/` path belongs in Git.
+- `state_sharing = "git-shared"` is an explicit opt-in for canonical config,
+  events, and externalized bodies only. Attachments and runtime state stay local.
+- Before changing the mode or publishing a repo, follow `docs/privacy.md` and
+  confirm repository readers may see the coordination history.
 
 ## Write
 - Use `agent-mesh request/respond/resolve/reopen`.
@@ -100,6 +109,7 @@ Write side (append-only events):
 References (read these for full contract, do not paraphrase from memory):
   README.md
   docs/configuration.md
+  docs/privacy.md
 """
 
 

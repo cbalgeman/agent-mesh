@@ -27,7 +27,7 @@ instruction should stay simple:
 
 ```text
 Give your agent the Agent Mesh repo and your target repo. Ask your agent to read
-the README and adoption docs. Your agent will walk you through the rest.
+the README, adoption, and privacy docs. Your agent will walk you through the rest.
 ```
 
 The rest of the setup is agent-facing. Agents should read `docs/adoption.md`
@@ -35,7 +35,9 @@ before initializing a target repository, summarize the setup decisions that need
 human input, and wait for the human's response. After the human responds, record
 the durable approved choices in the Agent Mesh decision log, accept them on the
 human's behalf, then implement and verify the setup. The human can review those
-records in the Workbench's Decisions tab.
+records in the Workbench's Decisions tab. New projects keep all `.agent-mesh/` state
+local by default; sharing canonical state through Git is a separate explicit
+onboarding choice.
 
 ## Manual Quickstart
 
@@ -48,6 +50,12 @@ agent-q list --status open
 agent-q packet --id <REQ-id>
 agent-mesh workbench --repo .
 ```
+
+The quickstart uses the privacy-first `local-only` default. It causes a normal
+`git add -A` to select no `.agent-mesh/` path. Use
+`--state-sharing git-shared` only after approving Git access to the canonical
+config, event log, and externalized bodies. See `docs/privacy.md` before sharing
+a repository or changing this setting.
 
 `agent-q packet` returns bounded, thread-scoped JSON for grounding an agent on a
 request or response. `agent-mesh workbench` starts a small local UI and writes a
@@ -65,6 +73,7 @@ private (`0600`) and ignored by Git.
 ## Configuration
 
 Project-local configuration lives in `.agent-mesh/config.toml`. See `docs/configuration.md` for the supported config surface, including how to add a new agent/participant to an existing project without rewriting historical events.
+Privacy and Git-tracking behavior are documented in `docs/privacy.md`.
 
 ## Agent-Driven Adoption
 
