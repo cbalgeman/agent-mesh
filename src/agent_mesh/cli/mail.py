@@ -269,12 +269,26 @@ def _build_parser() -> argparse.ArgumentParser:
     workbench = sub.add_parser(
         "workbench",
         help="run a small local agent-mesh workbench",
-        description="run a small local agent-mesh workbench",
+        description=(
+            "run a small local agent-mesh workbench or manage its automatic per-user service"
+        ),
+    )
+    workbench.add_argument("workbench_mode", nargs="?", choices=("service",))
+    workbench.add_argument(
+        "service_action",
+        nargs="?",
+        choices=("install", "status", "start", "restart", "uninstall"),
     )
     workbench.add_argument("--repo", type=Path, default=Path("."))
     workbench.add_argument("--host", default="127.0.0.1")
-    workbench.add_argument("--port", type=int, default=8765)
+    workbench.add_argument(
+        "--port",
+        type=int,
+        help="loopback port (default: 8765 manual, 8767 automatic service)",
+    )
     workbench.add_argument("--open", action="store_true", help="open the workbench in a browser")
+    workbench.add_argument("--managed-service", action="store_true", help=argparse.SUPPRESS)
+    workbench.add_argument("--config-home", type=Path, help=argparse.SUPPRESS)
     workbench.set_defaults(func=cmd_workbench)
 
     skill = sub.add_parser("skill", help="render or install the agent-mesh skill")
@@ -567,19 +581,148 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_workbench(args: argparse.Namespace) -> int:
-    from agent_mesh.workbench import WorkbenchError, serve_workbench
+    from agent_mesh.workbench import WorkbenchError, _validate_workbench_host, serve_workbench
+
+    if args.workbench_mode == "service":
+        return _cmd_workbench_service(args)
+    if args.service_action is not None:
+        print("agent-mesh: Workbench service action requires 'workbench service'", file=sys.stderr)
+        return 2
+    if args.managed_service:
+        os.environ["AGENT_MESH_WORKBENCH_SERVICE"] = "1"
+        if args.config_home is not None:
+            os.environ["AGENT_MESH_CONFIG_HOME"] = str(args.config_home.expanduser().resolve())
+
+    repo = args.repo
+    port = args.port if args.port is not None else 8765
+    if args.managed_service:
+        try:
+            load_config(repo)
+        except ConfigError:
+            projects = list_registered_projects()
+            if not projects:
+                raise
+            repo = projects[0].root
 
     try:
+        _validate_workbench_host(args.host)
         serve_workbench(
-            repo=args.repo,
+            repo=repo,
             host=args.host,
-            port=args.port,
+            port=port,
             open_browser=args.open,
         )
     except WorkbenchError as exc:
         print(f"agent-mesh: {exc}", file=sys.stderr)
         return 2
     return 0
+
+
+def _cmd_workbench_service(args: argparse.Namespace) -> int:
+    import webbrowser
+
+    from agent_mesh.workbench import (
+        WorkbenchError,
+        _validate_workbench_host,
+        managed_workbench_bookmark_path,
+    )
+    from agent_mesh.workbench_service import (
+        WorkbenchServiceError,
+        install_workbench_service,
+        make_service_spec,
+        restart_workbench_service,
+        start_workbench_service,
+        uninstall_workbench_service,
+        wait_for_managed_workbench,
+        workbench_service_status,
+    )
+
+    action = args.service_action
+    if action is None:
+        print(
+            "agent-mesh: choose a Workbench service action: "
+            "install, status, start, restart, or uninstall",
+            file=sys.stderr,
+        )
+        return 2
+
+    bookmark_path: Path | None = None
+    try:
+        if action == "install":
+            _validate_workbench_host(args.host)
+            config = load_config(args.repo)
+            register_project(config.project_root)
+            spec = make_service_spec(
+                repo=config.project_root,
+                host=args.host,
+                port=args.port if args.port is not None else 8767,
+            )
+            status = install_workbench_service(spec)
+            bookmark_path = managed_workbench_bookmark_path(spec.config_home)
+        elif action == "status":
+            status = workbench_service_status()
+        elif action == "start":
+            status = start_workbench_service()
+        elif action == "restart":
+            status = restart_workbench_service()
+        else:
+            status = uninstall_workbench_service()
+    except (ConfigError, ProjectRegistryError, WorkbenchServiceError, WorkbenchError) as exc:
+        print(f"agent-mesh: {exc}", file=sys.stderr)
+        return 2
+
+    _print_workbench_service_status(status)
+    if action in {"install", "start", "restart"}:
+        if bookmark_path is None:
+            bookmark_path = _service_bookmark_path(status, managed_workbench_bookmark_path)
+        if bookmark_path is not None:
+            if not wait_for_managed_workbench(bookmark_path):
+                print(
+                    "agent-mesh: the automatic Workbench service was registered but did not "
+                    "become reachable within 10 seconds; check service status and logs",
+                    file=sys.stderr,
+                )
+                return 2
+            print(f"bookmark: {bookmark_path}")
+            if args.open:
+                webbrowser.open(bookmark_path.resolve().as_uri())
+        elif args.open:
+            print(
+                "agent-mesh: the service is registered, but its project bookmark could not "
+                "be resolved from local metadata",
+                file=sys.stderr,
+            )
+            return 2
+    return 0
+
+
+def _service_bookmark_path(status: Any, resolver: Any) -> Path | None:
+    if not status.metadata:
+        return None
+    raw_config_home = status.metadata.get("config_home")
+    if not isinstance(raw_config_home, str) or not raw_config_home:
+        return None
+    try:
+        return resolver(Path(raw_config_home))
+    except OSError:
+        return None
+
+
+def _print_workbench_service_status(status: Any) -> None:
+    if not status.installed:
+        summary = "not installed"
+    elif status.running is True:
+        summary = "running"
+    elif status.running is False:
+        summary = status.state
+    else:
+        summary = status.state
+    print(f"workbench service: {summary}")
+    print(f"platform: {status.platform}")
+    print(f"definition: {status.definition}")
+    if status.metadata:
+        print(f"repo: {status.metadata.get('repo', '')}")
+        print(f"url: http://{status.metadata.get('host', '')}:{status.metadata.get('port', '')}")
 
 
 def cmd_decision_propose(args: argparse.Namespace) -> int:

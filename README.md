@@ -57,18 +57,43 @@ The quickstart uses the privacy-first `local-only` default. It causes a normal
 config, event log, and externalized bodies. See `docs/privacy.md` before sharing
 a repository or changing this setting.
 
+## Automatic Workbench
+
+The recommended adoption flow installs one automatic Workbench service for the
+current user:
+
+```bash
+agent-mesh workbench service install --repo . --open
+```
+
+The command is idempotent and uses `launchd` on macOS, `systemd --user` on Linux,
+or Task Scheduler on Windows. The service starts at sign-in and restarts after a
+failure. It serves every valid repo in the machine-local Workbench registry, so
+adopting another project does not create another background process. After an
+agent installs it, the human can use the stable machine-local bookmark printed
+by the command without opening a terminal. Reinstalling from another project or
+restarting the service refreshes that same bookmark. Use
+`agent-mesh workbench service status`, `start`, `restart`, or `uninstall` for
+lifecycle management. The manual
+`agent-mesh workbench --repo .` command remains the fallback when the native user
+supervisor is unavailable.
+
 `agent-q packet` returns bounded, thread-scoped JSON for grounding an agent on a
 request or response. `agent-mesh workbench` starts a small local UI and writes a
 bookmarkable `.agent-mesh/workbench.html` file for the project. `agent-mesh init`
 automatically registers the repo in the machine-local Workbench registry. The
 repository selector can switch among registered repos, and the server resolves
 its opaque repo ID before feedback, request-status, backlog, attachment, or
-decision operations. The bookmark is static, so keep the local server running for live reads and writes; its connection
-banner reports whether Submit is available. Feedback submits use retry-safe receipts so an uncertain retry returns the original REQ instead of creating a
-duplicate. A per-server access token and restricted browser origins protect the
-local mutation APIs automatically. The server is loopback-only, the HTTP launch
-URL carries its token only in a URL fragment, and the token-bearing bookmark is
-private (`0600`) and ignored by Git.
+decision operations. The bookmark is static, while live reads and writes require
+the loopback server. With the automatic service, native supervision and the
+page's reconnect loop keep that server available; the browser never executes a
+shell command. Feedback submits use retry-safe receipts so an uncertain retry
+returns the original REQ instead of creating a duplicate. A per-server access
+token and restricted browser origins protect the local mutation APIs
+automatically. The server is loopback-only, the HTTP launch URL carries its token
+only in a URL fragment, and the managed token-bearing bookmark is private (`0600`
+on macOS/Linux) and stored outside project repositories. Manual project bookmarks
+remain ignored by Git.
 
 ## Configuration
 

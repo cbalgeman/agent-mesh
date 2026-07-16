@@ -30,6 +30,7 @@ from agent_mesh.project_registry import (
     list_registered_projects,
     project_id,
     register_project,
+    registry_dir,
     resolve_registered_project,
     validate_registered_project_path,
 )
@@ -81,6 +82,7 @@ class WorkbenchContext:
     bookmark_path: Path
     default_repo_id: str = ""
     access_token: str = ""
+    managed_service: bool = False
 
 
 def serve_workbench(
@@ -95,12 +97,18 @@ def serve_workbench(
     config = load_config(repo)
     registered = register_project(config.project_root)
     url = f"http://{host}:{port}"
+    managed_service = os.environ.get("AGENT_MESH_WORKBENCH_SERVICE") == "1"
     context = WorkbenchContext(
         server_url=url,
         start_command=workbench_start_command(config, host=host, port=port),
-        bookmark_path=workbench_bookmark_path(config),
+        bookmark_path=(
+            managed_workbench_bookmark_path()
+            if managed_service
+            else workbench_bookmark_path(config)
+        ),
         default_repo_id=registered.id,
         access_token=secrets.token_urlsafe(32),
+        managed_service=managed_service,
     )
     handler = _handler_for(config.project_root, context)
     server = ThreadingHTTPServer((host, port), handler)
@@ -111,7 +119,7 @@ def serve_workbench(
         server.server_close()
         raise
     launch_url = workbench_launch_url(context)
-    print(f"agent-mesh workbench: {launch_url}")
+    print(f"agent-mesh workbench: {workbench_console_url(context)}")
     print(f"bookmark: file://{context.bookmark_path}")
     print(f"repo: {config.project_root}")
     if open_browser:
@@ -920,6 +928,13 @@ def workbench_bookmark_path(config: AgentMeshConfig) -> Path:
     return config.agent_dir / "workbench.html"
 
 
+def managed_workbench_bookmark_path(config_home: Path | None = None) -> Path:
+    """Return the stable machine-local bookmark for the per-user service."""
+
+    root = (config_home or registry_dir()).expanduser().resolve()
+    return root / "workbench.html"
+
+
 def workbench_start_command(config: AgentMeshConfig, *, host: str, port: int) -> str:
     return (
         f"agent-mesh workbench --repo {shlex.quote(str(config.project_root))} "
@@ -930,6 +945,14 @@ def workbench_start_command(config: AgentMeshConfig, *, host: str, port: int) ->
 def workbench_launch_url(context: WorkbenchContext) -> str:
     """Return an HTTP launch URL without sending the token to the server."""
     return f"{context.server_url}/#token={quote(context.access_token, safe='')}"
+
+
+def workbench_console_url(context: WorkbenchContext) -> str:
+    """Return a log-safe URL while keeping manual launch output convenient."""
+
+    if context.managed_service:
+        return context.server_url
+    return workbench_launch_url(context)
 
 
 def _validate_workbench_host(host: str) -> None:
@@ -955,6 +978,7 @@ def write_bookmark_file(config: AgentMeshConfig, context: WorkbenchContext) -> P
         bookmark_path=context.bookmark_path,
         default_repo_id=context.default_repo_id or project_id(config.project_root),
         access_token=context.access_token,
+        managed_service=context.managed_service,
     )
     context.bookmark_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(
@@ -964,13 +988,15 @@ def write_bookmark_file(config: AgentMeshConfig, context: WorkbenchContext) -> P
     )
     temporary_path = Path(temporary_name)
     try:
-        os.fchmod(fd, 0o600)
+        if os.name != "nt" and hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, context.bookmark_path)
-        context.bookmark_path.chmod(0o600)
+        if os.name != "nt":
+            context.bookmark_path.chmod(0o600)
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
@@ -985,6 +1011,7 @@ def render_server_workbench_html(context: WorkbenchContext) -> str:
         bookmark_path=context.bookmark_path,
         default_repo_id=context.default_repo_id,
         access_token="",
+        managed_service=context.managed_service,
     )
 
 
@@ -1004,6 +1031,7 @@ def render_workbench_html(
     bookmark_path: Path | None = None,
     default_repo_id: str = "",
     access_token: str = "",
+    managed_service: bool = False,
 ) -> str:
     bookmark_url = bookmark_path.resolve().as_uri() if bookmark_path else ""
     return (
@@ -1013,6 +1041,7 @@ def render_workbench_html(
         .replace("__AGENT_MESH_BOOKMARK_PATH__", escape(str(bookmark_path or "")))
         .replace("__AGENT_MESH_DEFAULT_REPO_ID__", json.dumps(default_repo_id))
         .replace("__AGENT_MESH_ACCESS_TOKEN__", json.dumps(access_token))
+        .replace("__AGENT_MESH_MANAGED_SERVICE__", json.dumps(managed_service))
         .replace("__AGENT_MESH_MAX_ATTACHMENT_BYTES__", str(MAX_ATTACHMENT_BYTES))
         .replace(
             "__AGENT_MESH_MAX_ATTACHMENT_TOTAL_BYTES__",
@@ -1120,7 +1149,14 @@ def _handler_for(repo: Path, context: WorkbenchContext) -> type[BaseHTTPRequestH
                 if parsed.path.startswith("/api/") and not self._authorized():
                     return
                 if parsed.path == "/api/health":
-                    self._json(HTTPStatus.OK, {"ok": True, "server": "online"})
+                    self._json(
+                        HTTPStatus.OK,
+                        {
+                            "ok": True,
+                            "server": "online",
+                            "managed_service": context.managed_service,
+                        },
+                    )
                     return
                 if parsed.path == "/api/projects":
                     projects = list_registered_projects()
@@ -2139,7 +2175,7 @@ WORKBENCH_HTML = """<!doctype html>
 	        <span>All feedback, status changes, backlog updates, and decision reads are scoped to this repository.</span>
 	      </label>
 	    </div>
-	    <div class="command-box">
+	    <div class="command-box" id="manual-launch-panel">
       <div class="command-line">
         <span class="muted">Start / restart</span>
         <code id="start-command">__AGENT_MESH_START_COMMAND__</code>
@@ -2151,6 +2187,19 @@ WORKBENCH_HTML = """<!doctype html>
         <code id="bookmark-path">__AGENT_MESH_BOOKMARK_PATH__</code>
         <a id="bookmark-link" href="__AGENT_MESH_BOOKMARK_URL__">Open bookmark file</a>
 	      </div>
+	    </div>
+	    <div class="command-box" id="managed-launch-panel" hidden>
+      <div class="command-line">
+        <span class="muted">Automatic startup</span>
+        <strong>Enabled for this user</strong>
+        <button type="button" class="ghost" id="recheck-server">Reconnect</button>
+        <span id="recheck-server-status" class="copy-status" role="status" aria-live="polite"></span>
+      </div>
+      <div class="command-line">
+        <span class="muted">Bookmark</span>
+        <code id="managed-bookmark-path">__AGENT_MESH_BOOKMARK_PATH__</code>
+        <a id="managed-bookmark-link" href="__AGENT_MESH_BOOKMARK_URL__">Open bookmark file</a>
+      </div>
 	    </div>
 	    <div id="server-connection" class="connection checking" role="status" aria-live="polite">Checking Workbench server...</div>
 	    <div id="status" class="status"><span class="badge">loading</span></div>
@@ -2388,6 +2437,7 @@ WORKBENCH_HTML = """<!doctype html>
 const API_BASE = __AGENT_MESH_API_BASE__;
 const DEFAULT_REPO_ID = __AGENT_MESH_DEFAULT_REPO_ID__;
 const EMBEDDED_API_TOKEN = __AGENT_MESH_ACCESS_TOKEN__;
+const MANAGED_SERVICE = __AGENT_MESH_MANAGED_SERVICE__;
 const FRAGMENT_TOKEN = new URLSearchParams(window.location.hash.slice(1)).get('token') || '';
 const API_TOKEN = EMBEDDED_API_TOKEN || FRAGMENT_TOKEN;
 if (FRAGMENT_TOKEN) history.replaceState(null, '', window.location.pathname + window.location.search);
@@ -2431,7 +2481,9 @@ function setServerConnection(state, detail = '') {
   indicator.textContent = online
     ? 'Server online - submit and live data are available.'
     : state === 'offline'
-      ? `Server offline - start or restart the command above. ${detail}`.trim()
+      ? MANAGED_SERVICE
+        ? `Server reconnecting - the automatic service will restart it. ${detail}`.trim()
+        : `Server offline - start or restart the command above. ${detail}`.trim()
       : 'Checking Workbench server...';
   document.querySelectorAll('[data-requires-server]').forEach((button) => {
     button.disabled = !online || (button.id === 'repo-selector' && !projectRegistryLoaded);
@@ -3126,6 +3178,26 @@ async function copyStartCommand() {
   }, 2200);
 }
 
+async function recheckServer() {
+  const status = $('recheck-server-status');
+  status.classList.remove('error');
+  status.textContent = 'Checking...';
+  await checkServerConnection();
+  const online = $('server-connection').classList.contains('online');
+  if (!online && MANAGED_SERVICE) {
+    status.textContent = 'Loading the latest private bookmark...';
+    window.location.replace($('managed-bookmark-link').href);
+    return;
+  }
+  status.classList.toggle('error', !online);
+  status.textContent = online ? 'Connected' : 'Still reconnecting';
+}
+
+function configureLaunchPanel() {
+  $('manual-launch-panel').hidden = MANAGED_SERVICE;
+  $('managed-launch-panel').hidden = !MANAGED_SERVICE;
+}
+
 function switchTab(tab) {
   document.querySelectorAll('.tab-button').forEach((button) => {
     button.classList.toggle('active', button.getAttribute('data-tab') === tab);
@@ -3359,6 +3431,12 @@ $('decision-body').addEventListener('click', (event) => {
 });
 $('reload-kanban').addEventListener('click', () => loadKanban().catch(console.error));
 $('copy-start-command').addEventListener('click', copyStartCommand);
+$('recheck-server').addEventListener('click', () => {
+  recheckServer().catch((error) => {
+    $('recheck-server-status').classList.add('error');
+    $('recheck-server-status').textContent = error.message || String(error);
+  });
+});
 $('repo-selector').addEventListener('change', (event) => {
   switchRepo(event.target.value).catch((error) => {
     $('status').innerHTML = `<span class="badge">repo switch error ${escapeHtml(error.message)}</span>`;
@@ -3447,6 +3525,7 @@ $('kanban').addEventListener('drop', (event) => {
   });
 });
 
+configureLaunchPanel();
 setServerConnection('checking');
 restoreFeedbackDraft();
 checkServerConnection();

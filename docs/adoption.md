@@ -39,8 +39,8 @@ and migration docs, inspect my target repo, summarize the setup decisions I need
 make, and ask me only for missing choices. Wait for my response, record my
 durable approved choices in the Agent Mesh decision log, then implement the
 approved setup, run verification, create a smoke-test request, start the
-Workbench, and give me the Workbench file path and restart command. Show me where
-to review my recorded choices in the Workbench's Decisions tab.
+Workbench as an automatic per-user service, and give me the Workbench bookmark.
+Show me where to review my recorded choices in the Workbench's Decisions tab.
 ```
 
 ## Required Source Reading
@@ -93,8 +93,10 @@ generated compatibility views.
 12. Implement the rest of the approved integration, rebuild derived state, and
     verify the event chain.
 13. Send a smoke-test request and confirm it is queryable.
-14. Start the Workbench once so `.agent-mesh/workbench.html` exists, then give
-    the human the file path, URL, and restart command.
+14. Install or refresh the automatic per-user Workbench service, verify that its
+    health check passes, and give the human the stable machine-local bookmark
+    printed by the command. Use the manual server only when the native user
+    supervisor is unavailable.
 15. Confirm the new repo appears in the Workbench repository selector. Show the
     human the Workbench's Decisions tab and report exactly what changed,
     which user decisions were recorded, what was verified, and what input is
@@ -192,8 +194,42 @@ agent-q list --status open
 agent-q packet --id <REQ-id>
 ```
 
-Start the Workbench after verification unless the target environment cannot run
-a local server or the human declines:
+Install or refresh the automatic Workbench service after verification unless the
+target environment cannot run a local server or the human declines:
+
+```bash
+agent-mesh workbench service install --repo . --host 127.0.0.1 --port 8767 --open
+agent-mesh workbench service status
+```
+
+This is an install-once, per-user service. It uses the native user supervisor on
+macOS (`launchd`), Linux (`systemd --user`), or Windows (Task Scheduler), starts
+at sign-in, and restarts after a process failure. It does not require an
+administrator account in the normal desktop setup. Re-running `service install`
+is safe and updates the existing definition, so each adopting agent should run
+it instead of asking whether another repo already installed the service.
+
+There is one service and one multi-repo Workbench per user, not one background
+process per project. Registered repositories appear in the repository selector.
+After the adopting agent installs the service, the human can open the bookmark
+without opening a terminal. The managed page replaces the command strip with
+automatic-startup status and a `Reconnect` button. The button checks the local
+server and, when its token is stale after a restart, reloads the latest private
+bookmark. It does not execute a shell command. Browser pages cannot safely and
+portably launch arbitrary native processes, so native supervision is the
+cross-platform startup boundary.
+
+Use these lifecycle commands for diagnosis or removal:
+
+```bash
+agent-mesh workbench service status
+agent-mesh workbench service start --open
+agent-mesh workbench service restart --open
+agent-mesh workbench service uninstall
+```
+
+If the platform does not provide a supported per-user supervisor, preserve the
+manual fallback and report that limitation clearly:
 
 ```bash
 agent-mesh workbench --repo . --host 127.0.0.1 --port 8767
@@ -210,26 +246,38 @@ uses an automatic per-server access token and restricted CORS origins; do not
 replace either control with wildcard browser access. The server rejects
 non-loopback hosts, the HTTP launch page receives its token only through the URL
 fragment, and the generated token-bearing bookmark is written as private
-runtime state and ignored by Git. Registered project state and attachment paths
-must remain physically inside the selected repo and must not traverse symlinks.
+runtime state outside project repositories. Manual project bookmarks remain
+ignored by Git. Registered project state and attachment paths must remain
+physically inside the selected repo and must not traverse symlinks.
+The native service definition stores the Python executable, anchor repo,
+loopback host, port, and machine-local config path; it does not store the
+Workbench access token. A fresh token is generated when the process starts and
+is written only to the private bookmark.
 
-Report all three outputs to the human:
+For the automatic service, report these outputs to the human:
 
-- the bookmarkable file path, usually `.agent-mesh/workbench.html`;
+- the stable machine-local bookmark path printed by `service install`;
 - the local browser URL, usually `http://127.0.0.1:8767`;
-- the restart command, shell-quoted if the repository path contains spaces.
+- confirmation that `agent-mesh workbench service status` reports the native
+  definition and the managed health check passed.
+
+For the manual fallback, also report the restart command, shell-quoted if the
+repository path contains spaces.
 
 Also direct the human to the Decisions tab, where the choices recorded after the
 onboarding approval gate should now be visible.
 
-Tell the human to bookmark the Workbench file path, use the browser URL while
-the server is running, and rerun the restart command when they want the local UI
-again.
+Tell the human to bookmark the Workbench file path. With the automatic service,
+the native supervisor starts the server at sign-in and the page retries its
+connection when opened or focused. With the manual fallback, the human or an
+agent must run the restart command before using live actions.
 
 Explain that the bookmark is a static launcher and viewer shell: live queries,
-uploads, drafts, and submissions require the local server. The connection banner must say `Server online` before the human submits feedback. When it is offline,
+uploads, drafts, and submissions require the local server. The connection banner
+must say `Server online` before the human submits feedback. When it is offline,
 server-dependent actions are disabled while the client-side Clear action remains
-available. Feedback submissions carry retry-safe receipts; after a lost response, reconnecting or retrying the preserved form returns the original REQ rather than
+available. Feedback submissions carry retry-safe receipts; after a lost response,
+reconnecting or retrying the preserved form returns the original REQ rather than
 creating a duplicate.
 
 ## Advanced Migration Procedure
