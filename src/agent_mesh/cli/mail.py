@@ -15,6 +15,12 @@ from pathlib import Path
 from typing import Any
 import tempfile
 
+from agent_mesh.adoption import (
+    CONTRACT_TARGETS,
+    AdoptionContractError,
+    contract_status,
+    install_contract,
+)
 from agent_mesh.config import (
     AgentMeshConfig,
     ConfigError,
@@ -65,6 +71,9 @@ def main(argv: list[str] | None = None) -> int:
         return int(exc.code or 0)
     try:
         return int(args.func(args))
+    except AdoptionContractError as exc:
+        print(f"agent-mesh: {exc}", file=sys.stderr)
+        return 2
     except ConfigError as exc:
         print(f"agent-mesh: {exc}", file=sys.stderr)
         return 2
@@ -116,6 +125,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="do not add this repo to the machine-local Workbench registry",
     )
     init.set_defaults(func=cmd_init)
+
+    adopt = sub.add_parser(
+        "adopt",
+        help="install or verify the managed repo-local Agent Mesh contract",
+    )
+    adopt.add_argument("--repo", type=Path, default=Path("."))
+    adopt.add_argument(
+        "--target",
+        dest="targets",
+        action="append",
+        choices=tuple(CONTRACT_TARGETS),
+        help="instruction target; repeat to install more than one (default: AGENTS plus detected Claude)",
+    )
+    adopt.add_argument(
+        "--check",
+        action="store_true",
+        help="verify the contract and conflicting legacy decision-write guidance without writing",
+    )
+    adopt.set_defaults(func=cmd_adopt)
 
     projects = sub.add_parser("projects", help="manage registered Workbench repos")
     projects_sub = projects.add_subparsers(dest="projects_command", required=True)
@@ -277,7 +305,7 @@ def _build_parser() -> argparse.ArgumentParser:
     workbench.add_argument(
         "service_action",
         nargs="?",
-        choices=("install", "status", "start", "restart", "uninstall"),
+        choices=("install", "status", "open", "start", "restart", "uninstall"),
     )
     workbench.add_argument("--repo", type=Path, default=Path("."))
     workbench.add_argument("--host", default="127.0.0.1")
@@ -356,6 +384,49 @@ def cmd_init(args: argparse.Namespace) -> int:
     if not args.no_register:
         project = register_project(root)
         print(f"registered Workbench repo {project.id} at {registry_path()}")
+    integration = contract_status(root)
+    if not integration["healthy"]:
+        print(
+            "agent integration: incomplete; run `agent-mesh adopt --repo .`, "
+            "then `agent-mesh adopt --repo . --check`"
+        )
+    return 0
+
+
+def cmd_adopt(args: argparse.Namespace) -> int:
+    root = args.repo.expanduser().resolve()
+    if args.check:
+        status = contract_status(root, targets=args.targets)
+        for item in status["files"]:
+            print(f"{item['target']}\t{item['status']}\t{item['path']}")
+        for conflict in status["conflicts"]:
+            print(
+                f"conflict\t{conflict['path']}:{conflict['line']}\t{conflict['text']}"
+            )
+        print(
+            "agent contract: "
+            + ("healthy" if status["healthy"] else "incomplete or conflicting")
+            + f" (v{status['version']} {status['digest']})"
+        )
+        return 0 if status["healthy"] else 1
+
+    results = install_contract(root, targets=args.targets)
+    for result in results:
+        action = "updated" if result.changed else "current"
+        print(f"{action}\t{result.target}\t{result.path}")
+    status = contract_status(root, targets=args.targets)
+    for conflict in status["conflicts"]:
+        print(
+            f"warning: conflicting legacy decision-write guidance at "
+            f"{conflict['path']}:{conflict['line']}: {conflict['text']}"
+        )
+    if status["conflicts"]:
+        print(
+            "managed contract installed, but adoption remains incomplete until the "
+            "conflicting legacy write guidance is removed"
+        )
+        return 1
+    print(f"agent contract: healthy (v{status['version']} {status['digest']})")
     return 0
 
 
@@ -625,6 +696,7 @@ def _cmd_workbench_service(args: argparse.Namespace) -> int:
         WorkbenchError,
         _validate_workbench_host,
         managed_workbench_bookmark_path,
+        write_managed_bookmark_pointer,
     )
     from agent_mesh.workbench_service import (
         WorkbenchServiceError,
@@ -641,16 +713,18 @@ def _cmd_workbench_service(args: argparse.Namespace) -> int:
     if action is None:
         print(
             "agent-mesh: choose a Workbench service action: "
-            "install, status, start, restart, or uninstall",
+            "install, status, open, start, restart, or uninstall",
             file=sys.stderr,
         )
         return 2
 
     bookmark_path: Path | None = None
+    anchor_config: AgentMeshConfig | None = None
     try:
         if action == "install":
             _validate_workbench_host(args.host)
             config = load_config(args.repo)
+            anchor_config = config
             register_project(config.project_root)
             spec = make_service_spec(
                 repo=config.project_root,
@@ -661,6 +735,15 @@ def _cmd_workbench_service(args: argparse.Namespace) -> int:
             bookmark_path = managed_workbench_bookmark_path(spec.config_home)
         elif action == "status":
             status = workbench_service_status()
+        elif action == "open":
+            status = workbench_service_status()
+            if not status.installed:
+                raise WorkbenchServiceError(
+                    "Workbench service is not installed; run "
+                    "'agent-mesh workbench service install --repo . --open'"
+                )
+            if status.running is not True:
+                status = start_workbench_service()
         elif action == "start":
             status = start_workbench_service()
         elif action == "restart":
@@ -671,10 +754,10 @@ def _cmd_workbench_service(args: argparse.Namespace) -> int:
         print(f"agent-mesh: {exc}", file=sys.stderr)
         return 2
 
-    _print_workbench_service_status(status)
-    if action in {"install", "start", "restart"}:
-        if bookmark_path is None:
-            bookmark_path = _service_bookmark_path(status, managed_workbench_bookmark_path)
+    if bookmark_path is None:
+        bookmark_path = _service_bookmark_path(status, managed_workbench_bookmark_path)
+    _print_workbench_service_status(status, bookmark_path=bookmark_path)
+    if action in {"install", "open", "start", "restart"}:
         if bookmark_path is not None:
             if not wait_for_managed_workbench(bookmark_path):
                 print(
@@ -683,8 +766,17 @@ def _cmd_workbench_service(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 2
-            print(f"bookmark: {bookmark_path}")
-            if args.open:
+            if anchor_config is None:
+                anchor_config = _service_anchor_config(status)
+            if anchor_config is not None:
+                try:
+                    write_managed_bookmark_pointer(anchor_config, bookmark_path)
+                except OSError as exc:
+                    print(
+                        f"agent-mesh: warning: could not update the project bookmark: {exc}",
+                        file=sys.stderr,
+                    )
+            if args.open or action == "open":
                 webbrowser.open(bookmark_path.resolve().as_uri())
         elif args.open:
             print(
@@ -708,7 +800,23 @@ def _service_bookmark_path(status: Any, resolver: Any) -> Path | None:
         return None
 
 
-def _print_workbench_service_status(status: Any) -> None:
+def _service_anchor_config(status: Any) -> AgentMeshConfig | None:
+    if not status.metadata:
+        return None
+    raw_repo = status.metadata.get("repo")
+    if not isinstance(raw_repo, str) or not raw_repo:
+        return None
+    try:
+        return load_config(Path(raw_repo))
+    except ConfigError:
+        return None
+
+
+def _print_workbench_service_status(
+    status: Any,
+    *,
+    bookmark_path: Path | None = None,
+) -> None:
     if not status.installed:
         summary = "not installed"
     elif status.running is True:
@@ -723,6 +831,9 @@ def _print_workbench_service_status(status: Any) -> None:
     if status.metadata:
         print(f"repo: {status.metadata.get('repo', '')}")
         print(f"url: http://{status.metadata.get('host', '')}:{status.metadata.get('port', '')}")
+    if status.installed and bookmark_path is not None:
+        print(f"bookmark: {bookmark_path}")
+        print("open: agent-mesh workbench service open")
 
 
 def cmd_decision_propose(args: argparse.Namespace) -> int:

@@ -45,6 +45,8 @@ onboarding choice.
 pip install agent-mesh
 cd ~/your-project
 agent-mesh init --participants human,agent --default-sender human --default-recipient agent
+agent-mesh adopt --repo .
+agent-mesh adopt --repo . --check
 agent-mesh request --to agent "Review the auth refactor"
 agent-q list --status open
 agent-q packet --id <REQ-id>
@@ -73,21 +75,35 @@ adopting another project does not create another background process. After an
 agent installs it, the human can use the stable machine-local bookmark printed
 by the command without opening a terminal. Reinstalling from another project or
 restarting the service refreshes that same bookmark. Use
-`agent-mesh workbench service status`, `start`, `restart`, or `uninstall` for
-lifecycle management. The manual
+`agent-mesh workbench service open` whenever the bookmark is not already saved;
+`service status` prints both its exact path and the open command. Use `start`,
+`restart`, or `uninstall` for lifecycle management. Installing or refreshing the
+service also turns the anchor repo's old project-local bookmark into a token-free
+pointer to the managed bookmark. The manual
 `agent-mesh workbench --repo .` command remains the fallback when the native user
 supervisor is unavailable.
 
 `agent-q packet` returns bounded, thread-scoped JSON for grounding an agent on a
 request or response. `agent-mesh workbench` starts a small local UI and writes a
-bookmarkable `.agent-mesh/workbench.html` file for the project. `agent-mesh init`
-automatically registers the repo in the machine-local Workbench registry. The
-repository selector can switch among registered repos, and the server resolves
-its opaque repo ID before feedback, request-status, backlog, attachment, or
-decision operations. The bookmark is static, while live reads and writes require
-the loopback server. With the automatic service, native supervision and the
-page's reconnect loop keep that server available; the browser never executes a
-shell command. Feedback submits use retry-safe receipts so an uncertain retry
+bookmarkable `.agent-mesh/workbench.html` file for the project. Its Decisions tab
+creates Proposed decisions, appends revisions, and records explicit human
+acceptance. Editing an accepted or in-force decision requires a reason and
+returns it to Proposed until it is accepted again. Repository Markdown decision
+logs are optional generated compatibility views, never separate writable
+tracking surfaces.
+
+`agent-mesh init` automatically registers the repo in the machine-local
+Workbench registry and reports when the managed agent contract is incomplete.
+`agent-mesh adopt` installs a versioned contract in applicable agent instruction
+files; `agent-mesh adopt --check` detects stale contracts and conflicting legacy
+decision-write guidance. The Workbench shows the same contract health signal.
+
+The repository selector can switch among registered repos, and the server
+resolves its opaque repo ID before feedback, request-status, backlog, attachment,
+or decision operations. The bookmark is static, while live reads and writes
+require the loopback server. With the automatic service, native supervision and
+the page's reconnect loop keep that server available; the browser never executes
+a shell command. Feedback submits use retry-safe receipts so an uncertain retry
 returns the original REQ instead of creating a duplicate. A per-server access
 token and restricted browser origins protect the local mutation APIs
 automatically. The server is loopback-only, the HTTP launch URL carries its token

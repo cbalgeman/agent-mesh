@@ -33,6 +33,9 @@ use the agent-mesh handoff substrate.
 - Walk upward from cwd for `.agent-mesh/`.
 - If absent, do not invent a project. Use a legacy handoff tool only when the
   target repository explicitly documents it.
+- Run `agent-mesh adopt --repo . --check`. A missing/stale managed contract or
+  conflicting legacy decision-write instruction is an adoption defect; report
+  it instead of silently choosing a second source of truth.
 
 ## Read Before Write
 - Run `agent-q status` and targeted `agent-q list/locate/body` before
@@ -53,6 +56,13 @@ use the agent-mesh handoff substrate.
 
 ## Write
 - Use `agent-mesh request/respond/resolve/reopen`.
+- Use Workbench or `agent-mesh decision propose` for new decisions. Do not
+  allocate a decision ID from memory.
+- Run `agent-mesh decision accept` only after explicit human approval and name
+  the approving human with `--by`.
+- Use Workbench for append-only decision revisions. Revising an accepted or
+  in-force decision requires a reason and returns it to Proposed until the
+  human accepts it again.
 - Do not hand-edit generated views or `events.jsonl`.
 - Respect `response_mode = single|multi`.
 
@@ -105,9 +115,16 @@ Write side (append-only events):
   agent-mesh respond <REQ-id> "<summary>" "<details>"
   agent-mesh resolve <REQ-id> "<reason>"
   agent-mesh reopen <REQ-id> "<reason>"
+  agent-mesh decision propose --id <D-id> --title "<title>" --tier <tier> --decision "<choice>"
+  agent-mesh decision accept <D-id> --by <human> --notes "<approval source>"
+
+Adoption health:
+  agent-mesh adopt --repo .
+  agent-mesh adopt --repo . --check
 
 References (read these for full contract, do not paraphrase from memory):
   README.md
+  docs/adoption.md
   docs/configuration.md
   docs/privacy.md
 """

@@ -81,23 +81,27 @@ generated compatibility views.
 7. Install or run `agent-mesh` from the source checkout.
 8. Initialize or update the target repo using the approved participants and
    defaults so the decision log is available.
-9. Ensure the repo is in the machine-local Workbench registry. `agent-mesh init`
+9. Run `agent-mesh adopt --repo .` to install the versioned managed instruction
+   contract, then run `agent-mesh adopt --repo . --check`. Remove or rewrite any
+   conflicting legacy instruction that still tells an agent to write a Markdown
+   decision log.
+10. Ensure the repo is in the machine-local Workbench registry. `agent-mesh init`
    does this automatically; for an existing initialized repo, run
    `agent-mesh projects register --repo .`. Registration is inferred operational
    metadata, not a project choice, so do not ask the human to edit or approve an
    allowlist.
-10. Record each durable approved setup choice in the Agent Mesh decision log and
+11. Record each durable approved setup choice in the Agent Mesh decision log and
    accept it on behalf of the human who made the choice. Do not record secrets or
    transient troubleshooting answers as decisions.
-11. Verify the recorded decisions with `agent-q decisions show <decision-id>`.
-12. Implement the rest of the approved integration, rebuild derived state, and
+12. Verify the recorded decisions with `agent-q decisions show <decision-id>`.
+13. Implement the rest of the approved integration, rebuild derived state, and
     verify the event chain.
-13. Send a smoke-test request and confirm it is queryable.
-14. Install or refresh the automatic per-user Workbench service, verify that its
+14. Send a smoke-test request and confirm it is queryable.
+15. Install or refresh the automatic per-user Workbench service, verify that its
     health check passes, and give the human the stable machine-local bookmark
     printed by the command. Use the manual server only when the native user
     supervisor is unavailable.
-15. Confirm the new repo appears in the Workbench repository selector. Show the
+16. Confirm the new repo appears in the Workbench repository selector. Show the
     human the Workbench's Decisions tab and report exactly what changed,
     which user decisions were recorded, what was verified, and what input is
     still needed.
@@ -181,6 +185,8 @@ agent-mesh init \
   --default-sender human \
   --default-recipient agent \
   --state-sharing local-only
+agent-mesh adopt --repo .
+agent-mesh adopt --repo . --check
 agent-q status
 agent-q verify-chain .agent-mesh/events.jsonl
 agent-mesh projects list
@@ -223,6 +229,7 @@ Use these lifecycle commands for diagnosis or removal:
 
 ```bash
 agent-mesh workbench service status
+agent-mesh workbench service open
 agent-mesh workbench service start --open
 agent-mesh workbench service restart --open
 agent-mesh workbench service uninstall
@@ -240,7 +247,8 @@ registered repos. The browser sends an opaque repo ID; the server resolves that
 ID against the registry before every read or write. Feedback requests,
 attachments, request-status changes, and backlog updates must therefore be
 recorded only in the active repo's `.agent-mesh/` state. Decision reads use the
-same boundary, and future decision mutation routes must do so as well. Never add
+same boundary. Workbench decision creation, revision, and acceptance routes do
+as well. Never add
 an API that accepts a browser-supplied filesystem path. The generated page also
 uses an automatic per-server access token and restricted CORS origins; do not
 replace either control with wildcard browser access. The server rejects
@@ -257,15 +265,27 @@ is written only to the private bookmark.
 For the automatic service, report these outputs to the human:
 
 - the stable machine-local bookmark path printed by `service install`;
+- the same exact bookmark path and `service open` action printed by `service status`;
 - the local browser URL, usually `http://127.0.0.1:8767`;
 - confirmation that `agent-mesh workbench service status` reports the native
   definition and the managed health check passed.
+
+Installing, starting, restarting, or opening the managed service rewrites the
+anchor repo's old `.agent-mesh/workbench.html` as a token-free pointer page. It
+must identify itself as the manual project bookmark and link to the stable
+private managed bookmark. This prevents an old repo-local bookmark from silently
+steering the human back to a stale manual port or copied restart command.
 
 For the manual fallback, also report the restart command, shell-quoted if the
 repository path contains spaces.
 
 Also direct the human to the Decisions tab, where the choices recorded after the
-onboarding approval gate should now be visible.
+onboarding approval gate should now be visible. The Decisions tab is the normal
+human authoring surface: New decision creates a Proposed record, edits append a
+revision, and Accept records explicit human approval. An accepted or in-force
+decision that is edited must include a reason and returns to Proposed until the
+human accepts it again. Repository Markdown decision logs are optional generated
+compatibility views, never writable tracking surfaces.
 
 Tell the human to bookmark the Workbench file path. With the automatic service,
 the native supervisor starts the server at sign-in and the page retries its

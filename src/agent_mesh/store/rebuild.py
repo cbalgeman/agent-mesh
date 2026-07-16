@@ -1320,20 +1320,77 @@ def _project_decision_metadata_updated(conn, record: dict[str, Any], dec_ulid: s
                 "UPDATE decisions SET human_id=?, parent_human_id=?, event_seq=? WHERE dec_ulid=?",
                 (new_id, parent_human_id(new_id), record["event_seq"], dec_ulid),
             )
+    simple_columns = {
+        "title": "title",
+        "owner": "owner",
+        "body_sha": "body_sha",
+        "body_path": "body_path",
+        "body_bytes": "body_bytes",
+    }
+    for field_name, column_name in simple_columns.items():
+        if field_name not in fields:
+            continue
+        new_value = _decision_changed_value(fields[field_name])
+        conn.execute(
+            f"UPDATE decisions SET {column_name}=?, event_seq=? WHERE dec_ulid=?",
+            (new_value, record["event_seq"], dec_ulid),
+        )
+    if "tier" in fields:
+        new_tier = str(_decision_changed_value(fields["tier"]) or "").strip()
+        if not new_tier:
+            raise ValueError("decision tier must not be empty")
+        conn.execute(
+            "UPDATE decisions SET tier=?, enforcement_mode=?, event_seq=? WHERE dec_ulid=?",
+            (new_tier, enforcement_for_tier(new_tier), record["event_seq"], dec_ulid),
+        )
+    meta_fields = {
+        "context",
+        "decision",
+        "rejected_alternatives",
+        "consequences",
+        "review_policy",
+        "exemptions",
+        "generated_artifact_paths",
+    }
+    if meta_fields.intersection(fields):
+        row = conn.execute(
+            "SELECT meta_json FROM decisions WHERE dec_ulid=?", (dec_ulid,)
+        ).fetchone()
+        meta = json_loads(row["meta_json"] if row else None, {})
+        if not isinstance(meta, dict):
+            meta = {}
+        for field_name in meta_fields.intersection(fields):
+            meta[field_name] = _decision_changed_value(fields[field_name])
+        conn.execute(
+            "UPDATE decisions SET meta_json=?, event_seq=? WHERE dec_ulid=?",
+            (json_dumps(meta), record["event_seq"], dec_ulid),
+        )
     if "status" in fields:
         old_new = fields["status"]
-        new_status = old_new[1] if isinstance(old_new, list) and len(old_new) == 2 else old_new
+        new_status = _decision_changed_value(old_new)
+        reset_approval = str(new_status) == "proposed"
         conn.execute(
-            "UPDATE decisions SET status=?, in_force_utc=COALESCE(in_force_utc, ?), event_seq=? "
+            "UPDATE decisions SET status=?, "
+            "accepted_utc=CASE WHEN ? THEN NULL ELSE accepted_utc END, "
+            "in_force_utc=CASE WHEN ? THEN NULL ELSE COALESCE(in_force_utc, ?) END, "
+            "event_seq=? "
             "WHERE dec_ulid=?",
             (
                 str(new_status),
+                reset_approval,
+                reset_approval,
                 record["occurred_utc"] if str(new_status) == "in_force" else None,
                 record["event_seq"],
                 dec_ulid,
             ),
         )
     _append_decision_log(conn, dec_ulid, record)
+
+
+def _decision_changed_value(value: Any) -> Any:
+    if isinstance(value, list) and len(value) == 2:
+        return value[1]
+    return value
 
 
 def _project_ops_event(conn, record: dict[str, Any]) -> None:

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
+from agent_mesh.adoption import contract_status as adoption_contract_status
 from agent_mesh.config import AgentMeshConfig, load_config, write_agent_dir_gitignore
 from agent_mesh.core.events import Event, append_event, generate_event_id
 from agent_mesh.core.lock import acquire
@@ -34,8 +35,14 @@ from agent_mesh.project_registry import (
     resolve_registered_project,
     validate_registered_project_path,
 )
-from agent_mesh.store.rebuild import projection_is_current, read_event_records, rebuild_all
+from agent_mesh.store.rebuild import (
+    DECISION_ID_RE,
+    projection_is_current,
+    read_event_records,
+    rebuild_all,
+)
 from agent_mesh.store.sqlite import connect, initialize_schema, json_loads, resolve_decision, resolve_message
+from agent_mesh.views import render_all
 
 
 class WorkbenchError(RuntimeError):
@@ -73,6 +80,14 @@ FEEDBACK_REQUEST_PREAMBLE = (
     "decisions, or request thread as appropriate.\n\n"
 )
 FEEDBACK_SUBMISSION_ID_RE = re.compile(r"^fb-[A-Za-z0-9-]{8,96}$")
+DECISION_TERMINAL_STATUSES = {"superseded", "retired", "rejected"}
+DECISION_TIERS = (
+    "note",
+    "implementation_plan",
+    "architecture_contract",
+    "production_invariant",
+    "compliance_security",
+)
 
 
 @dataclass(frozen=True)
@@ -177,6 +192,7 @@ def workbench_status(
             "db_exists": config.db_path.exists(),
             "last_event_seq": last_seq,
         },
+        "agent_contract": adoption_contract_status(config.project_root),
         "counts": counts,
         "snapshot": snapshot,
     }
@@ -463,6 +479,376 @@ def lookup_decision(repo: Path, identifier: str) -> dict[str, Any] | None:
         }
     finally:
         conn.close()
+
+
+def next_decision_human_id(repo: Path) -> str:
+    config = _load_and_rebuild(repo)
+    conn = connect(config.db_path)
+    try:
+        initialize_schema(conn)
+        return _next_decision_human_id(conn)
+    finally:
+        conn.close()
+
+
+def create_decision(
+    repo: Path,
+    *,
+    title: str,
+    tier: str,
+    owner: str = "",
+    context: str = "",
+    decision: str = "",
+    body: str | None = None,
+    human_id: str = "",
+    actor: str | None = None,
+) -> dict[str, Any]:
+    config = load_config(repo)
+    title = title.strip()
+    tier = tier.strip()
+    owner = owner.strip()
+    context = context.strip()
+    decision = decision.strip()
+    actor = _decision_actor(config, actor)
+    requested_id = human_id.strip().upper()
+    if not title:
+        raise WorkbenchError("Decision title is required")
+    if not tier:
+        raise WorkbenchError("Decision tier is required")
+    if tier not in DECISION_TIERS:
+        raise WorkbenchError(
+            f"Decision tier must be one of: {', '.join(DECISION_TIERS)}"
+        )
+    if requested_id and not DECISION_ID_RE.fullmatch(requested_id):
+        raise WorkbenchError(
+            "Decision ID must look like D001, D038-S1, or D076-E"
+        )
+
+    lock_handle = acquire(config.agent_dir / ".mail-lock")
+    last_event_seq = None
+    try:
+        rebuild_all(config)
+        conn = connect(config.db_path)
+        try:
+            initialize_schema(conn)
+            resolved_id = requested_id or _next_decision_human_id(conn)
+            if resolve_decision(conn, resolved_id) is not None:
+                raise WorkbenchError(f"decision already exists: {resolved_id}")
+        finally:
+            conn.close()
+
+        canonical_body = body if body is not None else ""
+        if not canonical_body.strip():
+            canonical_body = _default_decision_body(
+                resolved_id,
+                title=title,
+                context=context,
+                decision=decision,
+            )
+        body_path, body_sha, body_bytes = _write_decision_body(config, canonical_body)
+        dec_ulid = "dec_" + generate_event_id()[3:]
+        event = Event(
+            event_id=generate_event_id(),
+            actor=actor,
+            kind="decision_proposed",
+            entity_id=dec_ulid,
+            thread_id=dec_ulid,
+            payload={
+                "human_id": resolved_id,
+                "aliases": [],
+                "title": title,
+                "tier": tier,
+                "context": context,
+                "decision": decision,
+                "rejected_alternatives": [],
+                "consequences": [],
+                "affected_code_globs": [],
+                "exemptions": [],
+                "generated_artifact_paths": [],
+                "assumptions": [],
+                "evidence": {},
+                "supersedes": None,
+                "owner": owner or None,
+                "review_policy": {},
+                "required_checks": [],
+                "verification": [],
+                "tags": [],
+                "body_sha": body_sha,
+                "body_path": body_path,
+                "body_bytes": body_bytes,
+            },
+        )
+        result = append_event(config.events_path, event, lock_acquired=True)
+        last_event_seq = result.event.event_seq
+        rebuild_all(config)
+        render_all(config)
+    finally:
+        lock_handle.release(last_event_seq=last_event_seq)
+
+    created = lookup_decision(config.project_root, resolved_id)
+    if created is None:  # pragma: no cover - append/replay contract safeguard
+        raise WorkbenchError(f"created decision could not be read back: {resolved_id}")
+    return {**created, "event_seq": last_event_seq, "created": True}
+
+
+def update_decision(
+    repo: Path,
+    identifier: str,
+    *,
+    title: str | None = None,
+    tier: str | None = None,
+    owner: str | None = None,
+    context: str | None = None,
+    decision: str | None = None,
+    body: str | None = None,
+    revision_reason: str = "",
+    actor: str | None = None,
+) -> dict[str, Any]:
+    config = load_config(repo)
+    identifier = identifier.strip()
+    actor = _decision_actor(config, actor)
+    revision_reason = revision_reason.strip()
+    if not identifier:
+        raise WorkbenchError("Decision ID is required")
+
+    lock_handle = acquire(config.agent_dir / ".mail-lock")
+    last_event_seq = None
+    did_update = False
+    try:
+        rebuild_all(config)
+        conn = connect(config.db_path)
+        try:
+            initialize_schema(conn)
+            dec_ulid = resolve_decision(conn, identifier)
+            if dec_ulid is None:
+                raise WorkbenchError(f"decision not found: {identifier}")
+            row = conn.execute(
+                "SELECT * FROM decisions WHERE dec_ulid=?", (dec_ulid,)
+            ).fetchone()
+            if row is None:
+                raise WorkbenchError(f"decision not found: {identifier}")
+            meta = json_loads(row["meta_json"], {})
+            if not isinstance(meta, dict):
+                meta = {}
+            current_body = _decision_body_from_row(config, row)
+            status = str(row["status"])
+        finally:
+            conn.close()
+
+        if status in DECISION_TERMINAL_STATUSES:
+            raise WorkbenchError(
+                f"{identifier} is {status}; create a successor decision instead of editing it"
+            )
+
+        fields_changed: dict[str, list[Any]] = {}
+        requested_values = {
+            "title": title,
+            "tier": tier,
+            "owner": owner,
+            "context": context,
+            "decision": decision,
+        }
+        current_values = {
+            "title": str(row["title"] or ""),
+            "tier": str(row["tier"] or ""),
+            "owner": str(row["owner"] or ""),
+            "context": str(meta.get("context") or ""),
+            "decision": str(meta.get("decision") or ""),
+        }
+        for field_name, requested in requested_values.items():
+            if requested is None:
+                continue
+            normalized = requested.strip()
+            if field_name in {"title", "tier"} and not normalized:
+                raise WorkbenchError(f"Decision {field_name} is required")
+            if field_name == "tier" and normalized not in DECISION_TIERS:
+                raise WorkbenchError(
+                    f"Decision tier must be one of: {', '.join(DECISION_TIERS)}"
+                )
+            if normalized != current_values[field_name]:
+                fields_changed[field_name] = [current_values[field_name], normalized]
+
+        if body is not None and body != current_body:
+            body_path, body_sha, body_bytes = _write_decision_body(config, body)
+            fields_changed.update({
+                "body_path": [str(row["body_path"] or ""), body_path],
+                "body_sha": [str(row["body_sha"] or ""), body_sha],
+                "body_bytes": [int(row["body_bytes"] or 0), body_bytes],
+            })
+
+        if fields_changed:
+            if status in {"accepted", "in_force"}:
+                if not revision_reason:
+                    raise WorkbenchError(
+                        "Revision reason is required when editing an accepted decision"
+                    )
+                revisit = Event(
+                    event_id=generate_event_id(),
+                    actor=actor,
+                    kind="decision_revisited",
+                    entity_id=dec_ulid,
+                    thread_id=dec_ulid,
+                    payload={
+                        "decision_id": dec_ulid,
+                        "reason": revision_reason,
+                        "assumption_id": None,
+                        "new_decision_id": None,
+                    },
+                )
+                revisit_result = append_event(
+                    config.events_path, revisit, lock_acquired=True
+                )
+                last_event_seq = revisit_result.event.event_seq
+                fields_changed["status"] = [status, "proposed"]
+
+            update = Event(
+                event_id=generate_event_id(),
+                actor=actor,
+                kind="decision_metadata_updated",
+                entity_id=dec_ulid,
+                thread_id=dec_ulid,
+                payload={
+                    "decision_id": dec_ulid,
+                    "reason": revision_reason or "Updated proposed decision in Workbench",
+                    "fields_changed": fields_changed,
+                },
+            )
+            result = append_event(config.events_path, update, lock_acquired=True)
+            last_event_seq = result.event.event_seq
+            did_update = True
+            rebuild_all(config)
+            render_all(config)
+        else:
+            last_event_seq = int(row["event_seq"])
+    finally:
+        lock_handle.release(last_event_seq=last_event_seq)
+
+    updated = lookup_decision(config.project_root, identifier)
+    if updated is None:  # pragma: no cover - append/replay contract safeguard
+        raise WorkbenchError(f"updated decision could not be read back: {identifier}")
+    return {**updated, "event_seq": last_event_seq, "updated": did_update}
+
+
+def accept_decision(
+    repo: Path,
+    identifier: str,
+    *,
+    notes: str = "",
+    actor: str | None = None,
+) -> dict[str, Any]:
+    config = load_config(repo)
+    identifier = identifier.strip()
+    actor = _decision_actor(config, actor)
+    if not identifier:
+        raise WorkbenchError("Decision ID is required")
+
+    lock_handle = acquire(config.agent_dir / ".mail-lock")
+    last_event_seq = None
+    reused = False
+    try:
+        rebuild_all(config)
+        conn = connect(config.db_path)
+        try:
+            initialize_schema(conn)
+            dec_ulid = resolve_decision(conn, identifier)
+            if dec_ulid is None:
+                raise WorkbenchError(f"decision not found: {identifier}")
+            row = conn.execute(
+                "SELECT status, event_seq FROM decisions WHERE dec_ulid=?", (dec_ulid,)
+            ).fetchone()
+            if row is None:
+                raise WorkbenchError(f"decision not found: {identifier}")
+            status = str(row["status"])
+            last_event_seq = int(row["event_seq"])
+        finally:
+            conn.close()
+
+        if status in {"accepted", "in_force"}:
+            reused = True
+        elif status != "proposed":
+            raise WorkbenchError(f"cannot accept {identifier} while status is {status}")
+        else:
+            event = Event(
+                event_id=generate_event_id(),
+                actor=actor,
+                kind="decision_accepted",
+                entity_id=dec_ulid,
+                thread_id=dec_ulid,
+                payload={
+                    "decision_id": dec_ulid,
+                    "accepted_by": actor,
+                    "notes": notes.strip(),
+                },
+            )
+            result = append_event(config.events_path, event, lock_acquired=True)
+            last_event_seq = result.event.event_seq
+            rebuild_all(config)
+            render_all(config)
+    finally:
+        lock_handle.release(last_event_seq=last_event_seq)
+
+    accepted = lookup_decision(config.project_root, identifier)
+    if accepted is None:  # pragma: no cover - append/replay contract safeguard
+        raise WorkbenchError(f"accepted decision could not be read back: {identifier}")
+    return {
+        **accepted,
+        "event_seq": last_event_seq,
+        "accepted": True,
+        "reused": reused,
+    }
+
+
+def _decision_actor(config: AgentMeshConfig, actor: str | None) -> str:
+    normalized = (actor or config.default_sender).strip()
+    if normalized not in config.participants:
+        raise WorkbenchError(f"actor {normalized!r} is not in participants")
+    return normalized
+
+
+def _next_decision_human_id(conn) -> str:
+    highest = 0
+    for row in conn.execute("SELECT human_id FROM decisions"):
+        match = DECISION_ID_RE.fullmatch(str(row["human_id"]))
+        if match and match.group(2) is None:
+            highest = max(highest, int(match.group(1)))
+    return f"D{highest + 1:03d}"
+
+
+def _default_decision_body(
+    human_id: str,
+    *,
+    title: str,
+    context: str,
+    decision: str,
+) -> str:
+    return (
+        f"# {human_id} — {title}\n\n"
+        f"## Context\n{context}\n\n"
+        f"## Decision\n{decision}\n"
+    )
+
+
+def _write_decision_body(
+    config: AgentMeshConfig,
+    body: str,
+) -> tuple[str, str, int]:
+    data = body.encode("utf-8")
+    body_sha = hashlib.sha256(data).hexdigest()
+    relative = Path("bodies") / f"{body_sha}.md"
+    target = config.agent_dir / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists() or target.read_bytes() != data:
+        tmp = target.with_name(f".{target.name}.{secrets.token_hex(6)}.tmp")
+        try:
+            with tmp.open("wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, target)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+    return relative.as_posix(), body_sha, len(data)
 
 
 def update_backlog_item(
@@ -948,11 +1334,12 @@ def _decision_body_from_row(config: AgentMeshConfig, row) -> str:
     body_path = row["body_path"]
     if not body_path:
         return ""
-    path = config.agent_dir / body_path
-    try:
-        return path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return ""
+    for path in (config.agent_dir / body_path, config.project_root / body_path):
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+    return ""
 
 
 def _append_meta_section(lines: list[str], title: str, value: Any) -> None:
@@ -1050,11 +1437,47 @@ def write_bookmark_file(config: AgentMeshConfig, context: WorkbenchContext) -> P
         access_token=context.access_token,
         managed_service=context.managed_service,
     )
-    context.bookmark_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_private_html(context.bookmark_path, payload)
+    return context.bookmark_path
+
+
+def write_managed_bookmark_pointer(
+    config: AgentMeshConfig,
+    managed_bookmark_path: Path,
+) -> Path:
+    """Replace a project-local bookmark with a token-free managed-service pointer."""
+
+    target = managed_bookmark_path.expanduser().resolve()
+    target_url = target.as_uri()
+    payload = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Open Agent Mesh Workbench</title>
+</head>
+<body data-agent-mesh-managed-bookmark-pointer="true">
+  <main style="max-width: 680px; margin: 4rem auto; padding: 0 1.5rem; font: 16px/1.5 system-ui, sans-serif;">
+    <h1>Agent Mesh Workbench moved</h1>
+    <p>This project-local file is the manual fallback, not the automatic Workbench.</p>
+    <p><a id="managed-workbench-link" href="{escape(target_url)}">Open the managed Workbench</a></p>
+    <p>The stable private bookmark is <code>{escape(str(target))}</code>.</p>
+    <p>If it does not open, run <code>agent-mesh workbench service open</code>.</p>
+  </main>
+</body>
+</html>
+"""
+    pointer_path = workbench_bookmark_path(config)
+    _write_private_html(pointer_path, payload)
+    return pointer_path
+
+
+def _write_private_html(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(
         prefix="workbench-",
         suffix=".html",
-        dir=context.bookmark_path.parent,
+        dir=path.parent,
     )
     temporary_path = Path(temporary_name)
     try:
@@ -1064,15 +1487,12 @@ def write_bookmark_file(config: AgentMeshConfig, context: WorkbenchContext) -> P
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_path, context.bookmark_path)
+        os.replace(temporary_path, path)
         if os.name != "nt":
-            context.bookmark_path.chmod(0o600)
+            path.chmod(0o600)
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
-    return context.bookmark_path
-
-
 def render_server_workbench_html(context: WorkbenchContext) -> str:
     """Render the HTTP page without embedding the bearer token in its body."""
     return render_workbench_html(
@@ -1104,11 +1524,15 @@ def render_workbench_html(
     managed_service: bool = False,
 ) -> str:
     bookmark_url = bookmark_path.resolve().as_uri() if bookmark_path else ""
+    managed_bookmark_path = managed_workbench_bookmark_path()
+    managed_bookmark_url = managed_bookmark_path.as_uri()
     return (
         WORKBENCH_HTML.replace("__AGENT_MESH_API_BASE__", json.dumps(api_base))
         .replace("__AGENT_MESH_START_COMMAND__", escape(start_command))
         .replace("__AGENT_MESH_BOOKMARK_URL__", escape(bookmark_url))
         .replace("__AGENT_MESH_BOOKMARK_PATH__", escape(str(bookmark_path or "")))
+        .replace("__AGENT_MESH_MANAGED_BOOKMARK_URL__", escape(managed_bookmark_url))
+        .replace("__AGENT_MESH_MANAGED_BOOKMARK_PATH__", escape(str(managed_bookmark_path)))
         .replace("__AGENT_MESH_DEFAULT_REPO_ID__", json.dumps(default_repo_id))
         .replace("__AGENT_MESH_ACCESS_TOKEN__", json.dumps(access_token))
         .replace("__AGENT_MESH_MANAGED_SERVICE__", json.dumps(managed_service))
@@ -1363,6 +1787,7 @@ def _handler_for(repo: Path, context: WorkbenchContext) -> type[BaseHTTPRequestH
                         HTTPStatus.OK,
                         {
                             "ok": True,
+                            "next_id": next_decision_human_id(selected_repo),
                             "decisions": list_decisions(
                                 selected_repo,
                                 query=params.get("q", [""])[0].strip(),
@@ -1459,6 +1884,44 @@ def _handler_for(repo: Path, context: WorkbenchContext) -> type[BaseHTTPRequestH
                         request_id=_clean(payload.get("id")),
                         to_status=_clean(payload.get("status")),
                         reason=_clean(payload.get("reason")),
+                        actor=_optional_clean(payload.get("actor")),
+                    )
+                    self._json(HTTPStatus.OK, result)
+                    return
+                if parsed.path == "/api/decision/create":
+                    result = create_decision(
+                        selected_repo,
+                        human_id=_clean(payload.get("id")),
+                        title=_clean(payload.get("title")),
+                        tier=_clean(payload.get("tier")),
+                        owner=_clean(payload.get("owner")),
+                        context=_clean(payload.get("context")),
+                        decision=_clean(payload.get("decision")),
+                        body=str(payload.get("body")) if payload.get("body") is not None else None,
+                        actor=_optional_clean(payload.get("actor")),
+                    )
+                    self._json(HTTPStatus.OK, result)
+                    return
+                if parsed.path == "/api/decision/update":
+                    result = update_decision(
+                        selected_repo,
+                        _clean(payload.get("id")),
+                        title=_optional_clean(payload.get("title")),
+                        tier=_optional_clean(payload.get("tier")),
+                        owner=_optional_clean(payload.get("owner")),
+                        context=_optional_clean(payload.get("context")),
+                        decision=_optional_clean(payload.get("decision")),
+                        body=str(payload.get("body")) if payload.get("body") is not None else None,
+                        revision_reason=_clean(payload.get("revision_reason")),
+                        actor=_optional_clean(payload.get("actor")),
+                    )
+                    self._json(HTTPStatus.OK, result)
+                    return
+                if parsed.path == "/api/decision/accept":
+                    result = accept_decision(
+                        selected_repo,
+                        _clean(payload.get("id")),
+                        notes=_clean(payload.get("notes")),
                         actor=_optional_clean(payload.get("actor")),
                     )
                     self._json(HTTPStatus.OK, result)
@@ -2293,10 +2756,29 @@ WORKBENCH_HTML = """<!doctype html>
 	    .search-controls label:first-child {
 	      grid-column: span 2;
 	    }
+	    .decision-editor {
+	      margin: 12px 0;
+	      padding: 14px;
+	      border: 1px solid var(--line);
+	      border-radius: 6px;
+	      background: #f9fbfc;
+	      display: grid;
+	      gap: 10px;
+	    }
+	    .decision-editor-grid {
+	      display: grid;
+	      grid-template-columns: minmax(120px, 0.6fr) minmax(180px, 1fr) minmax(180px, 1fr);
+	      gap: 8px;
+	    }
+	    .decision-editor .wide { grid-column: 1 / -1; }
+	    .decision-editor textarea { min-height: 96px; }
+	    .decision-editor textarea.body { min-height: 220px; font-family: var(--mono); }
 	    @media (max-width: 900px) {
 	      .grid { grid-template-columns: 1fr; }
 	      .search-controls { grid-template-columns: 1fr; }
 	      .search-controls label:first-child { grid-column: span 1; }
+	      .decision-editor-grid { grid-template-columns: 1fr; }
+	      .decision-editor .wide { grid-column: span 1; }
 	    }
   </style>
 </head>
@@ -2313,6 +2795,12 @@ WORKBENCH_HTML = """<!doctype html>
 	      </label>
 	    </div>
 	    <div class="command-box" id="manual-launch-panel">
+      <div class="command-line">
+        <span class="muted">Automatic Workbench</span>
+        <strong>This is the manual project bookmark.</strong>
+        <code id="managed-bookmark-guidance-path">__AGENT_MESH_MANAGED_BOOKMARK_PATH__</code>
+        <a id="open-managed-bookmark" href="__AGENT_MESH_MANAGED_BOOKMARK_URL__">Open managed Workbench</a>
+      </div>
       <div class="command-line">
         <span class="muted">Start / restart</span>
         <code id="start-command">__AGENT_MESH_START_COMMAND__</code>
@@ -2339,6 +2827,7 @@ WORKBENCH_HTML = """<!doctype html>
       </div>
 	    </div>
 	    <div id="server-connection" class="connection checking" role="status" aria-live="polite">Checking Workbench server...</div>
+	    <div id="agent-contract-health" class="connection checking" role="status" aria-live="polite">Checking agent contract...</div>
 	    <div id="status" class="status"><span class="badge">loading</span></div>
 	  </header>
 
@@ -2528,6 +3017,7 @@ WORKBENCH_HTML = """<!doctype html>
 	  <section id="tab-decisions" class="tab-panel">
 	    <div class="row">
 	      <h2 style="flex:1">Decisions</h2>
+	      <button id="new-decision" data-requires-server>New decision</button>
 	      <button class="ghost" id="reload-decisions">Reload</button>
 	    </div>
 	    <div class="search-controls">
@@ -2546,6 +3036,39 @@ WORKBENCH_HTML = """<!doctype html>
 	      <label>Tier <span class="field-note">Optional</span><input id="decision-tier-filter" placeholder="architecture_contract"></label>
 	      <button id="search-decisions">Search</button>
 	    </div>
+	    <form id="decision-editor" class="decision-editor" hidden>
+	      <div class="row">
+	        <strong id="decision-editor-heading" style="flex:1">New decision</strong>
+	        <span id="decision-editor-lifecycle" class="badge">proposed</span>
+	      </div>
+	      <div class="decision-editor-grid">
+	        <label>ID <span class="field-note">Auto if blank</span><input id="decision-edit-id" placeholder="D079"></label>
+	        <label>Tier <span class="required-mark">*</span>
+	          <select id="decision-edit-tier" required aria-required="true">
+	            <option value="note">Note</option>
+	            <option value="implementation_plan">Implementation plan</option>
+	            <option value="architecture_contract">Architecture contract</option>
+	            <option value="production_invariant">Production invariant</option>
+	            <option value="compliance_security">Compliance/security</option>
+	          </select>
+	        </label>
+	        <label>Owner <span class="field-note">Optional</span><input id="decision-edit-owner" placeholder="human or agent"></label>
+	        <label>Acting identity <span class="required-mark">*</span><select id="decision-edit-actor" required aria-required="true"></select></label>
+	        <label class="wide">Title <span class="required-mark">*</span><input id="decision-edit-title" required aria-required="true" placeholder="One durable choice"></label>
+	        <label class="wide">Context <span class="field-note">Optional</span><textarea id="decision-edit-context" placeholder="Why this choice is needed"></textarea></label>
+	        <label class="wide">Decision <span class="field-note">Optional</span><textarea id="decision-edit-summary" placeholder="What has been decided"></textarea></label>
+	        <label class="wide">Canonical Markdown body <span class="field-note">Optional; generated from the fields above when blank</span><textarea id="decision-edit-body" class="body" placeholder="# D079 — Decision title"></textarea></label>
+	        <label id="decision-revision-reason-field" class="wide" hidden>Revision reason <span class="required-mark">*</span><input id="decision-revision-reason" placeholder="Why an accepted decision is being reopened"></label>
+	        <label id="decision-approval-notes-field" class="wide" hidden>Approval note <span class="field-note">Optional</span><input id="decision-approval-notes" placeholder="Where or how the human approved this decision"></label>
+	      </div>
+	      <div class="row">
+	        <button type="submit" id="save-decision" data-requires-server>Save decision</button>
+	        <button type="button" id="accept-decision" data-requires-server hidden>Accept decision</button>
+	        <button type="button" class="ghost" id="cancel-decision-edit">Cancel</button>
+	      </div>
+	      <div id="decision-edit-status" class="edit-status" role="status" aria-live="polite"></div>
+	      <p class="muted" style="margin:0">Edits are appended to the event history. Editing an accepted or in-force decision requires a reason and returns it to Proposed until it is accepted again.</p>
+	    </form>
 	    <div class="table-wrap">
 	      <table>
 	        <thead><tr>
@@ -2605,6 +3128,9 @@ let draggedBacklogId = null;
 let messageRows = [];
 let backlogRows = [];
 let decisionRows = [];
+let activeDecision = null;
+let decisionNextId = '';
+let decisionDefaultActor = '';
 const tableSort = {
   messages: { key: 'created_utc', direction: 'desc' },
   backlog: { key: 'updated_utc', direction: 'desc' },
@@ -2691,6 +3217,8 @@ function resetRepoView() {
   messageRows = [];
   backlogRows = [];
   decisionRows = [];
+  activeDecision = null;
+  decisionNextId = '';
   FEEDBACK_INPUT_IDS.filter((id) => id !== 'fb-severity').forEach((id) => {
     $(id).value = '';
   });
@@ -2703,6 +3231,7 @@ function resetRepoView() {
   $('message-output').textContent = '';
   $('backlog-output').textContent = '';
   $('decision-output').textContent = '';
+  resetDecisionEditor(true);
 }
 
 function snapshotParams() {
@@ -2848,6 +3377,27 @@ async function loadStatus(statusOverride = null) {
   try {
     const status = statusOverride || await api('/api/status');
     const c = status.counts;
+	    const actorSelect = $('decision-edit-actor');
+	    const priorActor = actorSelect.value;
+	    decisionDefaultActor = status.project.default_sender || status.project.participants[0] || '';
+	    actorSelect.innerHTML = (status.project.participants || []).map((participant) =>
+	      `<option value="${escapeHtml(participant)}">${escapeHtml(participant)}</option>`
+	    ).join('');
+	    actorSelect.value = (status.project.participants || []).includes(priorActor)
+	      ? priorActor
+	      : decisionDefaultActor;
+	    const contract = status.agent_contract || { healthy: false, files: [], conflicts: [] };
+	    const contractIndicator = $('agent-contract-health');
+	    contractIndicator.className = `connection ${contract.healthy ? 'online' : 'offline'}`;
+	    if (contract.healthy) {
+	      contractIndicator.textContent = `Agent contract healthy - v${contract.version} ${contract.digest}.`;
+	    } else if ((contract.conflicts || []).length) {
+	      const first = contract.conflicts[0];
+	      contractIndicator.textContent = `Agent contract conflict - ${contract.conflicts.length} legacy decision-write instruction(s), starting at ${first.path}:${first.line}. Run agent-mesh adopt --repo . --check.`;
+	    } else {
+	      const incomplete = (contract.files || []).filter((item) => item.status !== 'current');
+	      contractIndicator.textContent = `Agent contract incomplete - ${incomplete.map((item) => `${item.path} is ${item.status}`).join(', ') || 'managed instructions are missing'}. Run agent-mesh adopt --repo .`;
+	    }
 	    $('status').innerHTML = [
 	      `repo ${status.project.root}`,
 	      `sender ${status.project.default_sender}`,
@@ -3253,6 +3803,7 @@ async function loadDecisions(resultOverride = null) {
   const suffix = params.toString() ? `?${params.toString()}` : '';
   const result = resultOverride || await api(`/api/decisions${suffix}`);
   decisionRows = result.decisions;
+  if (result.next_id) decisionNextId = result.next_id;
   renderDecisionRows(decisionRows);
 }
 
@@ -3283,6 +3834,132 @@ async function lookupDecision(id) {
     '',
     d.title || '',
   ].join('\\n').trim() + '\\n';
+  populateDecisionEditor(d);
+  return result;
+}
+
+function resetDecisionEditor(hide = false) {
+  activeDecision = null;
+  $('decision-editor').hidden = hide;
+  $('decision-editor-heading').textContent = 'New decision';
+  $('decision-editor-lifecycle').textContent = 'proposed';
+  $('decision-edit-id').disabled = false;
+  $('decision-edit-id').value = decisionNextId;
+  $('decision-edit-tier').value = 'note';
+  $('decision-edit-owner').value = '';
+	$('decision-edit-actor').value = decisionDefaultActor;
+  $('decision-edit-title').value = '';
+  $('decision-edit-context').value = '';
+  $('decision-edit-summary').value = '';
+  $('decision-edit-body').value = '';
+  $('decision-revision-reason').value = '';
+  $('decision-revision-reason-field').hidden = true;
+	$('decision-approval-notes').value = '';
+	$('decision-approval-notes-field').hidden = true;
+  $('accept-decision').hidden = true;
+  $('save-decision').textContent = 'Create decision';
+  $('decision-edit-status').textContent = '';
+}
+
+async function showNewDecisionEditor() {
+  if (!decisionNextId) {
+    const result = await api('/api/decisions');
+    decisionNextId = result.next_id || '';
+  }
+  resetDecisionEditor(false);
+  $('decision-edit-title').focus();
+}
+
+function populateDecisionEditor(decision) {
+  activeDecision = decision;
+  const meta = decision.meta || {};
+  const status = decision.status || 'proposed';
+  $('decision-editor').hidden = false;
+  $('decision-editor-heading').textContent = `Edit ${decision.id || decision.dec_ulid}`;
+  $('decision-editor-lifecycle').textContent = status.replace('_', ' ');
+  $('decision-edit-id').value = decision.id || decision.dec_ulid || '';
+  $('decision-edit-id').disabled = true;
+  $('decision-edit-tier').value = decision.tier || 'note';
+  $('decision-edit-owner').value = decision.owner || '';
+	$('decision-edit-actor').value = decisionDefaultActor;
+  $('decision-edit-title').value = decision.title || '';
+  $('decision-edit-context').value = meta.context || '';
+  $('decision-edit-summary').value = meta.decision || '';
+  $('decision-edit-body').value = decision.body || '';
+  $('decision-revision-reason').value = '';
+  $('decision-revision-reason-field').hidden = !['accepted', 'in_force'].includes(status);
+	$('decision-approval-notes').value = '';
+	$('decision-approval-notes-field').hidden = status !== 'proposed';
+  $('accept-decision').hidden = status !== 'proposed';
+  $('save-decision').textContent = 'Save revision';
+  $('decision-edit-status').textContent = ['superseded', 'retired', 'rejected'].includes(status)
+    ? `This decision is ${status}; create a successor instead of editing it.`
+    : '';
+}
+
+function decisionEditorPayload() {
+  return {
+    id: $('decision-edit-id').value.trim(),
+    title: $('decision-edit-title').value,
+    tier: $('decision-edit-tier').value,
+    owner: $('decision-edit-owner').value,
+	actor: $('decision-edit-actor').value,
+    context: $('decision-edit-context').value,
+    decision: $('decision-edit-summary').value,
+    body: $('decision-edit-body').value,
+    revision_reason: $('decision-revision-reason').value,
+  };
+}
+
+async function saveDecision() {
+  const payload = decisionEditorPayload();
+  if (!payload.title.trim()) {
+    $('decision-edit-status').textContent = 'Title is required.';
+    return null;
+  }
+  const existingId = activeDecision && (activeDecision.id || activeDecision.dec_ulid);
+  $('decision-edit-status').textContent = existingId
+    ? `Saving ${existingId}...`
+    : 'Creating decision...';
+  const result = await api(
+    existingId ? '/api/decision/update' : '/api/decision/create',
+    { method: 'POST', body: JSON.stringify(existingId ? { ...payload, id: existingId } : payload) },
+  );
+  populateDecisionEditor(result.decision);
+  $('decision-output').textContent = result.block || result.decision.block || '';
+  $('decision-edit-status').textContent = existingId
+    ? `${existingId} saved as ${result.decision.status}.`
+    : `${result.decision.id} created as Proposed.`;
+  decisionNextId = '';
+  await Promise.all([loadStatus(), loadDecisions()]);
+  return result;
+}
+
+async function acceptActiveDecision() {
+  const id = activeDecision && (activeDecision.id || activeDecision.dec_ulid);
+  if (!id) return null;
+	const actor = $('decision-edit-actor').value.trim();
+	if (!actor) {
+	  $('decision-edit-status').textContent = 'Choose the approving identity.';
+	  return null;
+	}
+	if (!window.confirm(`Accept ${id} as ${actor}? This records explicit human approval.`)) {
+	  return null;
+	}
+  $('decision-edit-status').textContent = `Accepting ${id}...`;
+  const result = await api('/api/decision/accept', {
+    method: 'POST',
+	body: JSON.stringify({
+	  id,
+	  actor,
+	  notes: $('decision-approval-notes').value,
+	}),
+  });
+  populateDecisionEditor(result.decision);
+  $('decision-output').textContent = result.block || result.decision.block || '';
+  $('decision-edit-status').textContent = `${id} is now ${result.decision.status.replace('_', ' ')}.`;
+  await Promise.all([loadStatus(), loadDecisions()]);
+  return result;
 }
 
 async function loadKanban(resultOverride = null) {
@@ -3599,6 +4276,19 @@ $('search-decisions').addEventListener('click', () => loadDecisions().catch((err
   $('decision-output').textContent = error.message;
 }));
 $('reload-decisions').addEventListener('click', () => loadDecisions().catch(console.error));
+$('new-decision').addEventListener('click', () => showNewDecisionEditor().catch((error) => {
+  $('decision-output').textContent = error.message;
+}));
+$('decision-editor').addEventListener('submit', (event) => {
+  event.preventDefault();
+  saveDecision().catch((error) => {
+    $('decision-edit-status').textContent = error.message;
+  });
+});
+$('accept-decision').addEventListener('click', () => acceptActiveDecision().catch((error) => {
+  $('decision-edit-status').textContent = error.message;
+}));
+$('cancel-decision-edit').addEventListener('click', () => resetDecisionEditor(true));
 $('decision-body').addEventListener('click', (event) => {
   const row = event.target.closest('[data-decision-id]');
   if (!row) return;

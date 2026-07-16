@@ -264,11 +264,12 @@ def _decision_body(config: AgentMeshConfig, row) -> str:
     body_path = row["body_path"]
     if not body_path:
         return ""
-    path = config.agent_dir / body_path
-    try:
-        return path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return ""
+    for path in (config.agent_dir / body_path, config.project_root / body_path):
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+    return ""
 
 
 def _write_multi(targets: list[Path], text: str) -> RenderedView:
