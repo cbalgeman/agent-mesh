@@ -487,6 +487,11 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return str(row["value"]) if row is not None and row["value"] is not None else None
+
+
 def json_dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 

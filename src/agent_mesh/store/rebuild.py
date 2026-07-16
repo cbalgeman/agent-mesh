@@ -25,6 +25,7 @@ from agent_mesh.core.provenance import (
 from agent_mesh.store.sqlite import (
     ALL_TABLES,
     connect,
+    get_meta,
     get_last_event_seq,
     initialize_schema,
     json_dumps,
@@ -34,6 +35,11 @@ from agent_mesh.store.sqlite import (
     set_last_event_seq,
     set_meta,
 )
+
+# Bump this whenever replay semantics change in a way that requires existing
+# SQLite projections to be regenerated. Event-log equality alone cannot detect
+# a package upgrade that changes how historical events are interpreted.
+PROJECTION_VERSION = "1"
 
 DECISION_PARENT_MISSING = "DECISION_PARENT_MISSING"
 DECISION_SUPERSEDE_TARGET_INVALID = "DECISION_SUPERSEDE_TARGET_INVALID"
@@ -138,6 +144,7 @@ def rebuild_all(
         table_hashes = table_hashes_for(cfg)
         with conn:
             set_meta(conn, "events_jsonl_sha", file_sha256(cfg.events_path))
+            set_meta(conn, "projection_version", PROJECTION_VERSION)
         return RebuildResult(event_count=event_count, last_event_seq=last_seq, table_hashes=table_hashes)
     finally:
         conn.close()
@@ -215,6 +222,29 @@ def file_sha256(path: str | Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def projection_is_current(config: AgentMeshConfig) -> bool:
+    """Return whether SQLite exactly projects the current event log and code contract.
+
+    Callers that use this result to skip a rebuild must hold the project mail
+    lock while checking it, so an append cannot race between the SHA comparison
+    and the subsequent read.
+    """
+    if not config.db_path.exists():
+        return False
+    expected_sha = file_sha256(config.events_path)
+    try:
+        conn = connect(config.db_path)
+        try:
+            return (
+                get_meta(conn, "projection_version") == PROJECTION_VERSION
+                and get_meta(conn, "events_jsonl_sha") == expected_sha
+            )
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError:
+        return False
 
 
 def _project_record(conn, record: dict[str, Any], config: AgentMeshConfig) -> None:

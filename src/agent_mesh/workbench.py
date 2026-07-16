@@ -34,7 +34,7 @@ from agent_mesh.project_registry import (
     resolve_registered_project,
     validate_registered_project_path,
 )
-from agent_mesh.store.rebuild import read_event_records, rebuild_all
+from agent_mesh.store.rebuild import projection_is_current, read_event_records, rebuild_all
 from agent_mesh.store.sqlite import connect, initialize_schema, json_loads, resolve_decision, resolve_message
 
 
@@ -134,8 +134,12 @@ def serve_workbench(
         server.server_close()
 
 
-def workbench_status(repo: Path) -> dict[str, Any]:
-    config = _load_and_rebuild(repo)
+def workbench_status(
+    repo: Path,
+    *,
+    _config: AgentMeshConfig | None = None,
+) -> dict[str, Any]:
+    config = _config or _load_and_rebuild(repo)
     conn = connect(config.db_path)
     try:
         initialize_schema(conn)
@@ -212,8 +216,9 @@ def list_messages(
     kind: str = "",
     feature: str = "",
     query: str = "",
+    _config: AgentMeshConfig | None = None,
 ) -> list[dict[str, Any]]:
-    config = _load_and_rebuild(repo)
+    config = _config or _load_and_rebuild(repo)
     conn = connect(config.db_path)
     try:
         initialize_schema(conn)
@@ -258,8 +263,9 @@ def list_backlog_items(
     wave: str = "",
     query: str = "",
     quick_filter: str = "",
+    _config: AgentMeshConfig | None = None,
 ) -> list[dict[str, Any]]:
-    config = _load_and_rebuild(repo)
+    config = _config or _load_and_rebuild(repo)
     conn = connect(config.db_path)
     try:
         initialize_schema(conn)
@@ -270,33 +276,29 @@ def list_backlog_items(
             """
         ).fetchall()
         items = [_backlog_item_from_row(row) for row in rows]
-        filters = {
-            "status": status,
-            "lane": lane,
-            "priority": priority,
-            "owner_hint": owner,
-            "item_type": item_type,
-            "launch_scope": launch_scope,
-            "wave": wave,
-        }
-        for key, expected in filters.items():
-            if expected:
-                items = [item for item in items if _contains(item.get(key), expected)]
-        if query:
-            items = [item for item in items if _backlog_item_matches_query(item, query)]
-        if quick_filter:
-            items = [
-                item
-                for item in items
-                if _backlog_item_matches_quick_filter(item, quick_filter)
-            ]
-        return items
+        return _filter_backlog_items(
+            items,
+            status=status,
+            lane=lane,
+            priority=priority,
+            owner=owner,
+            item_type=item_type,
+            launch_scope=launch_scope,
+            wave=wave,
+            query=query,
+            quick_filter=quick_filter,
+        )
     finally:
         conn.close()
 
 
-def backlog_kanban(repo: Path) -> dict[str, Any]:
-    items = list_backlog_items(repo)
+def backlog_kanban(
+    repo: Path,
+    *,
+    _config: AgentMeshConfig | None = None,
+    _items: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    items = _items if _items is not None else list_backlog_items(repo, _config=_config)
     lanes: dict[str, list[dict[str, Any]]] = {}
     for item in items:
         lanes.setdefault(str(item["lane"] or "unassigned"), []).append(item)
@@ -324,8 +326,9 @@ def list_decisions(
     query: str = "",
     status: str = "",
     tier: str = "",
+    _config: AgentMeshConfig | None = None,
 ) -> list[dict[str, Any]]:
-    config = _load_and_rebuild(repo)
+    config = _config or _load_and_rebuild(repo)
     conn = connect(config.db_path)
     try:
         initialize_schema(conn)
@@ -346,6 +349,73 @@ def list_decisions(
         return [_decision_item_from_row(row) for row in rows]
     finally:
         conn.close()
+
+
+def workbench_snapshot(
+    repo: Path,
+    *,
+    message_status: str = "",
+    message_kind: str = "",
+    message_feature: str = "",
+    message_query: str = "",
+    backlog_status: str = "",
+    backlog_lane: str = "",
+    backlog_priority: str = "",
+    backlog_owner: str = "",
+    backlog_item_type: str = "",
+    backlog_launch_scope: str = "",
+    backlog_wave: str = "",
+    backlog_query: str = "",
+    backlog_quick_filter: str = "",
+    decision_query: str = "",
+    decision_status: str = "",
+    decision_tier: str = "",
+) -> dict[str, Any]:
+    """Return the repo-switch payload from one projection freshness check."""
+    config = load_config(repo)
+    lock_handle = acquire(config.agent_dir / ".mail-lock")
+    try:
+        _rebuild_if_stale(config)
+        all_backlog_items = list_backlog_items(config.project_root, _config=config)
+        filtered_backlog_items = _filter_backlog_items(
+            all_backlog_items,
+            status=backlog_status,
+            lane=backlog_lane,
+            priority=backlog_priority,
+            owner=backlog_owner,
+            item_type=backlog_item_type,
+            launch_scope=backlog_launch_scope,
+            wave=backlog_wave,
+            query=backlog_query,
+            quick_filter=backlog_quick_filter,
+        )
+        return {
+            "ok": True,
+            "status": workbench_status(config.project_root, _config=config),
+            "messages": list_messages(
+                config.project_root,
+                status=message_status,
+                kind=message_kind,
+                feature=message_feature,
+                query=message_query,
+                _config=config,
+            ),
+            "backlog_items": filtered_backlog_items,
+            "decisions": list_decisions(
+                config.project_root,
+                query=decision_query,
+                status=decision_status,
+                tier=decision_tier,
+                _config=config,
+            ),
+            "kanban": backlog_kanban(
+                config.project_root,
+                _config=config,
+                _items=all_backlog_items,
+            ),
+        }
+    finally:
+        lock_handle.release()
 
 
 def lookup_decision(repo: Path, identifier: str) -> dict[str, Any] | None:
@@ -1054,10 +1124,15 @@ def _load_and_rebuild(repo: Path) -> AgentMeshConfig:
     config = load_config(repo)
     lock_handle = acquire(config.agent_dir / ".mail-lock")
     try:
-        rebuild_all(config)
+        _rebuild_if_stale(config)
     finally:
         lock_handle.release()
     return config
+
+
+def _rebuild_if_stale(config: AgentMeshConfig) -> None:
+    if not projection_is_current(config):
+        rebuild_all(config)
 
 
 def _handler_for(repo: Path, context: WorkbenchContext) -> type[BaseHTTPRequestHandler]:
@@ -1170,6 +1245,31 @@ def _handler_for(repo: Path, context: WorkbenchContext) -> type[BaseHTTPRequestH
                     )
                     return
                 selected_repo = _registered_repo_from_request(parsed, default_repo)
+                if parsed.path == "/api/snapshot":
+                    params = parse_qs(parsed.query)
+                    self._json(
+                        HTTPStatus.OK,
+                        workbench_snapshot(
+                            selected_repo,
+                            message_status=params.get("message_status", [""])[0].strip(),
+                            message_kind=params.get("message_kind", [""])[0].strip(),
+                            message_feature=params.get("message_feature", [""])[0].strip(),
+                            message_query=params.get("message_q", [""])[0].strip(),
+                            backlog_status=params.get("backlog_status", [""])[0].strip(),
+                            backlog_lane=params.get("backlog_lane", [""])[0].strip(),
+                            backlog_priority=params.get("backlog_priority", [""])[0].strip(),
+                            backlog_owner=params.get("backlog_owner", [""])[0].strip(),
+                            backlog_item_type=params.get("backlog_type", [""])[0].strip(),
+                            backlog_launch_scope=params.get("backlog_scope", [""])[0].strip(),
+                            backlog_wave=params.get("backlog_wave", [""])[0].strip(),
+                            backlog_query=params.get("backlog_q", [""])[0].strip(),
+                            backlog_quick_filter=params.get("backlog_filter", [""])[0].strip(),
+                            decision_query=params.get("decision_q", [""])[0].strip(),
+                            decision_status=params.get("decision_status", [""])[0].strip(),
+                            decision_tier=params.get("decision_tier", [""])[0].strip(),
+                        ),
+                    )
+                    return
                 if parsed.path == "/api/status":
                     self._json(HTTPStatus.OK, workbench_status(selected_repo))
                     return
@@ -1602,6 +1702,43 @@ def _decision_item_from_row(row) -> dict[str, Any]:
 
 def _contains(value: Any, expected: str) -> bool:
     return expected.lower() in str(value or "").lower()
+
+
+def _filter_backlog_items(
+    items: list[dict[str, Any]],
+    *,
+    status: str = "",
+    lane: str = "",
+    priority: str = "",
+    owner: str = "",
+    item_type: str = "",
+    launch_scope: str = "",
+    wave: str = "",
+    query: str = "",
+    quick_filter: str = "",
+) -> list[dict[str, Any]]:
+    filtered = list(items)
+    filters = {
+        "status": status,
+        "lane": lane,
+        "priority": priority,
+        "owner_hint": owner,
+        "item_type": item_type,
+        "launch_scope": launch_scope,
+        "wave": wave,
+    }
+    for key, expected in filters.items():
+        if expected:
+            filtered = [item for item in filtered if _contains(item.get(key), expected)]
+    if query:
+        filtered = [item for item in filtered if _backlog_item_matches_query(item, query)]
+    if quick_filter:
+        filtered = [
+            item
+            for item in filtered
+            if _backlog_item_matches_quick_filter(item, quick_filter)
+        ]
+    return filtered
 
 
 def _backlog_item_matches_query(item: dict[str, Any], query: str) -> bool:
@@ -2568,6 +2705,46 @@ function resetRepoView() {
   $('decision-output').textContent = '';
 }
 
+function snapshotParams() {
+  const params = new URLSearchParams();
+  [
+    ['message_q', 'message-search'],
+    ['message_status', 'message-status-filter'],
+    ['message_kind', 'message-kind-filter'],
+    ['message_feature', 'message-feature-filter'],
+    ['backlog_q', 'backlog-search'],
+    ['backlog_filter', 'backlog-quick-filter'],
+    ['backlog_status', 'backlog-status-filter'],
+    ['backlog_lane', 'backlog-lane-filter'],
+    ['backlog_priority', 'backlog-priority-filter'],
+    ['backlog_owner', 'backlog-owner-filter'],
+    ['backlog_type', 'backlog-type-filter'],
+    ['backlog_scope', 'backlog-scope-filter'],
+    ['backlog_wave', 'backlog-wave-filter'],
+    ['decision_q', 'decision-search'],
+    ['decision_status', 'decision-status-filter'],
+    ['decision_tier', 'decision-tier-filter'],
+  ].forEach(([key, id]) => {
+    const value = $(id).value.trim();
+    if (value) params.set(key, value);
+  });
+  return params;
+}
+
+async function loadSnapshot() {
+  const params = snapshotParams();
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const result = await api(`/api/snapshot${suffix}`);
+  await Promise.all([
+    loadStatus(result.status),
+    loadMessages({ ok: true, messages: result.messages }),
+    loadBacklog({ ok: true, items: result.backlog_items }),
+    loadDecisions({ ok: true, decisions: result.decisions }),
+    loadKanban(result.kanban),
+  ]);
+  return result;
+}
+
 async function switchRepo(identifier) {
   if (!identifier || identifier === activeRepoId) return;
   activeRepoId = identifier;
@@ -2578,7 +2755,7 @@ async function switchRepo(identifier) {
   }
   resetRepoView();
   restoreFeedbackDraft();
-  await Promise.all([loadStatus(), loadMessages(), loadBacklog(), loadDecisions(), loadKanban()]);
+  await loadSnapshot();
   await recoverPendingFeedbackSubmission();
 }
 
@@ -2667,9 +2844,9 @@ function setTableSort(table, key) {
   if (table === 'decisions') renderDecisionRows(decisionRows);
 }
 
-async function loadStatus() {
+async function loadStatus(statusOverride = null) {
   try {
-    const status = await api('/api/status');
+    const status = statusOverride || await api('/api/status');
     const c = status.counts;
 	    $('status').innerHTML = [
 	      `repo ${status.project.root}`,
@@ -2919,7 +3096,7 @@ async function lookupMessage() {
   return result;
 }
 
-async function loadMessages() {
+async function loadMessages(resultOverride = null) {
   const params = new URLSearchParams();
   const query = $('message-search').value.trim();
   const status = $('message-status-filter').value.trim();
@@ -2930,7 +3107,7 @@ async function loadMessages() {
   if (kind) params.set('kind', kind);
   if (feature) params.set('feature', feature);
   const suffix = params.toString() ? `?${params.toString()}` : '';
-  const result = await api(`/api/messages${suffix}`);
+  const result = resultOverride || await api(`/api/messages${suffix}`);
   messageRows = result.messages;
   renderMessageRows(messageRows);
   $('message-edit-status').textContent = `Showing ${result.messages.length} message(s)${describeMessageFilters(params)}`;
@@ -3010,7 +3187,7 @@ async function updateMessageStatus() {
   await Promise.all([loadStatus(), loadMessages()]);
 }
 
-async function loadBacklog() {
+async function loadBacklog(resultOverride = null) {
   const params = new URLSearchParams();
   const query = $('backlog-search').value.trim();
   const quickFilter = $('backlog-quick-filter').value;
@@ -3031,7 +3208,7 @@ async function loadBacklog() {
   if (scope) params.set('scope', scope);
   if (wave) params.set('wave', wave);
   const suffix = params.toString() ? `?${params.toString()}` : '';
-  const result = await api(`/api/backlog/items${suffix}`);
+  const result = resultOverride || await api(`/api/backlog/items${suffix}`);
   backlogRows = result.items;
   renderBacklogRows(backlogRows);
   $('backlog-edit-status').textContent = `Showing ${result.items.length} backlog item(s)${describeBacklogFilters(params)}`;
@@ -3065,7 +3242,7 @@ async function lookupBacklogItem(id) {
   return result;
 }
 
-async function loadDecisions() {
+async function loadDecisions(resultOverride = null) {
   const params = new URLSearchParams();
   const query = $('decision-search').value.trim();
   const status = $('decision-status-filter').value.trim();
@@ -3074,7 +3251,7 @@ async function loadDecisions() {
   if (status) params.set('status', status);
   if (tier) params.set('tier', tier);
   const suffix = params.toString() ? `?${params.toString()}` : '';
-  const result = await api(`/api/decisions${suffix}`);
+  const result = resultOverride || await api(`/api/decisions${suffix}`);
   decisionRows = result.decisions;
   renderDecisionRows(decisionRows);
 }
@@ -3108,8 +3285,8 @@ async function lookupDecision(id) {
   ].join('\\n').trim() + '\\n';
 }
 
-async function loadKanban() {
-  const result = await api('/api/backlog/kanban');
+async function loadKanban(resultOverride = null) {
+  const result = resultOverride || await api('/api/backlog/kanban');
   const lanes = Object.entries(result.lanes).sort(([a], [b]) => a.localeCompare(b));
   $('kanban').innerHTML = lanes.map(([lane, items]) => `
     <div class="lane" data-lane="${escapeHtml(lane)}">
@@ -3148,7 +3325,7 @@ async function updateBacklogItem(id, field, value) {
     body: JSON.stringify({ id, [field]: value }),
   });
   $('backlog-edit-status').textContent = `Saved ${id} ${field}`;
-  await Promise.all([loadStatus(), loadBacklog(), loadKanban()]);
+  await loadSnapshot();
 }
 
 async function copyText(value) {
@@ -3534,13 +3711,7 @@ window.addEventListener('focus', checkServerConnection);
 loadProjects().then(() => {
   resetRepoView();
   restoreFeedbackDraft();
-  return Promise.all([
-    loadStatus(),
-    loadMessages(),
-    loadBacklog(),
-    loadDecisions(),
-    loadKanban(),
-  ]);
+  return loadSnapshot();
 }).then(() => recoverPendingFeedbackSubmission()).catch((error) => {
   $('status').innerHTML = `<span class="badge">startup error ${escapeHtml(error.message)}</span>`;
 });
