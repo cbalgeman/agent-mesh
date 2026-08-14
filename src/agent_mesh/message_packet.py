@@ -1,4 +1,5 @@
 """Thread-scoped message packets for agent-mesh readers."""
+
 from __future__ import annotations
 
 import json
@@ -33,23 +34,26 @@ def build_message_packet(
         item_body, item_truncated = _bounded_text(
             body_from_message_row(item), max_thread_body_chars
         )
-        thread.append({
-            "id": item["id"],
-            "kind": item["kind"],
-            "created_utc": item["created_utc"],
-            "event_seq": item["event_seq"],
-            "sender": item["sender"],
-            "parent_id": item["parent_id"],
-            "request_id": item["request_id"],
-            "title": item["title"],
-            "summary": item["summary"],
-            "body": item_body,
-            "body_truncated": item_truncated,
-            "body_bytes": item["body_bytes"],
-            "body_fidelity": item["body_fidelity"],
-            "body_authority": item["body_authority"],
-            "status": item["status"],
-        })
+        thread.append(
+            {
+                "id": item["id"],
+                "kind": item["kind"],
+                "created_utc": item["created_utc"],
+                "event_seq": item["event_seq"],
+                "sender": item["sender"],
+                "sender_instance_id": item["sender_instance_id"],
+                "parent_id": item["parent_id"],
+                "request_id": item["request_id"],
+                "title": item["title"],
+                "summary": item["summary"],
+                "body": item_body,
+                "body_truncated": item_truncated,
+                "body_bytes": item["body_bytes"],
+                "body_fidelity": item["body_fidelity"],
+                "body_authority": item["body_authority"],
+                "status": item["status"],
+            }
+        )
     packet: dict[str, Any] = {
         "packet_version": 1,
         "message": {
@@ -59,8 +63,13 @@ def build_message_packet(
             "request_id": row["request_id"],
             "parent_id": row["parent_id"],
             "sender": row["sender"],
+            "sender_instance_id": row["sender_instance_id"],
             "recipients": json_loads(row["recipients_json"], []),
+            "recipient_instance_ids": json_loads(row["recipient_instance_ids_json"], []),
             "feature": row["feature_id"],
+            "workflow_origin": row["workflow_origin"],
+            "workflow_origin_valid": bool(row["workflow_origin_valid"]),
+            "workflow_origin_source": row["workflow_origin_source"],
             "title": row["title"],
             "summary": row["summary"],
             "status": row["status"],

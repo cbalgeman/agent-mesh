@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-mesh"
 version = "0.2.0"
-description = "Durable, append-only message substrate for multi-agent collaboration"
+description = "Local, auditable coordination and decision tracking for human and AI-agent teams"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -24,9 +24,24 @@ dependencies = [
     # Stdlib-only by design for core. Optional integrations can wrap the CLI.
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=7",
+    "ruff>=0.4",
+]
+
 [project.scripts]
 agent-mesh = "agent_mesh.cli.mail:main"
 agent-q = "agent_mesh.cli.q:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/public"]
+addopts = "-ra"
+pythonpath = ["src"]

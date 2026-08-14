@@ -23,7 +23,9 @@ import json
 
 from agent_mesh.core.chain import ChainAnchor, ChainResult, capture_anchor, verify_chain
 from agent_mesh.core.dispatch_schema import validate_dispatch_payload
+from agent_mesh.core.agent_instances import resolve_authoring_actor
 from agent_mesh.core.events import AppendResult, Event, append_event, generate_event_id
+from agent_mesh.store.rebuild import read_event_records
 
 from .types import RunPlan
 
@@ -137,6 +139,10 @@ def _append(
 ) -> AppendResult:
     # Fail fast at the emitter boundary; append_event re-validates as the substrate's own guard.
     validate_dispatch_payload(kind, payload)
+    actor = resolve_authoring_actor(
+        read_event_records(events_path),
+        default_actor=actor,
+    )
     event = Event(
         event_id=generate_event_id(),
         kind=kind,

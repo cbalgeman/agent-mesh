@@ -26,6 +26,33 @@ the pre-publication checklist.
 
 ## Choose the project identity used in IDs
 
+Each initialized project persists three identity fields in addition to its
+display name and participant defaults:
+
+```toml
+[project]
+name = "example-project"
+timezone = "America/Los_Angeles"
+key = "example-project"
+store_id = "store_01KZPR603PBSJ1VKR9KA9PB6M4"
+default_sender = "human"
+default_recipient = "builder"
+```
+
+- `timezone` is the human user's IANA timezone. It determines the date portion
+  of newly allocated `BKL-YYYYMMDD-NN` IDs. Canonical event timestamps remain
+  UTC.
+- `key` is the stable, human-readable cross-repository project reference.
+- `store_id` is the stable machine identity. Agent Mesh generates it once; do
+  not edit, copy to a simultaneously live checkout, or derive it from the path.
+
+`agent-mesh adopt` fills missing identity fields under a repository lock and
+replaces an explicit legacy path-derived `repo-…` value atomically. It preserves
+an existing current value and never rewrites `timezone` or `key` implicitly.
+Machine-registry registration rejects a `store_id` already assigned to another
+live root. After an actual repository move, registration may replace the old row
+only when that recorded root no longer exists.
+
 `[project].default_sender` is the identity used when `agent-mesh request`,
 `agent-mesh reply`, feedback submission, or the workbench omit an explicit `--from`
 or sender. New public IDs include this identity in uppercase:
@@ -42,7 +69,15 @@ generic alias such as `human` or `user`. The value must be listed in
 affects only future writes; existing REQ/RES IDs and the event hash chain are not
 rewritten.
 
-## Add an agent to an existing project
+## Add an agent to an existing project: identity vs runtime
+
+“Add an agent” is ambiguous. This section adds a **participant identity**: a
+durable sender/recipient address in Agent Mesh. It does not install an executable
+runtime, authenticate a provider, select or pin a model, grant repository/tool/
+internet access, or assign a workflow role. Specify and verify those runtime
+integration layers separately. In particular, verify the executable, selected
+model, repository and tool access, authentication method, and billing mode as
+independent facts. A participant identity alone never enables execution.
 
 Adding a participant is a config edit plus a projection rebuild. It must not rewrite
 `.agent-mesh/events.jsonl`, migrate historical events, or copy project-specific wrapper
@@ -65,6 +100,9 @@ schema_version = 1
 
 [project]
 name = "example-project"
+timezone = "America/Los_Angeles"
+key = "example-project"
+store_id = "store_01KZPR603PBSJ1VKR9KA9PB6M4"
 default_sender = "human"
 default_recipient = "builder"
 
@@ -148,6 +186,100 @@ When another repo is the consumer, treat that repo's agent as a tester/user of t
 make reusable fixes in `agent-mesh`, then have the consumer verify through its wrapper or
 local `PYTHONPATH` without vendoring package code.
 
+## Distinguish parallel instances of one participant
+
+A participant such as `claude` is the durable coordination identity; it is not
+one particular chat window. When several long-running chats use that participant,
+register each as an AI-agent instance rather than inventing provider names or
+duplicating participants:
+
+```bash
+agent-mesh instance register --participant claude --provider anthropic \
+  --label claude-case-study --workstream case-study
+agent-mesh instance register --participant claude --provider anthropic \
+  --label claude-design --workstream design-system
+agent-q instances list --participant claude
+```
+
+The instance registry is append-only project state, not TOML configuration.
+Each stable ID can have human-friendly label aliases and an optional runtime
+profile or hashed external session reference. Once a participant has an active
+instance, every new canonical event authored by that participant must carry a
+valid active instance binding via global `--instance` or
+`AGENT_MESH_INSTANCE_ID`.
+
+Use request `--to-instance` or backlog `--owner-instance` to hand work to a
+specific existing chat. Do not use a runtime profile to stand in for an
+instance: the profile describes how a process may be launched, while the
+instance identifies the long-lived work context expected to receive the
+handoff. See `docs/agent-instances.md` for commands and boundaries.
+
+## Enable a pinned executable runtime
+
+A participant identity is inert until exactly one enabled runtime profile binds
+it to an executable. Profiles are project-local and name every execution fact
+that must not be inherited accidentally: provider, adapter, executable version,
+model, role, permission mode, repository scope, capabilities, authentication and
+billing boundary, and credential denylist.
+Participant identity alone never enables execution.
+
+This example enables a subscription-backed Codex research/review profile. Pin
+the version actually installed on the machine; an upgrade deliberately makes
+preflight fail until the profile is reviewed and updated.
+
+```toml
+[dispatch.runtime_profiles.sol_research]
+target = "codex"
+provider = "openai"
+adapter = "codex-cli"
+binary = "/opt/homebrew/bin/codex"
+version = "0.146.1"
+model = "gpt-5.6-sol"
+role = "research-reviewer"
+permission_mode = "read-only"
+repository_scope = "project"
+required_capabilities = ["repository", "tools", "network"]
+authentication_mode = "chatgpt"
+billing_mode = "subscription"
+credential_denylist = [
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+]
+enabled = true
+```
+
+The denylist contains variable names, never credential values. Subscription
+profiles also receive a package-level denylist for common OpenAI, Anthropic,
+Google/Gemini, Vertex, and Cursor API credentials. The child process receives a
+copied environment with all of those variables removed; the parent environment
+is unchanged.
+
+Run the read-only preflight before creating work for the participant:
+
+```bash
+agent-q dispatches preflight --target codex
+```
+
+For `codex-cli`, preflight uses non-prompt CLI surfaces to verify the resolved
+binary and exact version, requested model in the model catalog, ChatGPT login,
+subscription billing policy, configured sandbox, repository root, declared
+tool/network flags, and credential isolation. `dispatches once` and
+`dispatches worker` repeat that preflight before writing a plan, lease, or start
+event. The bounded worker repeats preflight before every possible live launch,
+so version, authentication, or capability drift between long-running iterations
+fails before the next lifecycle write. A failure writes no dispatch events for
+that attempted launch.
+
+Only `openai` + `codex-cli` currently has a machine-verifiable live adapter.
+Profiles for Antigravity, Claude, Cursor, or another runtime can be represented
+by the same schema, but preflight fails the `adapter` check until that adapter
+can prove its version, model, authentication/billing boundary, and capabilities
+without a billed probe or brittle UI scraping. Do not weaken the check to make a
+profile appear live.
+
 ## Machine-Local Workbench Registry
 
 Project data and policy remain in each repo's `.agent-mesh/config.toml`. The list
@@ -170,3 +302,10 @@ users, or ask the human to maintain it manually. Registry entries are canonical
 resolved paths; the Workbench ignores stale entries and rejects unknown repo IDs.
 Registration also rejects symlinked or external Agent Mesh state paths so a
 selected repo cannot route Workbench reads or writes into another checkout.
+
+Current registry rows use the repository's stable `[project].store_id`. When a
+valid same-root row still uses the older path-derived `repo-…` ID, the registry
+reader upgrades that row under the machine-registry lock and replaces the file
+atomically. It does not reassign a `store_id` already claimed by another root;
+resolve that conflict explicitly with `agent-mesh projects register` after
+checking the affected paths.

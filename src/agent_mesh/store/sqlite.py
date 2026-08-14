@@ -1,4 +1,5 @@
 """SQLite projection store for agent-mesh events."""
+
 from __future__ import annotations
 
 import json
@@ -8,6 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+AGENT_INSTANCE_TABLES = (
+    "agent_instances",
+    "agent_instance_aliases",
+)
 MESSAGE_TABLES = (
     "messages",
     "message_refs",
@@ -37,7 +42,9 @@ DISPATCH_TABLES = (
     "dispatch_runs",
     "dispatch_leases",
 )
-ALL_TABLES = MESSAGE_TABLES + DECISION_TABLES + BACKLOG_TABLES + DISPATCH_TABLES
+ALL_TABLES = (
+    AGENT_INSTANCE_TABLES + MESSAGE_TABLES + DECISION_TABLES + BACKLOG_TABLES + DISPATCH_TABLES
+)
 
 
 class StoreError(RuntimeError):
@@ -79,8 +86,41 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
     # Existing projection DBs may already have a pre-source-provenance messages
     # table. Add new columns before CREATE INDEX statements reference them.
     _migrate_messages_source_schema(conn)
+    _migrate_workflow_origin_schema(conn)
+    _migrate_agent_instance_schema(conn)
     conn.executescript(
         """
+        CREATE TABLE IF NOT EXISTS agent_instances (
+          id                          TEXT PRIMARY KEY,
+          participant                 TEXT NOT NULL,
+          provider                    TEXT NOT NULL,
+          label                       TEXT NOT NULL,
+          workstream                  TEXT,
+          runtime_profile             TEXT,
+          external_session_ref_digest TEXT,
+          status                      TEXT NOT NULL,
+          created_utc                 TEXT NOT NULL,
+          updated_utc                 TEXT NOT NULL,
+          retired_utc                 TEXT,
+          last_seen_utc               TEXT,
+          last_seen_event_seq         INTEGER,
+          created_event_seq           INTEGER NOT NULL,
+          event_seq                   INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_instances_participant
+          ON agent_instances(participant, status);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_instances_label
+          ON agent_instances(label);
+
+        CREATE TABLE IF NOT EXISTS agent_instance_aliases (
+          label       TEXT PRIMARY KEY,
+          instance_id TEXT NOT NULL,
+          is_primary  INTEGER NOT NULL,
+          event_seq   INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_instance_aliases_id
+          ON agent_instance_aliases(instance_id);
+
         CREATE TABLE IF NOT EXISTS messages (
           id              TEXT PRIMARY KEY,
           kind            TEXT NOT NULL,
@@ -89,8 +129,13 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
           request_id      TEXT,
           parent_id       TEXT,
           sender          TEXT NOT NULL,
+          sender_instance_id TEXT,
           recipients_json TEXT,
+          recipient_instance_ids_json TEXT,
           feature_id      TEXT,
+          workflow_origin TEXT,
+          workflow_origin_valid INTEGER NOT NULL DEFAULT 1,
+          workflow_origin_source TEXT NOT NULL DEFAULT 'none',
           title           TEXT,
           summary         TEXT,
           body_preview    TEXT,
@@ -119,6 +164,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_messages_status      ON messages(status);
         CREATE INDEX IF NOT EXISTS idx_messages_recipient   ON messages(recipients_json);
         CREATE INDEX IF NOT EXISTS idx_messages_feature     ON messages(feature_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_workflow_origin ON messages(workflow_origin);
         CREATE INDEX IF NOT EXISTS idx_messages_created     ON messages(created_utc);
         CREATE INDEX IF NOT EXISTS idx_messages_request_id  ON messages(request_id);
         CREATE INDEX IF NOT EXISTS idx_messages_thread      ON messages(thread_id);
@@ -199,6 +245,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
           parent_human_id    TEXT,
           title              TEXT NOT NULL,
           tier               TEXT NOT NULL,
+          tier_valid         INTEGER NOT NULL DEFAULT 1,
           status             TEXT NOT NULL,
           enforcement_mode   TEXT NOT NULL,
           owner              TEXT,
@@ -248,6 +295,8 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS decision_verifications (
           dec_ulid           TEXT NOT NULL,
           command            TEXT NOT NULL,
+          execution_mode     TEXT NOT NULL DEFAULT 'legacy_shell',
+          argv_json          TEXT,
           expected_signal    TEXT NOT NULL,
           runtime_cost       TEXT,
           drift_risk         TEXT,
@@ -308,8 +357,12 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
           production_state       TEXT,
           disposition            TEXT,
           owner_hint             TEXT,
+          owner_instance_id      TEXT,
           lane                   TEXT,
           notes                  TEXT,
+          workflow_origin        TEXT,
+          workflow_origin_valid  INTEGER NOT NULL DEFAULT 1,
+          workflow_origin_source TEXT NOT NULL DEFAULT 'none',
           refs_json              TEXT,
           created_utc            TEXT NOT NULL,
           updated_utc            TEXT NOT NULL,
@@ -319,6 +372,9 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_backlog_items_status ON backlog_items(status);
         CREATE INDEX IF NOT EXISTS idx_backlog_items_lane ON backlog_items(lane);
         CREATE INDEX IF NOT EXISTS idx_backlog_items_priority ON backlog_items(priority);
+        CREATE INDEX IF NOT EXISTS idx_backlog_items_workflow_origin ON backlog_items(workflow_origin);
+        CREATE INDEX IF NOT EXISTS idx_backlog_items_owner_instance
+          ON backlog_items(owner_instance_id);
 
         CREATE TABLE IF NOT EXISTS backlog_item_links (
           link_event_id TEXT NOT NULL PRIMARY KEY,
@@ -335,6 +391,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
           item_id      TEXT NOT NULL,
           event_type   TEXT NOT NULL,
           actor        TEXT NOT NULL,
+          actor_instance_id TEXT,
           created_utc  TEXT NOT NULL,
           details_json TEXT,
           event_seq    INTEGER NOT NULL
@@ -403,17 +460,17 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         """
     )
     _migrate_messages_source_schema(conn)
+    _migrate_decisions_schema(conn)
     _migrate_backlog_item_links_schema(conn)
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES ('schema_version', '1') "
-        "ON CONFLICT(key) DO NOTHING"
+        "INSERT INTO meta(key, value) VALUES ('schema_version', '1') ON CONFLICT(key) DO NOTHING"
     )
     conn.execute(
         "INSERT INTO meta(key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (
             "domain_versions",
-            '{"messages":2,"source_provenance":1,"decisions":1,"backlog":1,"dispatch":1}',
+            '{"messages":4,"source_provenance":1,"workflow_origin":1,"decisions":4,"backlog":3,"dispatch":1,"agent_instances":1}',
         ),
     )
     if conn.execute("SELECT COUNT(*) FROM events_seen").fetchone()[0] == 0:
@@ -457,6 +514,57 @@ def _migrate_messages_source_schema(conn: sqlite3.Connection) -> None:
         )
     if "body_fidelity" not in columns:
         conn.execute("ALTER TABLE messages ADD COLUMN body_fidelity TEXT")
+
+
+def _migrate_workflow_origin_schema(conn: sqlite3.Connection) -> None:
+    for table in ("messages", "backlog_items"):
+        columns = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})")]
+        if not columns:
+            continue
+        if "workflow_origin" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN workflow_origin TEXT")
+        if "workflow_origin_valid" not in columns:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN workflow_origin_valid INTEGER NOT NULL DEFAULT 1"
+            )
+        if "workflow_origin_source" not in columns:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN "
+                "workflow_origin_source TEXT NOT NULL DEFAULT 'none'"
+            )
+
+
+def _migrate_agent_instance_schema(conn: sqlite3.Connection) -> None:
+    message_columns = [row["name"] for row in conn.execute("PRAGMA table_info(messages)")]
+    if message_columns:
+        if "sender_instance_id" not in message_columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN sender_instance_id TEXT")
+        if "recipient_instance_ids_json" not in message_columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN recipient_instance_ids_json TEXT")
+
+    backlog_columns = [row["name"] for row in conn.execute("PRAGMA table_info(backlog_items)")]
+    if backlog_columns and "owner_instance_id" not in backlog_columns:
+        conn.execute("ALTER TABLE backlog_items ADD COLUMN owner_instance_id TEXT")
+
+    event_columns = [row["name"] for row in conn.execute("PRAGMA table_info(backlog_events)")]
+    if event_columns and "actor_instance_id" not in event_columns:
+        conn.execute("ALTER TABLE backlog_events ADD COLUMN actor_instance_id TEXT")
+
+
+def _migrate_decisions_schema(conn: sqlite3.Connection) -> None:
+    columns = [row["name"] for row in conn.execute("PRAGMA table_info(decisions)")]
+    if columns and "tier_valid" not in columns:
+        conn.execute("ALTER TABLE decisions ADD COLUMN tier_valid INTEGER NOT NULL DEFAULT 1")
+    verification_columns = [
+        row["name"] for row in conn.execute("PRAGMA table_info(decision_verifications)")
+    ]
+    if verification_columns and "execution_mode" not in verification_columns:
+        conn.execute(
+            "ALTER TABLE decision_verifications "
+            "ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'legacy_shell'"
+        )
+    if verification_columns and "argv_json" not in verification_columns:
+        conn.execute("ALTER TABLE decision_verifications ADD COLUMN argv_json TEXT")
 
 
 def reset_schema(conn: sqlite3.Connection) -> None:
@@ -519,6 +627,21 @@ def resolve_message(conn: sqlite3.Connection, identifier: str) -> sqlite3.Row | 
     return conn.execute("SELECT * FROM messages WHERE id = ?", (identifier,)).fetchone()
 
 
+def resolve_agent_instance(conn: sqlite3.Connection, identifier: str) -> sqlite3.Row | None:
+    direct = conn.execute("SELECT * FROM agent_instances WHERE id=?", (identifier,)).fetchone()
+    if direct is not None:
+        return direct
+    alias = conn.execute(
+        "SELECT instance_id FROM agent_instance_aliases WHERE label=?",
+        (identifier.strip().lower(),),
+    ).fetchone()
+    if alias is None:
+        return None
+    return conn.execute(
+        "SELECT * FROM agent_instances WHERE id=?", (alias["instance_id"],)
+    ).fetchone()
+
+
 def body_from_message_row(row: sqlite3.Row) -> str:
     meta = json_loads(row["meta_json"], {})
     return str(meta.get("body", ""))
@@ -546,6 +669,8 @@ def dump_all_tables(conn: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]
 
 def _natural_order_key(table: str) -> tuple[str, ...]:
     return {
+        "agent_instances": ("created_event_seq", "id"),
+        "agent_instance_aliases": ("label",),
         "messages": ("event_seq", "id"),
         "message_refs": ("message_id", "ref_type", "ref_value"),
         "message_source_context_refs": ("message_id", "ref_index"),

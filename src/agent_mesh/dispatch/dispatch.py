@@ -52,13 +52,14 @@ def to_message(event: dict, *, aliases: dict[str, list[str]] | None = None) -> M
         kind=event.get("kind", ""),
         event_seq=int(event.get("event_seq", 0)),
         thread_id=thread_id,
-        sender=payload.get("from", ""),
+        sender=event.get("actor", ""),
         actor=event.get("actor", ""),
         feature=(payload.get("feature") or "").strip(),
         title=payload.get("title", ""),
         status=payload.get("status", ""),
         response_mode=(payload.get("response_mode") or "single"),
         recipients=tuple(recipients),
+        recipient_instances=tuple(str(value) for value in payload.get("to_instances", []) or []),
         refs=tuple(payload.get("refs", []) or []),
     )
 
@@ -70,7 +71,7 @@ def responders_by_thread(events: list[dict]) -> dict[str, set[str]]:
         if event.get("kind") != "res_posted":
             continue
         thread = event.get("thread_id", "")
-        sender = (event.get("payload", {}) or {}).get("from", "") or event.get("actor", "")
+        sender = event.get("actor", "")
         if not sender:
             continue  # an unattributable res can neither credit an agent nor close a thread
         out.setdefault(thread, set()).add(sender)
@@ -205,6 +206,10 @@ def find_pending(
         if int(event.get("event_seq", 0)) <= since_seq:
             continue
         message = to_message(event, aliases=aliases)
+        if message.recipient_instances:
+            # A generic participant runtime is not the already-running, manually operated chat
+            # named by an instance address. The instance retrieves this request explicitly.
+            continue
         answered = responders.get(message.thread_id, set())
         # response_mode="single" means ONE response closes the thread: if anyone has answered, the
         # request is done. "multi" keeps per-agent remaining-target scheduling.

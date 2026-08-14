@@ -5,6 +5,7 @@ build sanitized launch specs only; they do not acquire leases, append lifecycle 
 messages, or persist raw prompts. That keeps agent-mesh core platform-agnostic while allowing host
 controllers to launch Claude Code, Codex, OpenCode, or future runtimes through the same contract.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -22,6 +23,30 @@ from .types import AgentLaunchResult, AgentLaunchSpec, AgentRunRequest
 
 
 DEFAULT_CODEX_BINARY = "/Applications/Codex.app/Contents/Resources/codex"
+SUBSCRIPTION_API_CREDENTIALS = (
+    "ANTHROPIC_API_KEY",
+    "CURSOR_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "OPENAI_API_KEY",
+)
+
+
+def sanitized_child_environment(
+    credential_denylist: tuple[str, ...] | list[str],
+    *,
+    source: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Copy the process environment without API credentials denied to subscription runtimes."""
+
+    environment = dict(os.environ if source is None else source)
+    for variable in {*SUBSCRIPTION_API_CREDENTIALS, *credential_denylist}:
+        environment.pop(variable, None)
+    return environment
 
 
 class AgentProcessLauncher:
@@ -54,6 +79,7 @@ class AgentProcessLauncher:
             completed = subprocess.run(
                 spec.argv,
                 cwd=spec.cwd,
+                env=spec.environment,
                 input=spec.stdin_text,
                 capture_output=True,
                 text=True,
@@ -103,6 +129,7 @@ class AgentProcessLauncher:
                 proc = subprocess.Popen(
                     spec.argv,
                     cwd=spec.cwd,
+                    env=spec.environment,
                     stdin=subprocess.PIPE,
                     stdout=slave_fd,
                     stderr=slave_fd,
@@ -145,7 +172,9 @@ class AgentProcessLauncher:
                 readable, writable, _ = select.select([master_fd], write_fds, [], timeout)
                 if stdin_fd is not None and stdin_fd in writable:
                     try:
-                        written = os.write(stdin_fd, stdin_bytes[stdin_offset : stdin_offset + 65536])
+                        written = os.write(
+                            stdin_fd, stdin_bytes[stdin_offset : stdin_offset + 65536]
+                        )
                     except OSError:
                         proc.stdin.close()  # type: ignore[union-attr]
                         stdin_fd = None
@@ -238,37 +267,78 @@ class CodexCliRuntimeAdapter(AgentRuntimeAdapter):
             binary = DEFAULT_CODEX_BINARY
         if not binary:
             raise ValueError("codex runtime binary must be configured")
-        sandbox = str(self.spec.options.get("sandbox") or "workspace-write").strip()
-        if not sandbox:
-            raise ValueError("codex runtime sandbox must be configured")
-        prompt_sha = hashlib.sha256(request.prompt.encode("utf-8")).hexdigest()
+        version = str(self.spec.options.get("version") or "").strip()
+        model = str(self.spec.options.get("model") or "").strip()
+        role = str(self.spec.options.get("role") or "").strip()
+        sandbox = str(self.spec.options.get("permission_mode") or "").strip()
+        authentication_mode = str(self.spec.options.get("authentication_mode") or "").strip()
+        billing_mode = str(self.spec.options.get("billing_mode") or "").strip()
+        capabilities = tuple(str(item) for item in self.spec.options.get("capabilities", ()))
+        credential_denylist = tuple(
+            str(item) for item in self.spec.options.get("credential_denylist", ())
+        )
+        required = {
+            "version": version,
+            "model": model,
+            "role": role,
+            "permission_mode": sandbox,
+            "authentication_mode": authentication_mode,
+            "billing_mode": billing_mode,
+        }
+        for field_name, value in required.items():
+            if not value:
+                raise ValueError(f"codex runtime {field_name} must be configured")
+        if sandbox not in {"read-only", "workspace-write"}:
+            raise ValueError("codex runtime permission_mode must be read-only or workspace-write")
+        if "repository" not in capabilities:
+            raise ValueError("codex runtime capabilities must include repository")
+        if not credential_denylist:
+            raise ValueError("codex runtime credential_denylist must be configured")
+        actual_prompt = f"Agent Mesh role: {role}\n\n{request.prompt}"
+        prompt_sha = hashlib.sha256(actual_prompt.encode("utf-8")).hexdigest()
         fd, stdout_file_name = tempfile.mkstemp(prefix="agent-mesh-codex-", suffix=".txt")
         os.close(fd)
         stdout_file = Path(stdout_file_name)
         stdout_file.unlink(missing_ok=True)
-        argv = [
-            binary,
-            "exec",
-            "--sandbox",
-            sandbox,
-            "--skip-git-repo-check",
-            "--output-last-message",
-            str(stdout_file),
-        ]
+        argv = [binary]
+        if "network" in capabilities:
+            argv.append("--search")
+        argv.extend(
+            [
+                "exec",
+                "--ignore-user-config",
+                "--strict-config",
+                "--model",
+                model,
+                "--sandbox",
+                sandbox,
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--output-last-message",
+                str(stdout_file),
+            ]
+        )
         return AgentLaunchSpec(
             argv=argv,
             cwd=Path(request.project_root),
             requires_pty=True,
             timeout_seconds=int(request.timeout_seconds),
             prompt_sha=prompt_sha,
-            stdin_text=request.prompt,
+            stdin_text=actual_prompt,
             metadata={
                 "runtime": "codex-cli",
+                "runtime_version": version,
                 "target_agent": request.target_agent,
                 "run_id": request.run_id,
                 "session_uuid": request.session_uuid,
                 "gen_ai.system": "openai",
+                "model": model,
+                "role": role,
                 "sandbox": sandbox,
+                "capabilities": list(capabilities),
+                "authentication_mode": authentication_mode,
+                "billing_mode": billing_mode,
             },
             stdout_file=stdout_file,
+            environment=sanitized_child_environment(credential_denylist),
         )

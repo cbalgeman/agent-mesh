@@ -1,8 +1,17 @@
 # Privacy and Git Sharing
 
-Agent Mesh state can contain participant identities, request and response text,
-decision records, source paths, and uploaded attachments. Treat `.agent-mesh/` as project data,
-not as harmless generated metadata.
+Agent Mesh state can contain participant and AI-agent instance identities,
+request and response text, decision records, source paths, and uploaded
+attachments. Treat `.agent-mesh/` as project data, not as harmless generated
+metadata.
+
+Instance records include the stable instance ID, label and aliases, participant,
+provider, workstream, optional runtime-profile name, lifecycle timestamps, and
+per-event attribution. An optional external provider session reference is stored
+only as a SHA-256 digest; the raw reference is not written to canonical state.
+The digest can still act as a correlator, so do not treat it as anonymous data.
+Instance attribution applies only to promoted Agent Mesh records and does not
+automatically copy ordinary chat transcripts.
 
 ## Privacy-first default
 

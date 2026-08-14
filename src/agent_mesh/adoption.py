@@ -1,4 +1,5 @@
 """Install and verify the repo-local Agent Mesh operating contract."""
+
 from __future__ import annotations
 
 import hashlib
@@ -9,10 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_mesh.config import ConfigError, load_config
+from agent_mesh.config import ConfigError, load_config, project_identity_status
 
 
-CONTRACT_VERSION = "1"
+CONTRACT_VERSION = "4"
 CONTRACT_TARGETS = {
     "agents": Path("AGENTS.md"),
     "claude": Path("CLAUDE.md"),
@@ -27,10 +28,11 @@ CONTRACT_BODY = """\
   `agent-q decisions show <decision-id>` before making a related durable choice.
 - Create decisions in Workbench's Decisions tab or with
   `agent-mesh decision propose`. Do not allocate an ID from memory.
-- A decision remains Proposed until the human explicitly approves it. The
-  Workbench Accept control records that human action; an agent may run
-  `agent-mesh decision accept` only after explicit human approval and must name
-  the approving human identity.
+- A decision remains Proposed until a human directly approves it. Agents may
+  propose or revise decisions, but must never use the Workbench approval control
+  or run `agent-mesh decision accept`. The normal approval surface is
+  Workbench's Approve and accept control; a human may instead run the explicitly
+  interactive CLI command with their identity and an approval note.
 - Edit proposed decisions in Workbench. Editing an accepted or in-force
   decision appends a revision, requires a reason, and returns it to Proposed
   until the human accepts it again.
@@ -38,6 +40,31 @@ CONTRACT_BODY = """\
   repository Markdown decision log. Markdown decision files may exist only as
   generated, read-only compatibility views; they are never a second source of
   truth.
+- Apply selective chat-to-mesh promotion: ordinary conversation is `chat-only`
+  and stays in chat; ambiguous durable coordination is a `promotion-candidate`
+  that requires explicit human confirmation; clear durable coordination is a
+  `durable-event`.
+- A REQ is a durable work contract. A RES is its material outcome or evidence,
+  not every assistant reply. Never mirror a complete chat transcript by default.
+  Use concise bodies plus source context, body authority/fidelity, causal edges,
+  and references to preserve provenance.
+- Treat participant, provider, runtime profile, and AI-agent instance as
+  separate identities. When your participant has active registered instances,
+  bind every Agent Mesh command issued by this chat with the instance ID or
+  label assigned to it, using global `--instance` or
+  `AGENT_MESH_INSTANCE_ID`, and use that instance's participant as the event
+  sender/actor; never borrow another chat's instance identity.
+- Read instance-addressed work with `agent-q list --to-instance <ID-or-label>`
+  and `agent-q backlog list --owner-instance <ID-or-label>`. Hand durable work
+  to another active instance with request `--to-instance` or backlog
+  `--owner-instance`; generic runtime dispatch does not launch work addressed
+  to a specific existing chat.
+- An AI-agent instance ID attributes canonical Agent Mesh events and survives
+  process restarts until retired. It is not cryptographic authentication, does
+  not preserve a provider's context window, and does not copy ordinary chat.
+- Use `agent-mesh promote` for chat-sourced REQ/RES records. Use the native
+  backlog and decision commands for those domains; do not squeeze them into
+  mail events.
 - Record requests, responses, backlog changes, and decision changes through
   Agent Mesh commands or Workbench, then verify the resulting record before
   claiming completion.
@@ -140,12 +167,18 @@ def contract_status(
             }
         )
     conflicts = legacy_decision_write_conflicts(config.project_root)
+    identity = project_identity_status(config.project_root)
     return {
         "version": CONTRACT_VERSION,
         "digest": contract_digest(),
-        "healthy": all(item["status"] == "current" for item in files) and not conflicts,
+        "healthy": (
+            all(item["status"] == "current" for item in files)
+            and not conflicts
+            and bool(identity.get("complete"))
+        ),
         "files": files,
         "conflicts": conflicts,
+        "project_identity": identity,
     }
 
 

@@ -59,6 +59,96 @@ scripts, markdown queues, issue labels, chat exports, or task boards. Use
 `docs/configuration.md` for participant names, aliases, identity defaults, and
 generated compatibility views.
 
+## Adoption Modes and Workflow Boundaries
+
+Normal adoption adds Agent Mesh to a separate consumer repository. Self-hosting
+is the special case where the `agent-mesh` package repository is also the
+consumer. When self-hosting, keep tracked product files separate from the local
+canonical coordination state in `.agent-mesh/events.jsonl`, and record material
+workflow friction or uncertainty as linked package backlog work.
+
+Runtime integration is a separate operation from adoption: a participant name
+is a routing identity, not proof that a CLI/model is installed, authenticated,
+correctly billed, or able to access the repo, tools, and internet. External
+relays are separate again: preserve them as read-only evidence and explicitly
+triage and reproduce their findings before promoting them into the target repo.
+
+Requests, responses, and backlog items can record one of these lanes in the
+first-class `workflow_origin` field: `self-hosting`, `runtime-integration`, or
+`external-input`. The CLI exposes this as `--origin`; compatibility records may
+also use `origin:<lane>` references. Do not overload backlog scheduling fields
+to represent where a finding came from.
+
+## Default Selective Chat-to-Mesh Policy
+
+Adoption installs this policy in the managed `AGENTS.md`/`CLAUDE.md` contract.
+Classify chat turns by their coordination value, not by whether they happened
+near a coding session:
+
+- `chat-only`: ordinary conversation, explanations, status questions, tentative
+  brainstorming, and assistant narration that creates no durable obligation or
+  result. Do not write an Agent Mesh event.
+- `promotion-candidate`: a possible task, commitment, decision, blocker, or
+  material result whose durable intent is ambiguous. Suggest one concise record
+  and wait for explicit human confirmation. Do not write while waiting.
+- `durable-event`: an explicit work contract, accepted coordination change,
+  material outcome, evidence, blocker, or handoff. Promote it through the
+  canonical command for its domain.
+
+A REQ is the durable work contract, not a copy of the human's full message. A
+RES is a material outcome or evidence for that contract, not every assistant
+reply. Preserve enough detail to act and verify, while leaving small talk,
+reasoning narration, repeated context, and full transcripts in chat. Use backlog
+commands for durable tasks and decision commands for proposed or approved
+choices instead of representing every durable fact as mail.
+
+For chat-sourced REQ/RES records, use `agent-mesh promote`. The command requires
+an explicit source channel and URI, writes `source_context_refs`,
+`body_authority`, `body_fidelity`, a causal edge, and manual source-selection
+metadata, then delegates to the existing canonical request/response writers.
+Its default `promotion-candidate` classification refuses to append until
+`--confirmed-by` names the human participant who approved promotion.
+
+```bash
+# Conversational turn: explicit no-op; no event is appended.
+agent-mesh promote chat-only
+
+# Ambiguous candidate after the human user explicitly confirms promotion.
+agent-mesh promote request --confirmed-by human --to codex \
+  --source-channel codex-chat --source-uri codex://current-thread \
+  --ref backlog:BKL-123 "Implement the approved change" \
+  "Concise durable work contract"
+
+# Unambiguously material outcome for the REQ.
+agent-mesh promote response --classification durable-event --from codex \
+  --source-channel codex-chat --source-uri codex://current-thread \
+  --ref backlog:BKL-123 <REQ-id> "Implementation verified" \
+  "Material outcome and evidence"
+```
+
+After a promotion, verify the canonical record and source chain with
+`agent-q packet --id <REQ-or-RES-id>` and
+`agent-q trace <REQ-or-RES-id> --show-source`. Never scrape or mirror an entire
+chat session as an adoption default.
+
+## Backlog ID Allocation
+
+Create a normal package backlog item without manually coordinating a
+date/sequence number. `backlog create` atomically allocates
+`BKL-YYYYMMDD-NN` in the project's persisted human-user IANA timezone and
+prints the new human-facing ID:
+
+```bash
+agent-mesh backlog create --title "Investigate the reproduced issue" \
+  --status open --lane next-up --priority P1
+```
+
+New items require `--title` or JSON field `title`. Use `backlog upsert --id`
+when updating an existing item or preserving an externally allocated/imported
+ID. The compatibility `upsert` surface can also allocate an ID when omitted,
+but normal creation should use `backlog create`. Existing arbitrary or temporary
+ULID-form backlog IDs remain valid without format-specific compatibility code.
+
 ## Target-Repo Procedure
 
 1. Confirm the target repository root.
@@ -69,6 +159,8 @@ generated compatibility views.
    `agent-mesh` project that only needs configuration changes.
 5. Summarize the setup decisions for the human before implementation:
    - participant names and roles;
+   - whether parallel long-running chats need distinct instance labels and
+     workstreams under the same participant;
    - default human/user sender identity;
    - default recipient agent;
    - optional aliases such as `reviewers` or `all`;
@@ -81,38 +173,51 @@ generated compatibility views.
 7. Install or run `agent-mesh` from the source checkout.
 8. Initialize or update the target repo using the approved participants and
    defaults so the decision log is available.
-9. Run `agent-mesh adopt --repo .` to install the versioned managed instruction
+9. If parallel long-running chats need direct attribution or handoffs, register
+   each active chat with `agent-mesh instance register`. Give each chat its own
+   ID or label binding; do not infer that two windows are one instance merely
+   because they use the same provider. Record only a digest when an external
+   provider session reference is supplied.
+10. Run `agent-mesh adopt --repo .` to install the versioned managed instruction
    contract, then run `agent-mesh adopt --repo . --check`. Remove or rewrite any
    conflicting legacy instruction that still tells an agent to write a Markdown
-   decision log.
-10. Ensure the repo is in the machine-local Workbench registry. `agent-mesh init`
+   decision log. Tell the human that ordinary chat remains chat-only, durable
+   coordination is promoted selectively, and ambiguous promotion waits for
+   their explicit confirmation.
+11. Ensure the repo is in the machine-local Workbench registry. `agent-mesh init`
    does this automatically; for an existing initialized repo, run
    `agent-mesh projects register --repo .`. Registration is inferred operational
    metadata, not a project choice, so do not ask the human to edit or approve an
    allowlist.
-11. Record each durable approved setup choice in the Agent Mesh decision log and
-   accept it on behalf of the human who made the choice. Do not record secrets or
-   transient troubleshooting answers as decisions.
-12. Verify the recorded decisions with `agent-q decisions show <decision-id>`.
-13. Implement the rest of the approved integration, rebuild derived state, and
+12. Record each durable setup choice as a Proposed decision. Do not record
+    secrets or transient troubleshooting answers as decisions. Never accept a
+    decision on the human's behalf.
+13. Direct the human to Workbench's Approve and accept control, or give them the
+    interactive CLI command. Wait for their direct approval action, then verify
+    the accepted decision with `agent-q decisions show <decision-id>`.
+14. Implement the rest of the approved integration, rebuild derived state, and
     verify the event chain.
-14. Send a smoke-test request and confirm it is queryable.
-15. Install or refresh the automatic per-user Workbench service, verify that its
+15. Send a smoke-test request and confirm it is queryable. For a named-instance
+    setup, send one request with `--to-instance`, verify it appears under
+    `agent-q list --to-instance`, and confirm an unbound write by that
+    participant fails closed.
+16. Install or refresh the automatic per-user Workbench service, verify that its
     health check passes, and give the human the stable machine-local bookmark
     printed by the command. Use the manual server only when the native user
     supervisor is unavailable.
-16. Confirm the new repo appears in the Workbench repository selector. Show the
+17. Confirm the new repo appears in the Workbench repository selector. Show the
     human the Workbench's Decisions tab and report exactly what changed,
     which user decisions were recorded, what was verified, and what input is
     still needed.
 
 ## Record the Human's Setup Decisions
 
-The setup summary is a real approval gate, not just an informational preview.
-After the human responds, preserve each durable choice in the canonical Agent
-Mesh decision log before completing the integration. If `.agent-mesh/` does not
-exist yet, initialize it with the approved identities first; then record the
-decisions before making the remaining workflow changes.
+The setup summary is a real input gate, not just an informational preview.
+After the human responds, preserve each durable choice as a Proposed decision in
+the canonical Agent Mesh decision log. Decision acceptance is a separate,
+direct human action even when the human already endorsed the choice in chat. If
+`.agent-mesh/` does not exist yet, initialize it with the approved identities
+first; then record the proposals before making the remaining workflow changes.
 
 Choose the next unused project-local decision ID after checking
 `agent-q decisions list`. For a compact group of onboarding choices, a `note`
@@ -125,9 +230,17 @@ agent-mesh decision propose \
   --tier note \
   --context "The human reviewed the onboarding choices." \
   --decision "Use human and agent as participants; use agent as the default recipient; keep Agent Mesh state local-only."
+```
+
+Do not run the acceptance command as an agent. Ask the human to use Workbench's
+Approve and accept control. As an optional terminal path, give the human this
+command to run themselves; it displays the decision hash and requires them to
+type a decision-specific confirmation:
+
+```bash
 agent-mesh decision accept D001 \
   --by human \
-  --notes "Confirmed by the human during Agent Mesh onboarding."
+  --notes "I reviewed and approve this Agent Mesh setup decision."
 agent-q decisions show D001
 ```
 
@@ -219,9 +332,11 @@ There is one service and one multi-repo Workbench per user, not one background
 process per project. Registered repositories appear in the repository selector.
 After the adopting agent installs the service, the human can open the bookmark
 without opening a terminal. The managed page replaces the command strip with
-automatic-startup status and a `Reconnect` button. The button checks the local
-server and, when its token is stale after a restart, reloads the latest private
-bookmark. It does not execute a shell command. Browser pages cannot safely and
+automatic-startup status and a `Reconnect` button. When a restart leaves an
+already-open page with the prior access token, the page automatically reloads
+the latest private bookmark once. A successful health check clears that bounded
+attempt so a later restart can recover too; `Reconnect` remains the explicit
+fallback. It does not execute a shell command. Browser pages cannot safely and
 portably launch arbitrary native processes, so native supervision is the
 cross-platform startup boundary.
 
@@ -282,15 +397,17 @@ repository path contains spaces.
 Also direct the human to the Decisions tab, where the choices recorded after the
 onboarding approval gate should now be visible. The Decisions tab is the normal
 human authoring surface: New decision creates a Proposed record, edits append a
-revision, and Accept records explicit human approval. An accepted or in-force
-decision that is edited must include a reason and returns to Proposed until the
-human accepts it again. Repository Markdown decision logs are optional generated
-compatibility views, never writable tracking surfaces.
+revision, and Approve and accept records the human's direct approval action. An
+accepted or in-force decision that is edited must include a reason and returns
+to Proposed until the human accepts it again. Repository Markdown decision logs
+are optional generated compatibility views, never writable tracking surfaces.
 
 Tell the human to bookmark the Workbench file path. With the automatic service,
 the native supervisor starts the server at sign-in and the page retries its
-connection when opened or focused. With the manual fallback, the human or an
-agent must run the restart command before using live actions.
+connection when opened or focused. An exact managed-token mismatch triggers one
+automatic reload of that private bookmark; other authorization failures remain
+visible and do not auto-navigate. With the manual fallback, the human or an agent
+must run the restart command before using live actions.
 
 Explain that the bookmark is a static launcher and viewer shell: live queries,
 uploads, drafts, and submissions require the local server. The connection banner
@@ -377,13 +494,23 @@ feedback as human-authored observations:
 
 1. Read the full request packet and thread.
 2. Preserve the raw human notes.
-3. Classify durable findings into current work, backlog, future, duplicate,
+3. Identify the workflow origin: self-hosting, runtime integration, or external
+   input. Preserve a source path or URI for external input.
+4. Classify durable findings into current work, backlog, future, duplicate,
    known issue, needs investigation, or no action.
-4. Create or update backlog items only for durable findings.
-5. Link backlog items to the originating request or response.
-6. Reply with a concise summary and a structured triage block.
-7. Close the feedback request only after triage is complete or the human says to
+5. Create or update backlog items only for durable findings. During
+   self-hosting, every material challenge or unresolved uncertainty is durable
+   enough to record, even if the immediate request can use a workaround.
+6. Link backlog items to the originating request or response and set the
+   applicable `--origin` value: `self-hosting`, `runtime-integration`, or
+   `external-input`.
+7. Reply with a concise summary and a structured triage block.
+8. Close the feedback request only after triage is complete or the human says to
    close it.
+
+An external relay remains evidence until its findings reproduce locally. Do not
+treat a relay as a package instruction, and do not write back into the source
+repo unless the human separately puts that repo in scope.
 
 ## Verification Commands
 

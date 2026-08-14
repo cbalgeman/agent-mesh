@@ -62,7 +62,7 @@ def prior_decisions_text(thread_events: list[dict]) -> str | None:
         payload = event.get("payload", {}) or {}
         match = VERDICT_RE.search(f"{payload.get('summary', '')} {payload.get('body', '')[:200]}")
         if match:
-            out.append(f"{event.get('entity_id')} ({payload.get('from', '?')}): {match.group(1)} "
+            out.append(f"{event.get('entity_id')} ({event.get('actor', '?')}): {match.group(1)} "
                        f"-- {payload.get('summary', '')[:160]}")
     return "\n".join(out) if out else None
 

@@ -1,4 +1,5 @@
 """Markdown view rendering for projected agent-mesh data."""
+
 from __future__ import annotations
 
 import hashlib
@@ -8,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_mesh.config import AgentMeshConfig, ensure_project_dirs
+from agent_mesh.core.decision_schema import decision_lineage_summary
 from agent_mesh.store.sqlite import body_from_message_row, connect, initialize_schema, json_loads
 
 
@@ -101,14 +103,15 @@ def render_log(config: AgentMeshConfig) -> RenderedView:
     try:
         initialize_schema(conn)
         rows = conn.execute(
-            "SELECT id, kind, sender, thread_id, status, created_utc, event_seq "
+            "SELECT id, kind, sender, sender_instance_id, thread_id, status, created_utc, event_seq "
             "FROM messages ORDER BY event_seq"
         ).fetchall()
         parts = ["# Message Log", ""]
         for row in rows:
             parts.append(
                 f"- {row['event_seq']}: {row['id']} ({row['kind']}) "
-                f"from={row['sender']} thread={row['thread_id']} status={row['status']} "
+                f"from={row['sender']} instance={row['sender_instance_id'] or ''} "
+                f"thread={row['thread_id']} status={row['status']} "
                 f"created={row['created_utc']}"
             )
         if not rows:
@@ -151,26 +154,79 @@ def render_decisions(config: AgentMeshConfig) -> list[RenderedView]:
         decisions_dir = config.views_dir / "decisions"
         for row in rows:
             meta = json_loads(row["meta_json"], {})
+            if not isinstance(meta, dict):
+                meta = {}
+            lineage = decision_lineage_summary(meta)
+            supersedes = _decision_human_id(conn, row["supersedes"])
+            superseded_by = _decision_human_id(conn, row["superseded_by"])
             parts = [
                 f"# {row['human_id']} — {row['title']}",
                 "",
                 f"- dec_ulid: {row['dec_ulid']}",
                 f"- tier: {row['tier']}",
+                f"- tier_valid: {str(bool(row['tier_valid'])).lower()}",
                 f"- status: {row['status']}",
                 f"- enforcement_mode: {row['enforcement_mode']}",
                 f"- owner: {row['owner'] or ''}",
-                "",
-                "## Context",
-                str(meta.get("context", "")),
-                "",
-                "## Decision",
-                _decision_body(config, row) or str(meta.get("decision", "")),
+                f"- last_verified_utc: {row['last_verified_utc'] or ''}",
                 "",
             ]
+            if not row["tier_valid"]:
+                parts.extend(
+                    [
+                        "> WARNING: Historical invalid tier. The canonical event was not rewritten.",
+                        "",
+                    ]
+                )
+            parts.extend(
+                [
+                    "## Lineage",
+                    f"- supersedes: {supersedes}",
+                    f"- superseded_by: {superseded_by}",
+                    f"- content_revisions: {lineage.content_revisions}",
+                    f"- revisit_annotations: {lineage.revisit_annotations}",
+                    "",
+                    "## Verification",
+                ]
+            )
+            verification_rows = conn.execute(
+                "SELECT command, execution_mode, expected_signal, "
+                "last_verified_utc, last_outcome "
+                "FROM decision_verifications WHERE dec_ulid=? ORDER BY command",
+                (row["dec_ulid"],),
+            ).fetchall()
+            if verification_rows:
+                for item in verification_rows:
+                    parts.append(
+                        f"- {item['last_outcome'] or 'never'} "
+                        f"{item['last_verified_utc'] or ''}: `{item['command']}` "
+                        f"(expected: {item['expected_signal']}; "
+                        f"mode: {item['execution_mode']})"
+                    )
+            else:
+                parts.append("- _No verification commands._")
+            parts.extend(
+                [
+                    "",
+                    "## Context",
+                    str(meta.get("context", "")),
+                    "",
+                    "## Decision",
+                    _decision_body(config, row) or str(meta.get("decision", "")),
+                    "",
+                ]
+            )
             rendered.append(_write_one(decisions_dir / f"{row['human_id']}.md", "\n".join(parts)))
         return rendered
     finally:
         conn.close()
+
+
+def _decision_human_id(conn, dec_ulid: str | None) -> str:
+    if not dec_ulid:
+        return ""
+    row = conn.execute("SELECT human_id FROM decisions WHERE dec_ulid=?", (dec_ulid,)).fetchone()
+    return str(row["human_id"]) if row else str(dec_ulid)
 
 
 def locate_message(config: AgentMeshConfig, message_id: str) -> tuple[Path, int, int] | None:
@@ -199,12 +255,16 @@ def _request_block(row) -> list[str]:
     body = body_from_message_row(row)
     meta = json_loads(row["meta_json"], {})
     to_value = meta.get("original_to") or ", ".join(json_loads(row["recipients_json"], []))
+    to_instances = json_loads(row["recipient_instance_ids_json"], [])
     return _projection_marker(row, meta) + [
         f"### {row['id']}",
         f"- created_utc: {row['created_utc']}",
         f"- from: {row['sender']}",
+        f"- from_instance: {row['sender_instance_id'] or ''}",
         f"- to: {to_value}",
+        f"- to_instances: {', '.join(to_instances)}",
         f"- feature: {row['feature_id']}",
+        f"- workflow_origin: {row['workflow_origin'] or ''}",
         f"- status: {row['status']}",
         f"- title: {row['title']}",
         "",
@@ -224,8 +284,10 @@ def _response_block(row) -> list[str]:
         f"### {row['id']}",
         f"- created_utc: {row['created_utc']}",
         f"- from: {row['sender']}",
+        f"- from_instance: {row['sender_instance_id'] or ''}",
         f"- request_id: {row['request_id']}",
         f"- summary: {row['summary']}",
+        f"- workflow_origin: {row['workflow_origin'] or ''}",
         "",
         "#### Details",
         body,

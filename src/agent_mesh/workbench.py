@@ -1,4 +1,5 @@
 """Small local workbench for agent-mesh projects."""
+
 from __future__ import annotations
 
 import base64
@@ -17,14 +18,24 @@ from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, quote, urlparse
 
 from agent_mesh.adoption import contract_status as adoption_contract_status
 from agent_mesh.config import AgentMeshConfig, load_config, write_agent_dir_gitignore
-from agent_mesh.core.events import Event, append_event, generate_event_id
+from agent_mesh.core.decision_schema import (
+    DECISION_TIERS,
+    DecisionVerificationError,
+    decision_completeness_issues,
+    decision_lineage_summary,
+    normalize_decision_strings,
+    normalize_decision_verification,
+)
+from agent_mesh.core.agent_instances import AgentInstanceError, resolve_authoring_actor
+from agent_mesh.core.events import Event, append_event, generate_event_id, utc_now
 from agent_mesh.core.lock import acquire
 from agent_mesh.core.recovery import recover
+from agent_mesh.core.workflow_origin import WORKFLOW_ORIGINS, refs_with_workflow_origin
 from agent_mesh.message_packet import build_message_packet
 from agent_mesh.project_registry import (
     ProjectRegistryError,
@@ -37,16 +48,31 @@ from agent_mesh.project_registry import (
 )
 from agent_mesh.store.rebuild import (
     DECISION_ID_RE,
+    DecisionStopLine,
     projection_is_current,
     read_event_records,
     rebuild_all,
+    validate_decision_proposal_identity,
 )
-from agent_mesh.store.sqlite import connect, initialize_schema, json_loads, resolve_decision, resolve_message
+from agent_mesh.store.sqlite import (
+    connect,
+    initialize_schema,
+    json_loads,
+    resolve_decision,
+    resolve_message,
+)
 from agent_mesh.views import render_all
 
 
 class WorkbenchError(RuntimeError):
     """Raised for local workbench request errors."""
+
+
+def _normalize_authored_verification(values: list[Any] | None) -> list[dict[str, Any]]:
+    try:
+        return normalize_decision_verification(values, reject_unsafe=True)
+    except DecisionVerificationError as exc:
+        raise WorkbenchError(str(exc)) from exc
 
 
 MAX_ATTACHMENT_FILES = 20
@@ -68,6 +94,8 @@ BACKLOG_SEARCH_FIELDS = (
     "release_phase",
     "wave",
     "owner_hint",
+    "owner_instance_id",
+    "workflow_origin",
     "updated_utc",
 )
 FEEDBACK_REQUEST_PREDICATE_SQL = (
@@ -81,13 +109,6 @@ FEEDBACK_REQUEST_PREAMBLE = (
 )
 FEEDBACK_SUBMISSION_ID_RE = re.compile(r"^fb-[A-Za-z0-9-]{8,96}$")
 DECISION_TERMINAL_STATUSES = {"superseded", "retired", "rejected"}
-DECISION_TIERS = (
-    "note",
-    "implementation_plan",
-    "architecture_contract",
-    "production_invariant",
-    "compliance_security",
-)
 
 
 @dataclass(frozen=True)
@@ -231,6 +252,7 @@ def list_messages(
     status: str = "",
     kind: str = "",
     feature: str = "",
+    workflow_origin: str = "",
     query: str = "",
     _config: AgentMeshConfig | None = None,
 ) -> list[dict[str, Any]]:
@@ -252,6 +274,9 @@ def list_messages(
             else:
                 sql += " AND feature_id=?"
                 params.append(feature)
+        if workflow_origin:
+            sql += " AND workflow_origin=?"
+            params.append(workflow_origin)
         if query:
             like = f"%{query}%"
             sql += (
@@ -277,6 +302,7 @@ def list_backlog_items(
     item_type: str = "",
     launch_scope: str = "",
     wave: str = "",
+    workflow_origin: str = "",
     query: str = "",
     quick_filter: str = "",
     _config: AgentMeshConfig | None = None,
@@ -301,6 +327,7 @@ def list_backlog_items(
             item_type=item_type,
             launch_scope=launch_scope,
             wave=wave,
+            workflow_origin=workflow_origin,
             query=query,
             quick_filter=quick_filter,
         )
@@ -330,6 +357,19 @@ def lookup_backlog_item(repo: Path, item_id: str) -> dict[str, Any] | None:
         if row is None:
             return None
         item = _backlog_detail_from_row(conn, row)
+        item["events"] = [
+            {
+                "event_id": event["event_id"],
+                "event_type": event["event_type"],
+                "actor": event["actor"],
+                "created_utc": event["created_utc"],
+                "details": json_loads(event["details_json"], {}),
+            }
+            for event in conn.execute(
+                "SELECT * FROM backlog_events WHERE item_id=? ORDER BY event_seq",
+                (item_id.strip(),),
+            )
+        ]
         block = backlog_detail_block(item)
         return {"ok": True, "item": item, "block": block}
     finally:
@@ -362,7 +402,17 @@ def list_decisions(
             params.extend([like, like, like, like])
         sql += " ORDER BY status ASC, tier ASC, human_id ASC LIMIT 200"
         rows = conn.execute(sql, params).fetchall()
-        return [_decision_item_from_row(row) for row in rows]
+        completeness_collections = _decision_completeness_collections(
+            conn,
+            {str(row["dec_ulid"]) for row in rows},
+        )
+        return [
+            _decision_item_from_row(
+                row,
+                completeness_collections.get(str(row["dec_ulid"])),
+            )
+            for row in rows
+        ]
     finally:
         conn.close()
 
@@ -373,6 +423,7 @@ def workbench_snapshot(
     message_status: str = "",
     message_kind: str = "",
     message_feature: str = "",
+    message_workflow_origin: str = "",
     message_query: str = "",
     backlog_status: str = "",
     backlog_lane: str = "",
@@ -381,6 +432,7 @@ def workbench_snapshot(
     backlog_item_type: str = "",
     backlog_launch_scope: str = "",
     backlog_wave: str = "",
+    backlog_workflow_origin: str = "",
     backlog_query: str = "",
     backlog_quick_filter: str = "",
     decision_query: str = "",
@@ -402,6 +454,7 @@ def workbench_snapshot(
             item_type=backlog_item_type,
             launch_scope=backlog_launch_scope,
             wave=backlog_wave,
+            workflow_origin=backlog_workflow_origin,
             query=backlog_query,
             quick_filter=backlog_quick_filter,
         )
@@ -413,6 +466,7 @@ def workbench_snapshot(
                 status=message_status,
                 kind=message_kind,
                 feature=message_feature,
+                workflow_origin=message_workflow_origin,
                 query=message_query,
                 _config=config,
             ),
@@ -449,7 +503,20 @@ def lookup_decision(repo: Path, identifier: str) -> dict[str, Any] | None:
         if not isinstance(meta, dict):
             meta = {}
         body = _decision_body_from_row(config, row)
-        block = decision_detail_block(row, meta, body)
+        collections = _decision_collections(conn, dec_ulid)
+        completeness_issues = decision_completeness_issues(
+            tier=str(row["tier"]),
+            owner=str(row["owner"] or ""),
+            affected_code_globs=collections["affected_code_globs"],
+            verification=collections["verification"],
+        )
+        block = decision_detail_block(
+            row,
+            meta,
+            body,
+            collections=collections,
+            completeness_issues=completeness_issues,
+        )
         proposed_utc = _decision_proposed_utc(row, meta)
         return {
             "ok": True,
@@ -458,6 +525,7 @@ def lookup_decision(repo: Path, identifier: str) -> dict[str, Any] | None:
                 "dec_ulid": row["dec_ulid"],
                 "title": row["title"],
                 "tier": row["tier"],
+                "tier_valid": bool(row["tier_valid"]),
                 "status": row["status"],
                 "owner": row["owner"] or "",
                 "drift_risk": row["drift_risk"] or "",
@@ -470,9 +538,13 @@ def lookup_decision(repo: Path, identifier: str) -> dict[str, Any] | None:
                 "superseded_by": row["superseded_by"] or "",
                 "status_utc": _decision_status_utc(row, meta if isinstance(meta, dict) else {}),
                 "meta": meta if isinstance(meta, dict) else {},
+                "body_sha": row["body_sha"] or "",
                 "body_path": row["body_path"] or "",
                 "body_bytes": row["body_bytes"],
                 "body": body,
+                **collections,
+                "complete_for_acceptance": not completeness_issues,
+                "completeness_issues": list(completeness_issues),
                 "block": block,
             },
             "block": block,
@@ -500,6 +572,10 @@ def create_decision(
     context: str = "",
     decision: str = "",
     body: str | None = None,
+    affected_code_globs: list[str] | None = None,
+    required_checks: list[str] | None = None,
+    verification: list[Any] | None = None,
+    tags: list[str] | None = None,
     human_id: str = "",
     actor: str | None = None,
 ) -> dict[str, Any]:
@@ -509,31 +585,39 @@ def create_decision(
     owner = owner.strip()
     context = context.strip()
     decision = decision.strip()
-    actor = _decision_actor(config, actor)
+    affected_code_globs = normalize_decision_strings(affected_code_globs)
+    required_checks = normalize_decision_strings(required_checks)
+    verification = _normalize_authored_verification(verification)
+    tags = normalize_decision_strings(tags)
+    actor = _workbench_authoring_actor(config, actor)
     requested_id = human_id.strip().upper()
     if not title:
         raise WorkbenchError("Decision title is required")
     if not tier:
         raise WorkbenchError("Decision tier is required")
     if tier not in DECISION_TIERS:
-        raise WorkbenchError(
-            f"Decision tier must be one of: {', '.join(DECISION_TIERS)}"
-        )
+        raise WorkbenchError(f"Decision tier must be one of: {', '.join(DECISION_TIERS)}")
     if requested_id and not DECISION_ID_RE.fullmatch(requested_id):
-        raise WorkbenchError(
-            "Decision ID must look like D001, D038-S1, or D076-E"
-        )
+        raise WorkbenchError("Decision ID must look like D001, D038-S1, or D076-E")
 
     lock_handle = acquire(config.agent_dir / ".mail-lock")
     last_event_seq = None
     try:
+        recover(config.events_path, config.agent_dir)
         rebuild_all(config)
         conn = connect(config.db_path)
         try:
             initialize_schema(conn)
             resolved_id = requested_id or _next_decision_human_id(conn)
-            if resolve_decision(conn, resolved_id) is not None:
-                raise WorkbenchError(f"decision already exists: {resolved_id}")
+            dec_ulid = "dec_" + generate_event_id()[3:]
+            try:
+                validate_decision_proposal_identity(
+                    conn,
+                    resolved_id,
+                    dec_ulid=dec_ulid,
+                )
+            except DecisionStopLine:
+                raise WorkbenchError(f"decision already exists: {resolved_id}") from None
         finally:
             conn.close()
 
@@ -546,7 +630,6 @@ def create_decision(
                 decision=decision,
             )
         body_path, body_sha, body_bytes = _write_decision_body(config, canonical_body)
-        dec_ulid = "dec_" + generate_event_id()[3:]
         event = Event(
             event_id=generate_event_id(),
             actor=actor,
@@ -562,7 +645,7 @@ def create_decision(
                 "decision": decision,
                 "rejected_alternatives": [],
                 "consequences": [],
-                "affected_code_globs": [],
+                "affected_code_globs": affected_code_globs,
                 "exemptions": [],
                 "generated_artifact_paths": [],
                 "assumptions": [],
@@ -570,9 +653,9 @@ def create_decision(
                 "supersedes": None,
                 "owner": owner or None,
                 "review_policy": {},
-                "required_checks": [],
-                "verification": [],
-                "tags": [],
+                "required_checks": required_checks,
+                "verification": verification,
+                "tags": tags,
                 "body_sha": body_sha,
                 "body_path": body_path,
                 "body_bytes": body_bytes,
@@ -601,12 +684,16 @@ def update_decision(
     context: str | None = None,
     decision: str | None = None,
     body: str | None = None,
+    affected_code_globs: list[str] | None = None,
+    required_checks: list[str] | None = None,
+    verification: list[Any] | None = None,
+    tags: list[str] | None = None,
     revision_reason: str = "",
     actor: str | None = None,
 ) -> dict[str, Any]:
     config = load_config(repo)
     identifier = identifier.strip()
-    actor = _decision_actor(config, actor)
+    actor = _workbench_authoring_actor(config, actor)
     revision_reason = revision_reason.strip()
     if not identifier:
         raise WorkbenchError("Decision ID is required")
@@ -622,15 +709,14 @@ def update_decision(
             dec_ulid = resolve_decision(conn, identifier)
             if dec_ulid is None:
                 raise WorkbenchError(f"decision not found: {identifier}")
-            row = conn.execute(
-                "SELECT * FROM decisions WHERE dec_ulid=?", (dec_ulid,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM decisions WHERE dec_ulid=?", (dec_ulid,)).fetchone()
             if row is None:
                 raise WorkbenchError(f"decision not found: {identifier}")
             meta = json_loads(row["meta_json"], {})
             if not isinstance(meta, dict):
                 meta = {}
             current_body = _decision_body_from_row(config, row)
+            current_collections = _decision_collections(conn, dec_ulid)
             status = str(row["status"])
         finally:
             conn.close()
@@ -662,19 +748,61 @@ def update_decision(
             if field_name in {"title", "tier"} and not normalized:
                 raise WorkbenchError(f"Decision {field_name} is required")
             if field_name == "tier" and normalized not in DECISION_TIERS:
-                raise WorkbenchError(
-                    f"Decision tier must be one of: {', '.join(DECISION_TIERS)}"
-                )
+                raise WorkbenchError(f"Decision tier must be one of: {', '.join(DECISION_TIERS)}")
             if normalized != current_values[field_name]:
                 fields_changed[field_name] = [current_values[field_name], normalized]
 
         if body is not None and body != current_body:
             body_path, body_sha, body_bytes = _write_decision_body(config, body)
-            fields_changed.update({
-                "body_path": [str(row["body_path"] or ""), body_path],
-                "body_sha": [str(row["body_sha"] or ""), body_sha],
-                "body_bytes": [int(row["body_bytes"] or 0), body_bytes],
-            })
+            fields_changed.update(
+                {
+                    "body_path": [str(row["body_path"] or ""), body_path],
+                    "body_sha": [str(row["body_sha"] or ""), body_sha],
+                    "body_bytes": [int(row["body_bytes"] or 0), body_bytes],
+                }
+            )
+
+        normalized_collection_requests: dict[str, list[Any] | None] = {
+            "affected_code_globs": cast(
+                list[Any], normalize_decision_strings(affected_code_globs)
+            )
+            if affected_code_globs is not None
+            else None,
+            "required_checks": cast(list[Any], normalize_decision_strings(required_checks))
+            if required_checks is not None
+            else None,
+            "verification": _normalize_authored_verification(verification)
+            if verification is not None
+            else None,
+            "tags": cast(list[Any], normalize_decision_strings(tags)) if tags is not None else None,
+        }
+        for field_name, normalized_values in normalized_collection_requests.items():
+            if normalized_values is None:
+                continue
+            if field_name == "verification" and verification is not None and all(
+                not isinstance(item, dict) for item in verification
+            ):
+                current_commands = [
+                    str(item.get("command") or "")
+                    for item in current_collections[field_name]
+                    if isinstance(item, dict)
+                ]
+                requested_commands = [
+                    str(item.get("command") or "")
+                    for item in normalized_values
+                    if isinstance(item, dict)
+                ]
+                if requested_commands == current_commands:
+                    continue
+            if field_name == "verification" and _verification_definitions(
+                normalized_values
+            ) == _verification_definitions(current_collections[field_name]):
+                continue
+            if normalized_values != current_collections[field_name]:
+                fields_changed[field_name] = [
+                    current_collections[field_name],
+                    normalized_values,
+                ]
 
         if fields_changed:
             if status in {"accepted", "in_force"}:
@@ -682,23 +810,6 @@ def update_decision(
                     raise WorkbenchError(
                         "Revision reason is required when editing an accepted decision"
                     )
-                revisit = Event(
-                    event_id=generate_event_id(),
-                    actor=actor,
-                    kind="decision_revisited",
-                    entity_id=dec_ulid,
-                    thread_id=dec_ulid,
-                    payload={
-                        "decision_id": dec_ulid,
-                        "reason": revision_reason,
-                        "assumption_id": None,
-                        "new_decision_id": None,
-                    },
-                )
-                revisit_result = append_event(
-                    config.events_path, revisit, lock_acquired=True
-                )
-                last_event_seq = revisit_result.event.event_seq
                 fields_changed["status"] = [status, "proposed"]
 
             update = Event(
@@ -710,6 +821,11 @@ def update_decision(
                 payload={
                     "decision_id": dec_ulid,
                     "reason": revision_reason or "Updated proposed decision in Workbench",
+                    "change_kind": (
+                        "content_revision"
+                        if status in {"accepted", "in_force"}
+                        else "content_update"
+                    ),
                     "fields_changed": fields_changed,
                 },
             )
@@ -733,14 +849,23 @@ def accept_decision(
     repo: Path,
     identifier: str,
     *,
-    notes: str = "",
-    actor: str | None = None,
+    expected_body_sha: str,
+    notes: str,
+    actor: str,
 ) -> dict[str, Any]:
     config = load_config(repo)
     identifier = identifier.strip()
-    actor = _decision_actor(config, actor)
+    expected_body_sha = expected_body_sha.strip()
+    notes = notes.strip()
+    if not actor.strip():
+        raise WorkbenchError("Approving human identity is required")
+    actor = _human_decision_actor(config, actor)
     if not identifier:
         raise WorkbenchError("Decision ID is required")
+    if not expected_body_sha:
+        raise WorkbenchError("Reviewed decision body hash is required")
+    if not notes:
+        raise WorkbenchError("Approval note is required")
 
     lock_handle = acquire(config.agent_dir / ".mail-lock")
     last_event_seq = None
@@ -753,13 +878,13 @@ def accept_decision(
             dec_ulid = resolve_decision(conn, identifier)
             if dec_ulid is None:
                 raise WorkbenchError(f"decision not found: {identifier}")
-            row = conn.execute(
-                "SELECT status, event_seq FROM decisions WHERE dec_ulid=?", (dec_ulid,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM decisions WHERE dec_ulid=?", (dec_ulid,)).fetchone()
             if row is None:
                 raise WorkbenchError(f"decision not found: {identifier}")
             status = str(row["status"])
+            body_sha = str(row["body_sha"])
             last_event_seq = int(row["event_seq"])
+            collections = _decision_collections(conn, dec_ulid)
         finally:
             conn.close()
 
@@ -767,9 +892,27 @@ def accept_decision(
             reused = True
         elif status != "proposed":
             raise WorkbenchError(f"cannot accept {identifier} while status is {status}")
+        elif body_sha != expected_body_sha:
+            raise WorkbenchError(
+                "Decision changed after it was shown for approval; review the current revision "
+                "and try again"
+            )
         else:
+            issues = decision_completeness_issues(
+                tier=str(row["tier"]),
+                owner=str(row["owner"] or ""),
+                affected_code_globs=collections["affected_code_globs"],
+                verification=collections["verification"],
+            )
+            if issues:
+                raise WorkbenchError(
+                    f"Cannot accept {identifier}: {'; '.join(issues)}. "
+                    "Add the missing metadata, save the Proposed revision, and review it again."
+                )
+            approved_utc = utc_now()
             event = Event(
                 event_id=generate_event_id(),
+                occurred_utc=approved_utc,
                 actor=actor,
                 kind="decision_accepted",
                 entity_id=dec_ulid,
@@ -777,7 +920,10 @@ def accept_decision(
                 payload={
                     "decision_id": dec_ulid,
                     "accepted_by": actor,
-                    "notes": notes.strip(),
+                    "notes": notes,
+                    "approval_source": "workbench",
+                    "approved_utc": approved_utc,
+                    "approved_body_sha": body_sha,
                 },
             )
             result = append_event(config.events_path, event, lock_acquired=True)
@@ -798,10 +944,26 @@ def accept_decision(
     }
 
 
-def _decision_actor(config: AgentMeshConfig, actor: str | None) -> str:
+def _human_decision_actor(config: AgentMeshConfig, actor: str | None) -> str:
     normalized = (actor or config.default_sender).strip()
     if normalized not in config.participants:
         raise WorkbenchError(f"actor {normalized!r} is not in participants")
+    return normalized
+
+
+def _workbench_authoring_actor(
+    config: AgentMeshConfig, actor: str | None = None, *, role: str = "actor"
+) -> str:
+    try:
+        normalized = resolve_authoring_actor(
+            read_event_records(config.events_path),
+            default_actor=config.default_sender,
+            explicit_actor=actor,
+        )
+    except AgentInstanceError as exc:
+        raise WorkbenchError(str(exc)) from exc
+    if normalized not in config.participants:
+        raise WorkbenchError(f"{role} {normalized!r} is not in participants")
     return normalized
 
 
@@ -821,11 +983,7 @@ def _default_decision_body(
     context: str,
     decision: str,
 ) -> str:
-    return (
-        f"# {human_id} — {title}\n\n"
-        f"## Context\n{context}\n\n"
-        f"## Decision\n{decision}\n"
-    )
+    return f"# {human_id} — {title}\n\n## Context\n{context}\n\n## Decision\n{decision}\n"
 
 
 def _write_decision_body(
@@ -875,9 +1033,7 @@ def update_backlog_item(
     }
     if not updates:
         raise WorkbenchError("status, lane, or priority is required")
-    actor = (actor or config.default_sender).strip()
-    if actor not in config.participants:
-        raise WorkbenchError(f"actor {actor!r} is not in participants")
+    actor = _workbench_authoring_actor(config, actor)
 
     lock_handle = acquire(config.agent_dir / ".mail-lock")
     last_event_seq = None
@@ -893,6 +1049,12 @@ def update_backlog_item(
         finally:
             conn.close()
         payload.update(updates)
+        payload["write_intent"] = "update"
+        payload["refs"] = refs_with_workflow_origin(
+            payload.get("refs", []),
+            payload.get("workflow_origin"),
+            replace=bool(payload.get("workflow_origin")),
+        )
         event = Event(
             event_id=generate_event_id(),
             actor=actor,
@@ -951,8 +1113,7 @@ def save_attachment_uploads(repo: Path, files: list[dict[str, Any]]) -> dict[str
         total_bytes += len(data)
         if total_bytes > MAX_ATTACHMENT_TOTAL_BYTES:
             raise WorkbenchError(
-                "Attachment upload exceeds "
-                f"{MAX_ATTACHMENT_TOTAL_BYTES // (1024 * 1024)} MB total"
+                f"Attachment upload exceeds {MAX_ATTACHMENT_TOTAL_BYTES // (1024 * 1024)} MB total"
             )
         prepared.append((filename, data))
 
@@ -1003,6 +1164,7 @@ def build_feedback_markdown(payload: dict[str, Any]) -> dict[str, Any]:
     refs = _string_list(payload.get("refs"))
     screenshots = _string_list(payload.get("screenshots"))
     created_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    workflow_origin = _clean(payload.get("workflow_origin"))
 
     lines = [
         "# Feedback",
@@ -1012,6 +1174,8 @@ def build_feedback_markdown(payload: dict[str, Any]) -> dict[str, Any]:
         f"- severity: {severity}",
         f"- created_utc: {created_utc}",
     ]
+    if workflow_origin:
+        lines.append(f"- workflow_origin: {workflow_origin}")
     if related_id:
         lines.append(f"- related_id: {related_id}")
     if target:
@@ -1041,7 +1205,8 @@ def submit_feedback_request(repo: Path, payload: dict[str, Any]) -> dict[str, An
     config = load_config(repo)
     _validate_feedback_for_submit(payload)
     draft = build_feedback_markdown(payload)
-    sender = _clean(payload.get("sender")) or config.default_sender
+    explicit_sender = _clean(payload.get("sender")) or None
+    sender = _workbench_authoring_actor(config, explicit_sender, role="sender")
     if sender not in config.participants:
         raise WorkbenchError(f"sender {sender!r} is not in participants")
     raw_to = _clean(payload.get("to")) or config.default_recipient
@@ -1052,6 +1217,7 @@ def submit_feedback_request(repo: Path, payload: dict[str, Any]) -> dict[str, An
             "feedback recipient(s) are not participants: " + ", ".join(unknown_recipients)
         )
     submission_id = _feedback_submission_id(payload)
+    workflow_origin = _clean(payload.get("workflow_origin"))
     submission_digest = _feedback_submission_digest(
         payload,
         sender=sender,
@@ -1064,9 +1230,7 @@ def submit_feedback_request(repo: Path, payload: dict[str, Any]) -> dict[str, An
         recover(config.events_path, config.agent_dir)
         existing = _find_feedback_submission(config.events_path, submission_id)
         if existing is not None:
-            existing_digest = str(
-                existing.get("payload", {}).get("feedback_submission_digest", "")
-            )
+            existing_digest = str(existing.get("payload", {}).get("feedback_submission_digest", ""))
             if existing_digest != submission_digest:
                 raise WorkbenchError(
                     "feedback submission_id was already used for different form content"
@@ -1081,11 +1245,13 @@ def submit_feedback_request(repo: Path, payload: dict[str, Any]) -> dict[str, An
             "title": draft["request"]["title"],
             "body": draft["request"]["body"],
             "feature": "feedback",
-            "refs": _feedback_refs(payload),
+            "refs": refs_with_workflow_origin(_feedback_refs(payload), workflow_origin),
             "response_mode": "single",
             "feedback_submission_id": submission_id,
             "feedback_submission_digest": submission_digest,
         }
+        if workflow_origin:
+            event_payload["workflow_origin"] = workflow_origin
         if config.routing.preserve_raw_to:
             event_payload["original_to"] = raw_to
         event = Event(
@@ -1153,6 +1319,7 @@ def _feedback_submission_digest(
         "notes": _clean(payload.get("notes")),
         "refs": _string_list(payload.get("refs")),
         "screenshots": _string_list(payload.get("screenshots")),
+        "workflow_origin": _clean(payload.get("workflow_origin")),
         "sender": sender,
         "to": raw_to,
     }
@@ -1180,7 +1347,7 @@ def _feedback_response_from_record(
     event_payload = record.get("payload", {})
     body = str(event_payload.get("body", ""))
     markdown = (
-        body[len(FEEDBACK_REQUEST_PREAMBLE):]
+        body[len(FEEDBACK_REQUEST_PREAMBLE) :]
         if body.startswith(FEEDBACK_REQUEST_PREAMBLE)
         else body
     )
@@ -1212,15 +1379,13 @@ def update_request_status(
     request_id = request_id.strip()
     to_status = to_status.strip()
     reason = reason.strip()
-    actor = (actor or config.default_sender).strip()
+    actor = _workbench_authoring_actor(config, actor)
     if not request_id:
         raise WorkbenchError("request_id is required")
     if to_status not in {"open", "closed"}:
         raise WorkbenchError("to_status must be open or closed")
     if not reason:
         raise WorkbenchError("Reason is required to change request status")
-    if actor not in config.participants:
-        raise WorkbenchError(f"actor {actor!r} is not in participants")
 
     lock_handle = acquire(config.agent_dir / ".mail-lock")
     last_event_seq = None
@@ -1273,6 +1438,9 @@ def _validate_feedback_for_submit(payload: dict[str, Any]) -> None:
         if len(missing) == 1:
             raise WorkbenchError(f"{missing[0]} is required to submit feedback.")
         raise WorkbenchError(f"{' and '.join(missing)} are required to submit feedback.")
+    workflow_origin = _clean(payload.get("workflow_origin"))
+    if workflow_origin and workflow_origin not in WORKFLOW_ORIGINS:
+        raise WorkbenchError("Workflow origin must be one of: " + ", ".join(WORKFLOW_ORIGINS))
 
 
 def message_packet_block(packet: dict[str, Any]) -> str:
@@ -1283,35 +1451,90 @@ def message_packet_block(packet: dict[str, Any]) -> str:
         f"- kind: {message.get('kind', '')}",
         f"- thread_id: {message.get('thread_id', '')}",
         f"- from: {message.get('sender', '')}",
+        f"- from_instance: {message.get('sender_instance_id', '')}",
+        f"- workflow_origin: {message.get('workflow_origin') or ''}",
     ]
     recipients = message.get("recipients") or []
     if recipients:
         lines.append(f"- to: {', '.join(str(item) for item in recipients)}")
+    recipient_instances = message.get("recipient_instance_ids") or []
+    if recipient_instances:
+        lines.append(f"- to_instances: {', '.join(str(item) for item in recipient_instances)}")
     if message.get("request_id"):
         lines.append(f"- request_id: {message.get('request_id')}")
     if label:
-        lines.append(f"- title: {label}" if message.get("kind") == "request" else f"- summary: {label}")
+        lines.append(
+            f"- title: {label}" if message.get("kind") == "request" else f"- summary: {label}"
+        )
     if message.get("status"):
         lines.append(f"- status: {message.get('status')}")
     lines.extend(["", "### Message", str(message.get("body") or "")])
     return "\n".join(lines).rstrip() + "\n"
 
 
-def decision_detail_block(row, meta: dict[str, Any], body: str) -> str:
+def decision_detail_block(
+    row,
+    meta: dict[str, Any],
+    body: str,
+    *,
+    collections: dict[str, list[Any]] | None = None,
+    completeness_issues: tuple[str, ...] = (),
+) -> str:
     status_utc = _decision_status_utc(row, meta)
     proposed_utc = _decision_proposed_utc(row, meta)
+    lineage = decision_lineage_summary(meta)
     lines = [
         f"## {row['human_id']}",
         f"- dec_ulid: {row['dec_ulid']}",
         f"- status: {row['status']}",
         f"- status_utc: {status_utc}",
         f"- tier: {row['tier']}",
+        f"- tier_valid: {bool(row['tier_valid'])}",
         f"- owner: {row['owner'] or ''}",
         f"- drift_risk: {row['drift_risk'] or ''}",
         f"- proposed_utc: {proposed_utc}",
+        f"- content_revisions: {lineage.content_revisions}",
+        f"- revisit_annotations: {lineage.revisit_annotations}",
+        f"- complete_for_acceptance: {not completeness_issues}",
     ]
+    if completeness_issues:
+        lines.append(f"- completeness_issues: {'; '.join(completeness_issues)}")
+    collections = collections or {}
+    for label, values in (
+        ("affected_code_globs", collections.get("affected_code_globs", [])),
+        ("required_checks", collections.get("required_checks", [])),
+        (
+            "verification_commands",
+            [
+                str(item.get("command") or "")
+                for item in collections.get("verification", [])
+                if isinstance(item, dict)
+            ],
+        ),
+        ("tags", collections.get("tags", [])),
+    ):
+        if values:
+            lines.append(f"- {label}: {', '.join(str(value) for value in values)}")
     if row["accepted_utc"]:
         lines.append(f"- accepted_utc: {row['accepted_utc']}")
+        event_log = meta.get("event_log", [])
+        latest_acceptance: dict[str, Any] = {}
+        if isinstance(event_log, list):
+            for item in reversed(event_log):
+                if not isinstance(item, dict) or item.get("kind") != "decision_accepted":
+                    continue
+                payload = item.get("payload", {})
+                if isinstance(payload, dict):
+                    latest_acceptance = payload
+                break
+        if latest_acceptance.get("accepted_by"):
+            lines.append(f"- accepted_by: {latest_acceptance['accepted_by']}")
+        if latest_acceptance.get("approval_source"):
+            lines.append(f"- approval_source: {latest_acceptance['approval_source']}")
+        if latest_acceptance.get("approved_body_sha"):
+            lines.append(f"- approved_body_sha: {latest_acceptance['approved_body_sha']}")
+        if latest_acceptance.get("notes"):
+            lines.append(f"- approval_note: {latest_acceptance['notes']}")
     if row["in_force_utc"]:
         lines.append(f"- in_force_utc: {row['in_force_utc']}")
     if row["retired_utc"]:
@@ -1326,7 +1549,9 @@ def decision_detail_block(row, meta: dict[str, Any], body: str) -> str:
         _append_meta_section(lines, "Decision", meta.get("decision"))
         _append_meta_section(lines, "Consequences", meta.get("consequences"))
         _append_meta_section(lines, "Rejected Alternatives", meta.get("rejected_alternatives"))
-        _append_meta_section(lines, "Generated Artifact Paths", meta.get("generated_artifact_paths"))
+        _append_meta_section(
+            lines, "Generated Artifact Paths", meta.get("generated_artifact_paths")
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1423,9 +1648,7 @@ def _validate_workbench_host(host: str) -> None:
             "Workbench is loopback-only; use --host 127.0.0.1 or localhost"
         ) from exc
     if not address.is_loopback:
-        raise WorkbenchError(
-            "Workbench is loopback-only; use --host 127.0.0.1 or localhost"
-        )
+        raise WorkbenchError("Workbench is loopback-only; use --host 127.0.0.1 or localhost")
 
 
 def write_bookmark_file(config: AgentMeshConfig, context: WorkbenchContext) -> Path:
@@ -1493,6 +1716,8 @@ def _write_private_html(path: Path, payload: str) -> None:
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
+
+
 def render_server_workbench_html(context: WorkbenchContext) -> str:
     """Render the HTTP page without embedding the bearer token in its body."""
     return render_workbench_html(
@@ -1526,8 +1751,23 @@ def render_workbench_html(
     bookmark_url = bookmark_path.resolve().as_uri() if bookmark_path else ""
     managed_bookmark_path = managed_workbench_bookmark_path()
     managed_bookmark_url = managed_bookmark_path.as_uri()
+    decision_tier_options = "\n".join(
+        f'<option value="{escape(tier)}">{escape(tier.replace("_", " ").title())}</option>'
+        for tier in DECISION_TIERS
+    )
+    workflow_origin_options = "\n".join(
+        [
+            '<option value="">Any / unspecified</option>',
+            *(
+                f'<option value="{escape(origin)}">'
+                f"{escape(origin.replace('-', ' ').title())}</option>"
+                for origin in WORKFLOW_ORIGINS
+            ),
+        ]
+    )
     return (
-        WORKBENCH_HTML.replace("__AGENT_MESH_API_BASE__", json.dumps(api_base))
+        WORKBENCH_HTML.replace("__AGENT_MESH_BOOKMARK_URL_JSON__", json.dumps(bookmark_url))
+        .replace("__AGENT_MESH_API_BASE__", json.dumps(api_base))
         .replace("__AGENT_MESH_START_COMMAND__", escape(start_command))
         .replace("__AGENT_MESH_BOOKMARK_URL__", escape(bookmark_url))
         .replace("__AGENT_MESH_BOOKMARK_PATH__", escape(str(bookmark_path or "")))
@@ -1536,6 +1776,8 @@ def render_workbench_html(
         .replace("__AGENT_MESH_DEFAULT_REPO_ID__", json.dumps(default_repo_id))
         .replace("__AGENT_MESH_ACCESS_TOKEN__", json.dumps(access_token))
         .replace("__AGENT_MESH_MANAGED_SERVICE__", json.dumps(managed_service))
+        .replace("__AGENT_MESH_DECISION_TIER_OPTIONS__", decision_tier_options)
+        .replace("__AGENT_MESH_WORKFLOW_ORIGIN_OPTIONS__", workflow_origin_options)
         .replace("__AGENT_MESH_MAX_ATTACHMENT_BYTES__", str(MAX_ATTACHMENT_BYTES))
         .replace(
             "__AGENT_MESH_MAX_ATTACHMENT_TOTAL_BYTES__",
@@ -1678,6 +1920,7 @@ def _handler_for(repo: Path, context: WorkbenchContext) -> type[BaseHTTPRequestH
                             message_status=params.get("message_status", [""])[0].strip(),
                             message_kind=params.get("message_kind", [""])[0].strip(),
                             message_feature=params.get("message_feature", [""])[0].strip(),
+                            message_workflow_origin=params.get("message_origin", [""])[0].strip(),
                             message_query=params.get("message_q", [""])[0].strip(),
                             backlog_status=params.get("backlog_status", [""])[0].strip(),
                             backlog_lane=params.get("backlog_lane", [""])[0].strip(),
@@ -1686,6 +1929,7 @@ def _handler_for(repo: Path, context: WorkbenchContext) -> type[BaseHTTPRequestH
                             backlog_item_type=params.get("backlog_type", [""])[0].strip(),
                             backlog_launch_scope=params.get("backlog_scope", [""])[0].strip(),
                             backlog_wave=params.get("backlog_wave", [""])[0].strip(),
+                            backlog_workflow_origin=params.get("backlog_origin", [""])[0].strip(),
                             backlog_query=params.get("backlog_q", [""])[0].strip(),
                             backlog_quick_filter=params.get("backlog_filter", [""])[0].strip(),
                             decision_query=params.get("decision_q", [""])[0].strip(),
@@ -1737,6 +1981,7 @@ def _handler_for(repo: Path, context: WorkbenchContext) -> type[BaseHTTPRequestH
                                 status=params.get("status", [""])[0].strip(),
                                 kind=params.get("kind", [""])[0].strip(),
                                 feature=params.get("feature", [""])[0].strip(),
+                                workflow_origin=params.get("origin", [""])[0].strip(),
                                 query=params.get("q", [""])[0].strip(),
                             ),
                         },
@@ -1757,6 +2002,7 @@ def _handler_for(repo: Path, context: WorkbenchContext) -> type[BaseHTTPRequestH
                                 item_type=params.get("type", [""])[0].strip(),
                                 launch_scope=params.get("scope", [""])[0].strip(),
                                 wave=params.get("wave", [""])[0].strip(),
+                                workflow_origin=params.get("origin", [""])[0].strip(),
                                 query=params.get("q", [""])[0].strip(),
                                 quick_filter=params.get("filter", [""])[0].strip(),
                             ),
@@ -1812,7 +2058,9 @@ def _handler_for(repo: Path, context: WorkbenchContext) -> type[BaseHTTPRequestH
                         return
                     self._json(HTTPStatus.OK, result)
                     return
-                self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": f"Unknown path: {parsed.path}"})
+                self._json(
+                    HTTPStatus.NOT_FOUND, {"ok": False, "error": f"Unknown path: {parsed.path}"}
+                )
             except ProjectRegistryError as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
             except Exception as exc:  # pragma: no cover - local server safeguard
@@ -1898,6 +2146,10 @@ def _handler_for(repo: Path, context: WorkbenchContext) -> type[BaseHTTPRequestH
                         context=_clean(payload.get("context")),
                         decision=_clean(payload.get("decision")),
                         body=str(payload.get("body")) if payload.get("body") is not None else None,
+                        affected_code_globs=_string_list(payload.get("affected_code_globs")),
+                        required_checks=_string_list(payload.get("required_checks")),
+                        verification=_string_list(payload.get("verification_commands")),
+                        tags=_string_list(payload.get("tags")),
                         actor=_optional_clean(payload.get("actor")),
                     )
                     self._json(HTTPStatus.OK, result)
@@ -1912,6 +2164,22 @@ def _handler_for(repo: Path, context: WorkbenchContext) -> type[BaseHTTPRequestH
                         context=_optional_clean(payload.get("context")),
                         decision=_optional_clean(payload.get("decision")),
                         body=str(payload.get("body")) if payload.get("body") is not None else None,
+                        affected_code_globs=(
+                            _string_list(payload.get("affected_code_globs"))
+                            if "affected_code_globs" in payload
+                            else None
+                        ),
+                        required_checks=(
+                            _string_list(payload.get("required_checks"))
+                            if "required_checks" in payload
+                            else None
+                        ),
+                        verification=(
+                            _string_list(payload.get("verification_commands"))
+                            if "verification_commands" in payload
+                            else None
+                        ),
+                        tags=_string_list(payload.get("tags")) if "tags" in payload else None,
                         revision_reason=_clean(payload.get("revision_reason")),
                         actor=_optional_clean(payload.get("actor")),
                     )
@@ -1921,12 +2189,15 @@ def _handler_for(repo: Path, context: WorkbenchContext) -> type[BaseHTTPRequestH
                     result = accept_decision(
                         selected_repo,
                         _clean(payload.get("id")),
+                        expected_body_sha=_clean(payload.get("expected_body_sha")),
                         notes=_clean(payload.get("notes")),
-                        actor=_optional_clean(payload.get("actor")),
+                        actor=_clean(payload.get("actor")),
                     )
                     self._json(HTTPStatus.OK, result)
                     return
-                self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": f"Unknown path: {parsed.path}"})
+                self._json(
+                    HTTPStatus.NOT_FOUND, {"ok": False, "error": f"Unknown path: {parsed.path}"}
+                )
             except (ProjectRegistryError, ValueError, WorkbenchError) as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
             except Exception as exc:  # pragma: no cover - local server safeguard
@@ -1980,7 +2251,7 @@ def _string_list(value: Any) -> list[str]:
     return cleaned
 
 
-def _feedback_refs(payload: dict[str, Any]) -> list[str]:
+def _feedback_refs(payload: dict[str, Any]) -> list[Any]:
     refs: list[str] = []
     related_id = _clean(payload.get("related_id"))
     if related_id:
@@ -2012,24 +2283,28 @@ def _backlog_payload_from_row(row) -> dict[str, Any]:
     payload = json_loads(row["meta_json"], {})
     if not isinstance(payload, dict):
         payload = {}
-    payload.update({
-        "id": row["id"],
-        "title": row["title"],
-        "item_type": row["item_type"],
-        "summary": row["summary"],
-        "root_cause_summary": row["root_cause_summary"],
-        "architectural_category": row["architectural_category"],
-        "status": row["status"],
-        "priority": row["priority"],
-        "launch_scope": row["launch_scope"],
-        "release_phase": row["release_phase"],
-        "production_state": row["production_state"],
-        "disposition": row["disposition"],
-        "owner_hint": row["owner_hint"],
-        "lane": row["lane"],
-        "notes": row["notes"],
-        "refs": json_loads(row["refs_json"], []),
-    })
+    payload.update(
+        {
+            "id": row["id"],
+            "title": row["title"],
+            "item_type": row["item_type"],
+            "summary": row["summary"],
+            "root_cause_summary": row["root_cause_summary"],
+            "architectural_category": row["architectural_category"],
+            "status": row["status"],
+            "priority": row["priority"],
+            "launch_scope": row["launch_scope"],
+            "release_phase": row["release_phase"],
+            "production_state": row["production_state"],
+            "disposition": row["disposition"],
+            "owner_hint": row["owner_hint"],
+            "owner_instance_id": row["owner_instance_id"],
+            "lane": row["lane"],
+            "notes": row["notes"],
+            "workflow_origin": row["workflow_origin"],
+            "refs": json_loads(row["refs_json"], []),
+        }
+    )
     return {key: value for key, value in payload.items() if value is not None}
 
 
@@ -2046,6 +2321,10 @@ def _backlog_item_from_row(row) -> dict[str, Any]:
         "release_phase": row["release_phase"],
         "wave": row["release_phase"] or "",
         "owner_hint": row["owner_hint"],
+        "owner_instance_id": row["owner_instance_id"] or "",
+        "workflow_origin": row["workflow_origin"] or "",
+        "workflow_origin_valid": bool(row["workflow_origin_valid"]),
+        "workflow_origin_source": row["workflow_origin_source"],
         "updated_utc": row["updated_utc"],
         "refs": json_loads(row["refs_json"], []),
     }
@@ -2070,13 +2349,14 @@ def _backlog_detail_from_row(conn, row) -> dict[str, Any]:
         "production_state": row["production_state"] or "",
         "disposition": row["disposition"] or "",
         "owner_hint": row["owner_hint"] or "",
+        "owner_instance_id": row["owner_instance_id"] or "",
         "lane": row["lane"] or "unassigned",
         "notes": row["notes"] or "",
+        "workflow_origin": row["workflow_origin"] or "",
+        "workflow_origin_valid": bool(row["workflow_origin_valid"]),
+        "workflow_origin_source": row["workflow_origin_source"],
         "refs": json_loads(row["refs_json"], []),
-        "links": [
-            {"type": link["ref_type"], "value": link["ref_value"]}
-            for link in links
-        ],
+        "links": [{"type": link["ref_type"], "value": link["ref_value"]} for link in links],
         "created_utc": row["created_utc"],
         "updated_utc": row["updated_utc"],
         "event_seq": row["event_seq"],
@@ -2091,6 +2371,9 @@ def backlog_detail_block(item: dict[str, Any]) -> str:
         f"- priority: {item.get('priority', '')}",
         f"- type: {item.get('item_type', '')}",
         f"- owner: {item.get('owner_hint', '')}",
+        f"- owner_instance: {item.get('owner_instance_id', '')}",
+        f"- workflow_origin: {item.get('workflow_origin', '')}",
+        f"- workflow_origin_source: {item.get('workflow_origin_source', '')}",
         f"- scope: {item.get('launch_scope', '')}",
         f"- wave: {item.get('release_phase') or item.get('wave') or ''}",
         f"- updated_utc: {item.get('updated_utc', '')}",
@@ -2118,6 +2401,42 @@ def backlog_detail_block(item: dict[str, Any]) -> str:
     if links:
         lines.extend(["", "## Links"])
         lines.extend(f"- {link.get('type', 'unknown')}:{link.get('value', '')}" for link in links)
+    referral_events = [
+        event
+        for event in item.get("events") or []
+        if str(event.get("event_type") or "").startswith("backlog_referral_")
+    ]
+    if referral_events:
+        latest = referral_events[-1]
+        details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
+        lines.extend(
+            [
+                "",
+                "## Cross-repository referral",
+                f"- status: {str(latest.get('event_type') or '').removeprefix('backlog_referral_')}",
+                f"- referral_id: {details.get('referral_id', '')}",
+                f"- target_project: {details.get('target_project', '')}",
+            ]
+        )
+        if details.get("target_backlog"):
+            lines.append(f"- target_backlog: {details['target_backlog']}")
+        reason_code = str(details.get("reason_code") or "")
+        if reason_code == "target_write_scope_absent":
+            lines.append(
+                "- requested_action: grant an agent write scope for the target repo, then rerun "
+                "the referral with --apply"
+            )
+        elif reason_code == "duplicate_review_required":
+            candidates = ", ".join(str(value) for value in details.get("duplicate_candidates", []))
+            lines.append(
+                "- requested_action: review possible target duplicates "
+                f"({candidates}), then rerun with --use-existing TARGET-BKL-ID --apply"
+            )
+        elif reason_code == "target_write_failed":
+            lines.append(
+                "- requested_action: repair target write scope, then rerun the same referral "
+                "with --apply"
+            )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -2128,8 +2447,13 @@ def _message_item_from_row(row) -> dict[str, Any]:
         "thread_id": row["thread_id"],
         "request_id": row["request_id"] or "",
         "sender": row["sender"],
+        "sender_instance_id": row["sender_instance_id"] or "",
         "recipients": json_loads(row["recipients_json"], []),
+        "recipient_instance_ids": json_loads(row["recipient_instance_ids_json"], []),
         "feature": row["feature_id"] or "",
+        "workflow_origin": row["workflow_origin"] or "",
+        "workflow_origin_valid": bool(row["workflow_origin_valid"]),
+        "workflow_origin_source": row["workflow_origin_source"],
         "title": row["title"] or row["summary"] or "",
         "status": row["status"],
         "resolution": row["resolution"] or "",
@@ -2140,15 +2464,29 @@ def _message_item_from_row(row) -> dict[str, Any]:
     }
 
 
-def _decision_item_from_row(row) -> dict[str, Any]:
+def _decision_item_from_row(
+    row,
+    collections: dict[str, list[Any]] | None = None,
+) -> dict[str, Any]:
     meta = json_loads(row["meta_json"], {})
     if not isinstance(meta, dict):
         meta = {}
+    collections = collections or {
+        "affected_code_globs": [],
+        "verification": [],
+    }
+    completeness_issues = decision_completeness_issues(
+        tier=str(row["tier"]),
+        owner=str(row["owner"] or ""),
+        affected_code_globs=collections["affected_code_globs"],
+        verification=collections["verification"],
+    )
     return {
         "id": row["human_id"],
         "dec_ulid": row["dec_ulid"],
         "title": row["title"],
         "tier": row["tier"],
+        "tier_valid": bool(row["tier_valid"]),
         "status": row["status"],
         "owner": row["owner"] or "",
         "drift_risk": row["drift_risk"] or "",
@@ -2160,7 +2498,105 @@ def _decision_item_from_row(row) -> dict[str, Any]:
         "last_verified_utc": row["last_verified_utc"],
         "superseded_by": row["superseded_by"] or "",
         "status_utc": _decision_status_utc(row, meta),
+        "complete_for_acceptance": not completeness_issues,
+        "completeness_issues": list(completeness_issues),
     }
+
+
+def _decision_completeness_collections(
+    conn,
+    dec_ulids: set[str],
+) -> dict[str, dict[str, list[Any]]]:
+    collections: dict[str, dict[str, list[Any]]] = {
+        dec_ulid: {"affected_code_globs": [], "verification": []}
+        for dec_ulid in dec_ulids
+    }
+    for row in conn.execute(
+        "SELECT dec_ulid, pattern FROM decision_globs WHERE kind='affected' ORDER BY rowid"
+    ):
+        dec_ulid = str(row["dec_ulid"])
+        if dec_ulid in collections:
+            collections[dec_ulid]["affected_code_globs"].append(str(row["pattern"]))
+    for row in conn.execute(
+        "SELECT dec_ulid, command, expected_signal FROM decision_verifications ORDER BY rowid"
+    ):
+        dec_ulid = str(row["dec_ulid"])
+        if dec_ulid in collections:
+            collections[dec_ulid]["verification"].append(
+                {
+                    "command": str(row["command"]),
+                    "expected_signal": str(row["expected_signal"]),
+                }
+            )
+    return collections
+
+
+def _decision_collections(conn, dec_ulid: str) -> dict[str, list[Any]]:
+    affected_code_globs = [
+        str(row["pattern"])
+        for row in conn.execute(
+            "SELECT pattern FROM decision_globs "
+            "WHERE dec_ulid=? AND kind='affected' ORDER BY rowid",
+            (dec_ulid,),
+        )
+    ]
+    required_checks = [
+        str(row["check_name"])
+        for row in conn.execute(
+            "SELECT check_name FROM decision_checks WHERE dec_ulid=? ORDER BY rowid",
+            (dec_ulid,),
+        )
+    ]
+    verification = [
+        {
+            "command": str(row["command"]),
+            "execution_mode": str(row["execution_mode"]),
+            "argv": json_loads(row["argv_json"], None),
+            "expected_signal": str(row["expected_signal"]),
+            "runtime_cost": row["runtime_cost"],
+            "drift_risk": row["drift_risk"],
+            "last_verified_utc": row["last_verified_utc"],
+            "last_outcome": row["last_outcome"],
+        }
+        for row in conn.execute(
+            "SELECT command, execution_mode, argv_json, expected_signal, "
+            "runtime_cost, drift_risk, "
+            "last_verified_utc, last_outcome FROM decision_verifications "
+            "WHERE dec_ulid=? ORDER BY rowid",
+            (dec_ulid,),
+        )
+    ]
+    tags = [
+        str(row["tag"])
+        for row in conn.execute(
+            "SELECT tag FROM decision_tags WHERE dec_ulid=? ORDER BY rowid",
+            (dec_ulid,),
+        )
+    ]
+    return {
+        "affected_code_globs": affected_code_globs,
+        "required_checks": required_checks,
+        "verification": verification,
+        "tags": tags,
+    }
+
+
+def _verification_definitions(values: list[Any]) -> list[dict[str, Any]]:
+    definitions: list[dict[str, Any]] = []
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        definition = {
+            "command": str(item.get("command") or ""),
+            "execution_mode": str(item.get("execution_mode") or ""),
+            "argv": item.get("argv"),
+            "expected_signal": str(item.get("expected_signal") or "exit 0"),
+        }
+        for key in ("runtime_cost", "drift_risk"):
+            if item.get(key) is not None:
+                definition[key] = item[key]
+        definitions.append(definition)
+    return definitions
 
 
 def _contains(value: Any, expected: str) -> bool:
@@ -2177,6 +2613,7 @@ def _filter_backlog_items(
     item_type: str = "",
     launch_scope: str = "",
     wave: str = "",
+    workflow_origin: str = "",
     query: str = "",
     quick_filter: str = "",
 ) -> list[dict[str, Any]]:
@@ -2189,6 +2626,7 @@ def _filter_backlog_items(
         "item_type": item_type,
         "launch_scope": launch_scope,
         "wave": wave,
+        "workflow_origin": workflow_origin,
     }
     for key, expected in filters.items():
         if expected:
@@ -2197,9 +2635,7 @@ def _filter_backlog_items(
         filtered = [item for item in filtered if _backlog_item_matches_query(item, query)]
     if quick_filter:
         filtered = [
-            item
-            for item in filtered
-            if _backlog_item_matches_quick_filter(item, quick_filter)
+            item for item in filtered if _backlog_item_matches_quick_filter(item, quick_filter)
         ]
     return filtered
 
@@ -2877,6 +3313,9 @@ WORKBENCH_HTML = """<!doctype html>
 	            <option>nit</option>
 	          </select>
 	        </label>
+	        <label style="width:210px">Workflow origin <span class="field-note">Optional</span>
+	          <select id="fb-origin">__AGENT_MESH_WORKFLOW_ORIGIN_OPTIONS__</select>
+	        </label>
 	      </div>
 	      <label>Target or area <span class="field-note">Optional</span><input id="fb-target" placeholder="feature, route, component, or backlog id"></label>
 	      <label>Notes <span class="required-mark">*</span><textarea id="fb-notes" placeholder="What you observed, expected behavior, and acceptance criteria." required aria-required="true"></textarea></label>
@@ -2931,6 +3370,9 @@ WORKBENCH_HTML = """<!doctype html>
 	          <option value="feedback">Feedback</option>
 	        </select>
 	      </label>
+	      <label>Workflow origin <span class="field-note">Optional</span>
+	        <select id="message-origin-filter">__AGENT_MESH_WORKFLOW_ORIGIN_OPTIONS__</select>
+	      </label>
 	      <button id="search-messages">Search</button>
 	    </div>
 	    <div class="row">
@@ -2956,6 +3398,7 @@ WORKBENCH_HTML = """<!doctype html>
 	          <th data-sort-table="messages" data-sort-key="status" aria-sort="none">Status <span class="sort-mark"></span></th>
 	          <th data-sort-table="messages" data-sort-key="kind" aria-sort="none">Kind <span class="sort-mark"></span></th>
 	          <th data-sort-table="messages" data-sort-key="feature" aria-sort="none">Feature <span class="sort-mark"></span></th>
+	          <th data-sort-table="messages" data-sort-key="workflow_origin" aria-sort="none">Origin <span class="sort-mark"></span></th>
 	          <th data-sort-table="messages" data-sort-key="sender" aria-sort="none">From <span class="sort-mark"></span></th>
 	          <th data-sort-table="messages" data-sort-key="recipients" aria-sort="none">To <span class="sort-mark"></span></th>
 	          <th data-sort-table="messages" data-sort-key="title" aria-sort="none">Title <span class="sort-mark"></span></th>
@@ -2990,6 +3433,9 @@ WORKBENCH_HTML = """<!doctype html>
 	      <label>Type <span class="field-note">Optional</span><input id="backlog-type-filter" placeholder="bug"></label>
 	      <label>Scope <span class="field-note">Optional</span><input id="backlog-scope-filter" placeholder="launch"></label>
 	      <label>Wave <span class="field-note">Optional</span><input id="backlog-wave-filter" placeholder="pre-launch"></label>
+	      <label>Workflow origin <span class="field-note">Optional</span>
+	        <select id="backlog-origin-filter">__AGENT_MESH_WORKFLOW_ORIGIN_OPTIONS__</select>
+	      </label>
 	      <button id="search-backlog">Search</button>
 	      <button class="ghost" id="clear-backlog-filters">Clear</button>
 	    </div>
@@ -3003,7 +3449,8 @@ WORKBENCH_HTML = """<!doctype html>
           <th data-sort-table="backlog" data-sort-key="lane" aria-sort="none">Lane <span class="sort-mark"></span></th>
           <th data-sort-table="backlog" data-sort-key="priority" aria-sort="none">Priority <span class="sort-mark"></span></th>
           <th data-sort-table="backlog" data-sort-key="item_type" aria-sort="none">Type <span class="sort-mark"></span></th>
-          <th data-sort-table="backlog" data-sort-key="owner_hint" aria-sort="none">Owner <span class="sort-mark"></span></th>
+	          <th data-sort-table="backlog" data-sort-key="owner_hint" aria-sort="none">Owner <span class="sort-mark"></span></th>
+	          <th data-sort-table="backlog" data-sort-key="workflow_origin" aria-sort="none">Origin <span class="sort-mark"></span></th>
           <th data-sort-table="backlog" data-sort-key="launch_scope" aria-sort="none">Scope <span class="sort-mark"></span></th>
           <th data-sort-table="backlog" data-sort-key="wave" aria-sort="none">Wave <span class="sort-mark"></span></th>
           <th data-sort-table="backlog" data-sort-key="title" aria-sort="none">Title <span class="sort-mark"></span></th>
@@ -3045,11 +3492,7 @@ WORKBENCH_HTML = """<!doctype html>
 	        <label>ID <span class="field-note">Auto if blank</span><input id="decision-edit-id" placeholder="D079"></label>
 	        <label>Tier <span class="required-mark">*</span>
 	          <select id="decision-edit-tier" required aria-required="true">
-	            <option value="note">Note</option>
-	            <option value="implementation_plan">Implementation plan</option>
-	            <option value="architecture_contract">Architecture contract</option>
-	            <option value="production_invariant">Production invariant</option>
-	            <option value="compliance_security">Compliance/security</option>
+__AGENT_MESH_DECISION_TIER_OPTIONS__
 	          </select>
 	        </label>
 	        <label>Owner <span class="field-note">Optional</span><input id="decision-edit-owner" placeholder="human or agent"></label>
@@ -3057,13 +3500,17 @@ WORKBENCH_HTML = """<!doctype html>
 	        <label class="wide">Title <span class="required-mark">*</span><input id="decision-edit-title" required aria-required="true" placeholder="One durable choice"></label>
 	        <label class="wide">Context <span class="field-note">Optional</span><textarea id="decision-edit-context" placeholder="Why this choice is needed"></textarea></label>
 	        <label class="wide">Decision <span class="field-note">Optional</span><textarea id="decision-edit-summary" placeholder="What has been decided"></textarea></label>
+	        <label class="wide">Affected code globs <span class="field-note">One per line; required for required-enforcement tiers</span><textarea id="decision-edit-globs" placeholder="src/package/**"></textarea></label>
+	        <label class="wide">Required checks <span class="field-note">One repo-owned check per line</span><textarea id="decision-edit-checks" placeholder="pytest::tests/test_contract.py"></textarea></label>
+	        <label class="wide">Verification commands <span class="field-note">One argv-only command per line; no pipes, redirection, expansion, or chaining; required for architecture contracts and above</span><textarea id="decision-edit-verification" placeholder="pytest tests/test_contract.py"></textarea></label>
+	        <label class="wide">Tags <span class="field-note">One per line</span><textarea id="decision-edit-tags" placeholder="architecture"></textarea></label>
 	        <label class="wide">Canonical Markdown body <span class="field-note">Optional; generated from the fields above when blank</span><textarea id="decision-edit-body" class="body" placeholder="# D079 — Decision title"></textarea></label>
 	        <label id="decision-revision-reason-field" class="wide" hidden>Revision reason <span class="required-mark">*</span><input id="decision-revision-reason" placeholder="Why an accepted decision is being reopened"></label>
-	        <label id="decision-approval-notes-field" class="wide" hidden>Approval note <span class="field-note">Optional</span><input id="decision-approval-notes" placeholder="Where or how the human approved this decision"></label>
+	        <label id="decision-approval-notes-field" class="wide" hidden>Human approval note <span class="required-mark">*</span><input id="decision-approval-notes" placeholder="Why you approve this exact decision revision"></label>
 	      </div>
 	      <div class="row">
 	        <button type="submit" id="save-decision" data-requires-server>Save decision</button>
-	        <button type="button" id="accept-decision" data-requires-server hidden>Accept decision</button>
+	        <button type="button" id="accept-decision" data-requires-server hidden>Approve and accept</button>
 	        <button type="button" class="ghost" id="cancel-decision-edit">Cancel</button>
 	      </div>
 	      <div id="decision-edit-status" class="edit-status" role="status" aria-live="polite"></div>
@@ -3098,6 +3545,7 @@ const API_BASE = __AGENT_MESH_API_BASE__;
 const DEFAULT_REPO_ID = __AGENT_MESH_DEFAULT_REPO_ID__;
 const EMBEDDED_API_TOKEN = __AGENT_MESH_ACCESS_TOKEN__;
 const MANAGED_SERVICE = __AGENT_MESH_MANAGED_SERVICE__;
+const BOOKMARK_URL = __AGENT_MESH_BOOKMARK_URL_JSON__;
 const FRAGMENT_TOKEN = new URLSearchParams(window.location.hash.slice(1)).get('token') || '';
 const API_TOKEN = EMBEDDED_API_TOKEN || FRAGMENT_TOKEN;
 if (FRAGMENT_TOKEN) history.replaceState(null, '', window.location.pathname + window.location.search);
@@ -3107,12 +3555,15 @@ const FEEDBACK_PENDING_KEY = 'agent-mesh.feedback.pending.v2';
 const FEEDBACK_RECEIPT_KEY = 'agent-mesh.feedback.receipt.v2';
 const FEEDBACK_DRAFT_KEY = 'agent-mesh.feedback.draft.v1';
 const ACTIVE_REPO_KEY = 'agent-mesh.workbench.active-repo.v1';
+const STALE_BOOKMARK_REFRESH_PARAM = 'agent-mesh-stale-token-refresh';
+const MAX_STALE_BOOKMARK_REFRESHES = 1;
 const MAX_ATTACHMENT_BYTES = __AGENT_MESH_MAX_ATTACHMENT_BYTES__;
 const MAX_ATTACHMENT_TOTAL_BYTES = __AGENT_MESH_MAX_ATTACHMENT_TOTAL_BYTES__;
 const FEEDBACK_INPUT_IDS = [
   'fb-title',
   'fb-related',
   'fb-severity',
+  'fb-origin',
   'fb-target',
   'fb-notes',
   'fb-refs',
@@ -3131,6 +3582,7 @@ let decisionRows = [];
 let activeDecision = null;
 let decisionNextId = '';
 let decisionDefaultActor = '';
+let staleBookmarkRefreshStarted = false;
 const tableSort = {
   messages: { key: 'created_utc', direction: 'desc' },
   backlog: { key: 'updated_utc', direction: 'desc' },
@@ -3151,6 +3603,47 @@ function setServerConnection(state, detail = '') {
   document.querySelectorAll('[data-requires-server]').forEach((button) => {
     button.disabled = !online || (button.id === 'repo-selector' && !projectRegistryLoaded);
   });
+}
+
+function staleBookmarkRefreshAttempt() {
+  try {
+    const raw = new URL(window.location.href).searchParams.get(STALE_BOOKMARK_REFRESH_PARAM) || '';
+    const attempt = Number.parseInt(raw, 10);
+    return Number.isFinite(attempt) && attempt > 0 ? attempt : 0;
+  } catch (error) {
+    return MAX_STALE_BOOKMARK_REFRESHES;
+  }
+}
+
+function refreshManagedBookmarkAfterUnauthorized(response, payload) {
+  const tokenMismatch = response.status === 403
+    && payload.error === 'Missing or invalid Workbench access token';
+  if (!tokenMismatch || !MANAGED_SERVICE || !BOOKMARK_URL || staleBookmarkRefreshStarted) {
+    return false;
+  }
+  const attempt = staleBookmarkRefreshAttempt();
+  if (attempt >= MAX_STALE_BOOKMARK_REFRESHES) return false;
+  try {
+    const refreshUrl = new URL(BOOKMARK_URL);
+    refreshUrl.searchParams.set(STALE_BOOKMARK_REFRESH_PARAM, String(attempt + 1));
+    staleBookmarkRefreshStarted = true;
+    setServerConnection('offline', 'Access changed; loading the latest private bookmark.');
+    window.location.replace(refreshUrl.href);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function clearStaleBookmarkRefreshAttempt() {
+  if (!MANAGED_SERVICE || staleBookmarkRefreshAttempt() === 0) return;
+  try {
+    const cleanUrl = new URL(window.location.href);
+    cleanUrl.searchParams.delete(STALE_BOOKMARK_REFRESH_PARAM);
+    history.replaceState(null, '', cleanUrl.href);
+  } catch (error) {
+    // Automatic recovery remains bounded even when file-page history is unavailable.
+  }
 }
 
 async function api(path, options = {}) {
@@ -3175,9 +3668,17 @@ async function api(path, options = {}) {
     error.cause = cause;
     throw error;
   }
-  setServerConnection('online');
   const payload = await response.json();
-  if (!response.ok || payload.ok === false) throw new Error(payload.error || response.statusText);
+  if (!response.ok || payload.ok === false) {
+    if (refreshManagedBookmarkAfterUnauthorized(response, payload)) {
+      const error = new Error('Workbench access changed; loading the latest private bookmark.');
+      error.bookmarkRecovery = true;
+      throw error;
+    }
+    throw new Error(payload.error || response.statusText);
+  }
+  setServerConnection('online');
+  if (path === '/api/health') clearStaleBookmarkRefreshAttempt();
   return payload;
 }
 
@@ -3241,6 +3742,7 @@ function snapshotParams() {
     ['message_status', 'message-status-filter'],
     ['message_kind', 'message-kind-filter'],
     ['message_feature', 'message-feature-filter'],
+    ['message_origin', 'message-origin-filter'],
     ['backlog_q', 'backlog-search'],
     ['backlog_filter', 'backlog-quick-filter'],
     ['backlog_status', 'backlog-status-filter'],
@@ -3250,6 +3752,7 @@ function snapshotParams() {
     ['backlog_type', 'backlog-type-filter'],
     ['backlog_scope', 'backlog-scope-filter'],
     ['backlog_wave', 'backlog-wave-filter'],
+    ['backlog_origin', 'backlog-origin-filter'],
     ['decision_q', 'decision-search'],
     ['decision_status', 'decision-status-filter'],
     ['decision_tier', 'decision-tier-filter'],
@@ -3293,7 +3796,7 @@ async function checkServerConnection() {
     await api('/api/health');
     if (projectRegistryLoaded) await recoverPendingFeedbackSubmission();
   } catch (error) {
-    if (!error.networkFailure) {
+    if (!error.networkFailure && !error.bookmarkRecovery) {
       setServerConnection('offline', error.message);
     }
   }
@@ -3464,6 +3967,7 @@ function feedbackPayload() {
     title: $('fb-title').value,
     related_id: $('fb-related').value,
     severity: $('fb-severity').value,
+    workflow_origin: $('fb-origin').value,
     target: $('fb-target').value,
     notes: $('fb-notes').value,
     refs: $('fb-refs').value,
@@ -3546,6 +4050,7 @@ function restoreFeedbackInputs(payload) {
   $('fb-title').value = payload.title || '';
   $('fb-related').value = payload.related_id || '';
   $('fb-severity').value = payload.severity || 'normal';
+  $('fb-origin').value = payload.workflow_origin || '';
   $('fb-target').value = payload.target || '';
   $('fb-notes').value = payload.notes || '';
   $('fb-refs').value = payload.refs || '';
@@ -3652,10 +4157,12 @@ async function loadMessages(resultOverride = null) {
   const status = $('message-status-filter').value.trim();
   const kind = $('message-kind-filter').value.trim();
   const feature = $('message-feature-filter').value.trim();
+  const origin = $('message-origin-filter').value.trim();
   if (query) params.set('q', query);
   if (status) params.set('status', status);
   if (kind) params.set('kind', kind);
   if (feature) params.set('feature', feature);
+  if (origin) params.set('origin', origin);
   const suffix = params.toString() ? `?${params.toString()}` : '';
   const result = resultOverride || await api(`/api/messages${suffix}`);
   messageRows = result.messages;
@@ -3673,11 +4180,12 @@ function renderMessageRows(messages) {
       <td>${escapeHtml(message.status)}</td>
       <td>${escapeHtml(message.kind)}</td>
       <td>${escapeHtml(message.feature)}</td>
+      <td>${escapeHtml(message.workflow_origin || '')}</td>
       <td>${escapeHtml(message.sender)}</td>
       <td>${escapeHtml((message.recipients || []).join(', '))}</td>
       <td>${escapeHtml(message.title)}</td>
     </tr>
-  `).join('') || '<tr><td colspan="8" class="muted">No messages.</td></tr>';
+  `).join('') || '<tr><td colspan="9" class="muted">No messages.</td></tr>';
 }
 
 function renderMessageDetail(result) {
@@ -3706,6 +4214,7 @@ function messageRowFromPacket(message) {
     created_utc: message.created_utc || '',
     status: message.status || '',
     feature: message.feature || '',
+    workflow_origin: message.workflow_origin || '',
     sender: message.sender || '',
     recipients: message.recipients || [],
     title: message.title || message.summary || '',
@@ -3748,6 +4257,7 @@ async function loadBacklog(resultOverride = null) {
   const itemType = $('backlog-type-filter').value.trim();
   const scope = $('backlog-scope-filter').value.trim();
   const wave = $('backlog-wave-filter').value.trim();
+  const origin = $('backlog-origin-filter').value.trim();
   if (query) params.set('q', query);
   if (quickFilter) params.set('filter', quickFilter);
   if (status) params.set('status', status);
@@ -3757,6 +4267,7 @@ async function loadBacklog(resultOverride = null) {
   if (itemType) params.set('type', itemType);
   if (scope) params.set('scope', scope);
   if (wave) params.set('wave', wave);
+  if (origin) params.set('origin', origin);
   const suffix = params.toString() ? `?${params.toString()}` : '';
   const result = resultOverride || await api(`/api/backlog/items${suffix}`);
   backlogRows = result.items;
@@ -3778,11 +4289,12 @@ function renderBacklogRows(items) {
       </select></td>
       <td>${escapeHtml(item.item_type)}</td>
       <td>${escapeHtml(item.owner_hint)}</td>
+      <td>${escapeHtml(item.workflow_origin || '')}</td>
       <td>${escapeHtml(item.launch_scope)}</td>
       <td>${escapeHtml(item.wave || item.release_phase || '')}</td>
       <td>${escapeHtml(item.title)}</td>
     </tr>
-  `).join('') || '<tr><td colspan="10" class="muted">No backlog items.</td></tr>';
+  `).join('') || '<tr><td colspan="11" class="muted">No backlog items.</td></tr>';
 }
 
 async function lookupBacklogItem(id) {
@@ -3851,12 +4363,18 @@ function resetDecisionEditor(hide = false) {
   $('decision-edit-title').value = '';
   $('decision-edit-context').value = '';
   $('decision-edit-summary').value = '';
+  $('decision-edit-globs').value = '';
+  $('decision-edit-checks').value = '';
+  $('decision-edit-verification').value = '';
+  $('decision-edit-tags').value = '';
   $('decision-edit-body').value = '';
   $('decision-revision-reason').value = '';
   $('decision-revision-reason-field').hidden = true;
 	$('decision-approval-notes').value = '';
+	$('decision-approval-notes').required = false;
 	$('decision-approval-notes-field').hidden = true;
   $('accept-decision').hidden = true;
+  $('accept-decision').disabled = false;
   $('save-decision').textContent = 'Create decision';
   $('decision-edit-status').textContent = '';
 }
@@ -3885,16 +4403,28 @@ function populateDecisionEditor(decision) {
   $('decision-edit-title').value = decision.title || '';
   $('decision-edit-context').value = meta.context || '';
   $('decision-edit-summary').value = meta.decision || '';
+  $('decision-edit-globs').value = (decision.affected_code_globs || []).join('\\n');
+  $('decision-edit-checks').value = (decision.required_checks || []).join('\\n');
+  $('decision-edit-verification').value = (decision.verification || [])
+    .map(item => item.command || '')
+    .filter(Boolean)
+    .join('\\n');
+  $('decision-edit-tags').value = (decision.tags || []).join('\\n');
   $('decision-edit-body').value = decision.body || '';
   $('decision-revision-reason').value = '';
   $('decision-revision-reason-field').hidden = !['accepted', 'in_force'].includes(status);
 	$('decision-approval-notes').value = '';
+	$('decision-approval-notes').required = status === 'proposed';
 	$('decision-approval-notes-field').hidden = status !== 'proposed';
   $('accept-decision').hidden = status !== 'proposed';
+  const completenessIssues = decision.completeness_issues || [];
+  $('accept-decision').disabled = status === 'proposed' && completenessIssues.length > 0;
   $('save-decision').textContent = 'Save revision';
   $('decision-edit-status').textContent = ['superseded', 'retired', 'rejected'].includes(status)
     ? `This decision is ${status}; create a successor instead of editing it.`
-    : '';
+    : status === 'proposed' && completenessIssues.length
+      ? `Approval is blocked: ${completenessIssues.join('; ')}. Add the missing metadata and save.`
+      : '';
 }
 
 function decisionEditorPayload() {
@@ -3906,6 +4436,10 @@ function decisionEditorPayload() {
 	actor: $('decision-edit-actor').value,
     context: $('decision-edit-context').value,
     decision: $('decision-edit-summary').value,
+    affected_code_globs: $('decision-edit-globs').value,
+    required_checks: $('decision-edit-checks').value,
+    verification_commands: $('decision-edit-verification').value,
+    tags: $('decision-edit-tags').value,
     body: $('decision-edit-body').value,
     revision_reason: $('decision-revision-reason').value,
   };
@@ -3940,10 +4474,20 @@ async function acceptActiveDecision() {
   if (!id) return null;
 	const actor = $('decision-edit-actor').value.trim();
 	if (!actor) {
-	  $('decision-edit-status').textContent = 'Choose the approving identity.';
+	  $('decision-edit-status').textContent = 'Choose the approving human identity.';
 	  return null;
 	}
-	if (!window.confirm(`Accept ${id} as ${actor}? This records explicit human approval.`)) {
+	const notes = $('decision-approval-notes').value.trim();
+	if (!notes) {
+	  $('decision-edit-status').textContent = 'Enter a human approval note.';
+	  return null;
+	}
+	const bodySha = (activeDecision.body_sha || '').trim();
+	if (!bodySha) {
+	  $('decision-edit-status').textContent = 'Reload this decision before approving it.';
+	  return null;
+	}
+	if (!window.confirm(`Approve and accept ${id} as ${actor}? This binds your approval to the displayed revision.`)) {
 	  return null;
 	}
   $('decision-edit-status').textContent = `Accepting ${id}...`;
@@ -3952,7 +4496,8 @@ async function acceptActiveDecision() {
 	body: JSON.stringify({
 	  id,
 	  actor,
-	  notes: $('decision-approval-notes').value,
+	  notes,
+	  expected_body_sha: bodySha,
 	}),
   });
   populateDecisionEditor(result.decision);
@@ -4071,6 +4616,7 @@ function clearBacklogFilterInputs() {
     'backlog-type-filter',
     'backlog-scope-filter',
     'backlog-wave-filter',
+    'backlog-origin-filter',
   ].forEach((id) => { $(id).value = ''; });
   $('backlog-quick-filter').value = '';
 }
@@ -4104,6 +4650,7 @@ function clearMessageFilterInputs() {
   $('message-status-filter').value = '';
   $('message-kind-filter').value = '';
   $('message-feature-filter').value = '';
+  $('message-origin-filter').value = '';
 }
 
 function applyMessageFilter({ kind = '', feature = '', status = '' } = {}) {

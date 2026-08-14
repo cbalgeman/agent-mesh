@@ -1,4 +1,5 @@
 """Durable event append protocol for events.jsonl."""
+
 from __future__ import annotations
 
 import json
@@ -9,10 +10,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_mesh.core.agent_instances import (
+    INSTANCE_EVENT_KINDS,
+    AgentInstanceError,
+    reduce_agent_instances,
+    selected_agent_instance,
+    validate_actor_shadow,
+)
 from agent_mesh.core.dispatch_schema import DispatchSchemaError, validate_dispatch_payload
 from agent_mesh.core.hashing import SENTINEL_PREV_HASH, canonical_json, hash_event_line
 from agent_mesh.core.ids import new_ulid
 from agent_mesh.core.provenance import ProvenanceValidationError, validate_event_provenance
+from agent_mesh.core.workflow_origin import (
+    WorkflowOriginValidationError,
+    validate_event_workflow_origin,
+)
 
 FAULT_ENV_VAR = "AGENT_MESH_FAULT_AFTER"
 ALLOW_NOOP_REPLAY_ENV_VAR = "AGENT_MESH_ALLOW_NOOP_REPLAY"
@@ -36,6 +48,7 @@ class Event:
     occurred_utc: str = field(default_factory=lambda: utc_now())
     event_seq: int | None = None
     actor: str = ""
+    actor_instance_id: str = ""
     kind: str = ""
     entity_id: str = ""
     thread_id: str = ""
@@ -47,7 +60,7 @@ class Event:
             raise EventProtocolError("event_seq must be assigned before serialization")
         if self.prev_event_hash is None:
             raise EventProtocolError("prev_event_hash must be assigned before serialization")
-        return {
+        envelope = {
             "actor": self.actor,
             "entity_id": self.entity_id,
             "event_id": self.event_id,
@@ -59,6 +72,9 @@ class Event:
             "schema_version": self.schema_version,
             "thread_id": self.thread_id,
         }
+        if self.actor_instance_id:
+            envelope["actor_instance_id"] = self.actor_instance_id
+        return envelope
 
 
 @dataclass(frozen=True)
@@ -80,11 +96,29 @@ def generate_event_id() -> str:
     return new_ulid("ev")
 
 
-def append_event(events_path: str | Path, event: Event, lock_acquired: bool = True) -> AppendResult:
-    """Append one event with the durable intent/commit journal protocol."""
+def append_event(
+    events_path: str | Path, event: Event, lock_acquired: bool = False
+) -> AppendResult:
+    """Append one event with the durable intent/commit journal protocol.
+
+    The public default acquires the mesh lock. Pass ``lock_acquired=True`` only
+    from a writer that already owns ``.mail-lock`` for the entire transaction.
+    """
+    event = replace(
+        event,
+        actor_instance_id=selected_agent_instance(event.actor_instance_id),
+    )
+    try:
+        validate_actor_shadow(event.kind, event.actor, event.payload)
+    except AgentInstanceError as exc:
+        raise EventProtocolError(str(exc)) from exc
     try:
         validate_event_provenance(event.kind, event.payload, event.entity_id)
     except ProvenanceValidationError as exc:
+        raise EventProtocolError(str(exc)) from exc
+    try:
+        validate_event_workflow_origin(event.kind, event.payload, event.entity_id)
+    except WorkflowOriginValidationError as exc:
         raise EventProtocolError(str(exc)) from exc
     try:
         validate_dispatch_payload(event.kind, event.payload)
@@ -112,6 +146,8 @@ def append_event(events_path: str | Path, event: Event, lock_acquired: bool = Tr
     from agent_mesh.core.recovery import recover
 
     recover(path, journal_dir)
+    event = _validate_agent_instance_before_append(event, path)
+    _validate_stateful_event_before_append(event, journal_dir)
 
     prev_line, prev_hash = read_tail_line(path)
     next_seq = _next_event_seq(prev_line)
@@ -170,6 +206,175 @@ def append_event(events_path: str | Path, event: Event, lock_acquired: bool = Tr
     return AppendResult(event=prepared, event_hash=event_hash, line_bytes=line)
 
 
+def _validate_agent_instance_before_append(event: Event, events_path: Path) -> Event:
+    """Resolve and enforce durable instance attribution while holding the append lock."""
+
+    from agent_mesh.config import config_from_agent_dir
+
+    records: list[dict[str, Any]] = []
+    if events_path.exists():
+        with events_path.open("r", encoding="utf-8") as handle:
+            records = [json.loads(line) for line in handle if line.strip()]
+    try:
+        instances = reduce_agent_instances(records)
+    except AgentInstanceError as exc:
+        raise EventProtocolError(str(exc)) from exc
+
+    selected = event.actor_instance_id.strip()
+    if selected:
+        matches = [
+            item
+            for item in instances.values()
+            if selected == item.id or selected.lower() in item.aliases
+        ]
+        if len(matches) != 1:
+            code = "AGENT_INSTANCE_UNKNOWN" if not matches else "AGENT_INSTANCE_LABEL_AMBIGUOUS"
+            raise EventProtocolError(f"{code}: {selected}")
+        instance = matches[0]
+        if instance.status != "active":
+            raise EventProtocolError(f"AGENT_INSTANCE_RETIRED: {instance.id}")
+        if instance.participant != event.actor:
+            raise EventProtocolError(
+                f"AGENT_INSTANCE_ACTOR_MISMATCH: {instance.id} belongs to "
+                f"{instance.participant!r}, not {event.actor!r}"
+            )
+        event = replace(event, actor_instance_id=instance.id)
+    elif any(
+        item.participant == event.actor and item.status == "active" for item in instances.values()
+    ):
+        raise EventProtocolError(
+            f"AGENT_INSTANCE_REQUIRED: participant {event.actor!r} has active registered instances; "
+            "use --instance or AGENT_MESH_INSTANCE_ID"
+        )
+
+    if event.kind == "req_created":
+        raw_targets = event.payload.get("to_instances", [])
+        if not isinstance(raw_targets, list):
+            raise EventProtocolError("AGENT_INSTANCE_ADDRESS_INVALID: to_instances must be a list")
+        recipients = event.payload.get("to", [])
+        if isinstance(recipients, str):
+            recipients = [recipients]
+        recipient_set = {str(value) for value in recipients}
+        seen_targets: set[str] = set()
+        for raw_target in raw_targets:
+            target_id = str(raw_target)
+            if target_id in seen_targets:
+                raise EventProtocolError(
+                    f"AGENT_INSTANCE_ADDRESS_DUPLICATE: {target_id}"
+                )
+            seen_targets.add(target_id)
+            target = instances.get(target_id)
+            if target is None:
+                raise EventProtocolError(f"AGENT_INSTANCE_UNKNOWN: {target_id}")
+            if target.status != "active":
+                raise EventProtocolError(f"AGENT_INSTANCE_RETIRED: {target_id}")
+            if target.participant not in recipient_set:
+                raise EventProtocolError(
+                    f"AGENT_INSTANCE_RECIPIENT_MISMATCH: {target_id} belongs to "
+                    f"{target.participant!r}"
+                )
+    elif event.kind == "res_posted":
+        request_id = str(event.payload.get("request_id") or event.thread_id)
+        request = next(
+            (
+                record
+                for record in records
+                if record.get("kind") == "req_created" and record.get("entity_id") == request_id
+            ),
+            None,
+        )
+        target_ids = (
+            request.get("payload", {}).get("to_instances", [])
+            if isinstance(request, dict) and isinstance(request.get("payload"), dict)
+            else []
+        )
+        addressed_participants = {
+            instances[str(target)].participant
+            for target in target_ids
+            if str(target) in instances
+        }
+        if event.actor in addressed_participants and event.actor_instance_id not in {
+            str(target) for target in target_ids
+        }:
+            raise EventProtocolError(
+                f"AGENT_INSTANCE_NOT_ADDRESSED: "
+                f"{event.actor_instance_id or event.actor} is not addressed by {request_id}"
+            )
+    elif event.kind == "backlog_item_upserted":
+        raw_owner_instance_id = event.payload.get("owner_instance_id")
+        owner_instance_id = (
+            str(raw_owner_instance_id).strip()
+            if raw_owner_instance_id is not None
+            else ""
+        )
+        if owner_instance_id:
+            owner = instances.get(owner_instance_id)
+            if owner is None:
+                raise EventProtocolError(f"AGENT_INSTANCE_UNKNOWN: {owner_instance_id}")
+            if owner.status != "active":
+                raise EventProtocolError(f"AGENT_INSTANCE_RETIRED: {owner_instance_id}")
+
+    if event.kind not in INSTANCE_EVENT_KINDS:
+        return event
+
+    config = config_from_agent_dir(events_path.parent)
+    payload = event.payload
+    identifier = str(payload.get("id") or event.entity_id)
+    if identifier != event.entity_id or event.thread_id != event.entity_id:
+        raise EventProtocolError(
+            "agent instance id, entity_id, and thread_id must identify the same instance"
+        )
+    if event.kind == "agent_instance_registered":
+        participant = str(payload.get("participant", "")).strip()
+        if participant not in config.participants:
+            raise EventProtocolError(
+                f"PARTICIPANT_UNKNOWN: instance participant {participant!r} is not configured"
+            )
+        runtime_profile = str(payload.get("runtime_profile", "")).strip()
+        if runtime_profile:
+            profile = config.runtime_profiles.get(runtime_profile)
+            if profile is None:
+                raise EventProtocolError(f"RUNTIME_PROFILE_UNKNOWN: {runtime_profile}")
+            if profile.target != participant:
+                raise EventProtocolError(
+                    f"RUNTIME_PROFILE_TARGET_MISMATCH: {runtime_profile} targets "
+                    f"{profile.target!r}, not {participant!r}"
+                )
+    elif event.kind == "agent_instance_metadata_updated":
+        fields = payload.get("fields_changed", {})
+        if isinstance(fields, dict) and "runtime_profile" in fields:
+            old_new = fields["runtime_profile"]
+            runtime_profile = (
+                str(old_new[1]).strip()
+                if isinstance(old_new, list) and len(old_new) == 2
+                else ""
+            )
+            if runtime_profile:
+                profile = config.runtime_profiles.get(runtime_profile)
+                target = instances.get(identifier)
+                if profile is None:
+                    raise EventProtocolError(f"RUNTIME_PROFILE_UNKNOWN: {runtime_profile}")
+                if target is None or profile.target != target.participant:
+                    raise EventProtocolError(
+                        f"RUNTIME_PROFILE_TARGET_MISMATCH: {runtime_profile}"
+                    )
+    candidate = {
+        "actor": event.actor,
+        "actor_instance_id": event.actor_instance_id,
+        "entity_id": event.entity_id,
+        "event_seq": (int(records[-1]["event_seq"]) + 1) if records else 1,
+        "kind": event.kind,
+        "occurred_utc": event.occurred_utc,
+        "payload": event.payload,
+        "thread_id": event.thread_id,
+    }
+    try:
+        reduce_agent_instances([*records, candidate])
+    except AgentInstanceError as exc:
+        raise EventProtocolError(str(exc)) from exc
+    return event
+
+
 def read_tail_line(path: str | Path) -> tuple[bytes, str]:
     """Return the final line bytes and its sha256 hex hash.
 
@@ -218,6 +423,51 @@ def get_size(path: str | Path) -> int:
         return Path(path).stat().st_size
     except FileNotFoundError:
         return 0
+
+
+def _validate_stateful_event_before_append(event: Event, agent_dir: Path) -> None:
+    """Run projection-backed invariants after recovery and before journaling."""
+    from agent_mesh.config import config_from_agent_dir
+    from agent_mesh.store.rebuild import (
+        DECISION_EVENT_KINDS,
+        rebuild_all,
+        validate_backlog_write,
+        validate_decision_event,
+    )
+    from agent_mesh.store.sqlite import connect, initialize_schema
+
+    if event.kind not in DECISION_EVENT_KINDS | {"backlog_item_upserted"}:
+        return
+
+    config = config_from_agent_dir(agent_dir)
+    rebuild_all(config)
+    if event.kind == "backlog_item_upserted":
+        item_id = str(event.payload.get("id") or event.entity_id)
+        if item_id != event.entity_id or event.thread_id != event.entity_id:
+            raise EventProtocolError(
+                "backlog id, entity_id, and thread_id must identify the same item"
+            )
+        intent = str(event.payload.get("write_intent") or "upsert")
+        conn = connect(config.db_path)
+        try:
+            initialize_schema(conn)
+            validate_backlog_write(conn, item_id, intent)
+        finally:
+            conn.close()
+        return
+
+    conn = connect(config.db_path)
+    try:
+        initialize_schema(conn)
+        validate_decision_event(
+            conn,
+            kind=event.kind,
+            entity_id=event.entity_id,
+            thread_id=event.thread_id,
+            payload=event.payload,
+        )
+    finally:
+        conn.close()
 
 
 def _next_event_seq(prev_line: bytes) -> int:

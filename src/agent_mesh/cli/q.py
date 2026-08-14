@@ -1,4 +1,5 @@
 """agent-q CLI — read side."""
+
 from __future__ import annotations
 
 import argparse
@@ -8,9 +9,24 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-from agent_mesh.config import ConfigError, load_config
-from agent_mesh.core.events import Event, append_event, generate_event_id
+from agent_mesh.config import AgentMeshConfig, ConfigError, load_config
+from agent_mesh.core.agent_instances import (
+    AgentInstanceError,
+    bind_agent_instance,
+    resolve_authoring_actor,
+    reset_agent_instance,
+)
+from agent_mesh.core.decision_schema import (
+    VERIFICATION_EXECUTABLE_STATUSES,
+    VERIFICATION_EXECUTION_MODE_ARGV,
+    VERIFICATION_EXECUTION_MODE_LEGACY_ARGV,
+    decision_completeness_issues,
+    decision_lineage_summary,
+)
+from agent_mesh.core.events import Event, EventProtocolError, append_event, generate_event_id
+from agent_mesh.core.workflow_origin import WORKFLOW_ORIGINS
 from agent_mesh.core.external_recovery_plan import (
     ExternalRecoveryPlanError,
     build_external_recovery_plan_report,
@@ -33,12 +49,21 @@ from agent_mesh.core.source_recovery_promotion import (
     SourceRecoveryPromotionError,
     build_source_recovery_promotion_plan,
 )
-from agent_mesh.store.rebuild import DecisionStopLine, DispatchStopLine, rebuild_all
+from agent_mesh.store.rebuild import (
+    BacklogStopLine,
+    AgentInstanceStopLine,
+    DecisionStopLine,
+    DispatchStopLine,
+    diagnose_decision_replay,
+    read_event_records,
+    rebuild_all,
+)
 from agent_mesh.store.sqlite import (
     body_from_message_row,
     connect,
     initialize_schema,
     json_loads,
+    resolve_agent_instance,
     resolve_decision,
     resolve_dispatch_run,
     resolve_message,
@@ -46,8 +71,9 @@ from agent_mesh.store.sqlite import (
 from agent_mesh.views import locate_message, render_all
 from agent_mesh.adapters.base import AdapterSpec
 from agent_mesh.dispatch import extract_response_candidate, plan_for, to_message
-from agent_mesh.dispatch.adapters import DispatchHost
+from agent_mesh.dispatch.adapters import AgentRuntimeAdapter, DispatchHost
 from agent_mesh.dispatch.execution import execute_launch_plan
+from agent_mesh.dispatch.profiles import RuntimePreflightResult, preflight_runtime_profile
 from agent_mesh.dispatch.runtime import AgentProcessLauncher, CodexCliRuntimeAdapter
 from agent_mesh.dispatch.types import Message
 
@@ -58,12 +84,13 @@ def main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code or 0)
+    instance_token = bind_agent_instance(getattr(args, "instance", None))
     try:
         return int(args.func(args))
-    except ConfigError as exc:
+    except (AgentInstanceError, ConfigError, EventProtocolError) as exc:
         print(f"agent-q: {exc}", file=sys.stderr)
         return 2
-    except (DecisionStopLine, DispatchStopLine) as exc:
+    except (AgentInstanceStopLine, BacklogStopLine, DecisionStopLine, DispatchStopLine) as exc:
         print(f"agent-q: {exc.code}: {exc.detail}", file=sys.stderr)
         return 1
     except RecoveryStopLine as exc:
@@ -78,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
         command = getattr(locals().get("args", None), "command", "recover-sources")
         print(f"agent-q {command}: {exc}", file=sys.stderr)
         return 1
+    finally:
+        reset_agent_instance(instance_token)
 
 
 def _rebuild_all_locked(config):
@@ -97,13 +126,26 @@ def _render_all_locked(config):
         lock_handle.release()
 
 
+def _authoring_actor(config) -> str:
+    return resolve_authoring_actor(
+        read_event_records(config.events_path),
+        default_actor=config.default_sender,
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-q")
+    parser.add_argument(
+        "--instance",
+        help="authoring AI instance ID or label for read commands that append outcomes",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     list_cmd = sub.add_parser("list")
     list_cmd.add_argument("--status")
     list_cmd.add_argument("--to")
+    list_cmd.add_argument("--to-instance")
+    list_cmd.add_argument("--origin", choices=WORKFLOW_ORIGINS)
     list_cmd.add_argument("--json", action="store_true")
     list_cmd.set_defaults(func=cmd_list)
 
@@ -192,6 +234,7 @@ def _build_parser() -> argparse.ArgumentParser:
     events = sub.add_parser("events")
     events.add_argument("--kind")
     events.add_argument("--thread")
+    events.add_argument("--actor-instance")
     events.add_argument("--json", action="store_true")
     events.set_defaults(func=cmd_events)
 
@@ -200,6 +243,8 @@ def _build_parser() -> argparse.ArgumentParser:
     backlog_list = backlog_sub.add_parser("list")
     backlog_list.add_argument("--status")
     backlog_list.add_argument("--lane")
+    backlog_list.add_argument("--owner-instance")
+    backlog_list.add_argument("--origin", choices=WORKFLOW_ORIGINS)
     backlog_list.set_defaults(func=cmd_backlog_list)
     backlog_get = backlog_sub.add_parser("get")
     backlog_get.add_argument("item_id")
@@ -207,6 +252,17 @@ def _build_parser() -> argparse.ArgumentParser:
     backlog_events = backlog_sub.add_parser("events")
     backlog_events.add_argument("item_id")
     backlog_events.set_defaults(func=cmd_backlog_events)
+
+    instances = sub.add_parser("instances")
+    instance_sub = instances.add_subparsers(dest="instances_command", required=True)
+    instance_list = instance_sub.add_parser("list")
+    instance_list.add_argument("--participant")
+    instance_list.add_argument("--status", choices=("active", "retired"))
+    instance_list.add_argument("--json", action="store_true")
+    instance_list.set_defaults(func=cmd_instances_list)
+    instance_show = instance_sub.add_parser("show")
+    instance_show.add_argument("identifier")
+    instance_show.set_defaults(func=cmd_instances_show)
 
     decisions = sub.add_parser("decisions")
     decision_sub = decisions.add_subparsers(dest="decision_command", required=True)
@@ -232,11 +288,26 @@ def _build_parser() -> argparse.ArgumentParser:
     search.add_argument("query")
     search.set_defaults(func=cmd_decisions_search)
 
+    diagnose = decision_sub.add_parser(
+        "diagnose",
+        description=(
+            "Replay the canonical log in memory and report the first decision stop-line. "
+            "This command never edits or quarantines canonical events."
+        ),
+    )
+    diagnose.set_defaults(func=cmd_decisions_diagnose)
+
     at = decision_sub.add_parser("at")
     at.add_argument("path")
     at.set_defaults(func=cmd_decisions_at)
 
-    verify_dec = decision_sub.add_parser("verify")
+    verify_dec = decision_sub.add_parser(
+        "verify",
+        description=(
+            "Execute human-approved verification definitions as explicit argv. "
+            "Shell interpolation, pipes, redirection, expansion, and command chaining are disabled."
+        ),
+    )
     verify_dec.add_argument("identifier")
     verify_dec.set_defaults(func=cmd_decisions_verify)
 
@@ -257,6 +328,9 @@ def _build_parser() -> argparse.ArgumentParser:
     disp_status.set_defaults(func=cmd_dispatches_status)
     disp_verify = dispatch_sub.add_parser("verify")
     disp_verify.set_defaults(func=cmd_dispatches_verify)
+    disp_preflight = dispatch_sub.add_parser("preflight")
+    disp_preflight.add_argument("--target", required=True)
+    disp_preflight.set_defaults(func=cmd_dispatches_preflight)
     disp_once = dispatch_sub.add_parser("once")
     disp_once.add_argument("--live", action="store_true")
     disp_once.add_argument("--target", required=True)
@@ -290,13 +364,27 @@ def cmd_list(args: argparse.Namespace) -> int:
         if args.to:
             sql += " AND recipients_json LIKE ?"
             params.append(f"%{args.to}%")
+        if args.to_instance:
+            instance = resolve_agent_instance(conn, args.to_instance)
+            if instance is None:
+                raise ConfigError(f"AGENT_INSTANCE_UNKNOWN: {args.to_instance}")
+            sql += " AND recipient_instance_ids_json LIKE ?"
+            params.append(f'%"{instance["id"]}"%')
+        if args.origin:
+            sql += " AND workflow_origin=?"
+            params.append(args.origin)
         sql += " ORDER BY created_utc DESC, event_seq DESC"
         rows = conn.execute(sql, params).fetchall()
         if args.json:
             print(json.dumps([{key: row[key] for key in row.keys()} for row in rows], indent=2))
         else:
             for row in rows:
-                print(f"{row['id']}\t{row['status']}\t{row['sender']}\t{row['title']}")
+                print(
+                    f"{row['id']}\t{row['status']}\t{row['sender']}"
+                    f"{('@' + row['sender_instance_id']) if row['sender_instance_id'] else ''}\t"
+                    f"{row['title']}\t"
+                    f"{row['workflow_origin'] or ''}"
+                )
     finally:
         conn.close()
     return 0
@@ -324,7 +412,10 @@ def cmd_body(args: argparse.Namespace) -> int:
         if row is None:
             print(f"agent-q body: not found: {args.message_id}", file=sys.stderr)
             return 1
-        print(body_from_message_row(row), end="" if body_from_message_row(row).endswith("\n") else "\n")
+        print(
+            body_from_message_row(row),
+            end="" if body_from_message_row(row).endswith("\n") else "\n",
+        )
     finally:
         conn.close()
     return 0
@@ -379,8 +470,7 @@ def cmd_thread(args: argparse.Namespace) -> int:
             parent = row["parent_id"] or "-"
             label = row["title"] if row["kind"] == "request" else row["summary"]
             print(
-                f"{row['id']}\t{row['kind']}\tparent={parent}\t"
-                f"from={row['sender']}\t{label or ''}"
+                f"{row['id']}\t{row['kind']}\tparent={parent}\tfrom={row['sender']}\t{label or ''}"
             )
     finally:
         conn.close()
@@ -627,13 +717,95 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_instances_list(args: argparse.Namespace) -> int:
+    config = load_config()
+    _rebuild_all_locked(config)
+    conn = connect(config.db_path)
+    try:
+        initialize_schema(conn)
+        sql = "SELECT * FROM agent_instances WHERE 1=1"
+        params: list[str] = []
+        if args.participant:
+            sql += " AND participant=?"
+            params.append(args.participant)
+        if args.status:
+            sql += " AND status=?"
+            params.append(args.status)
+        sql += " ORDER BY created_event_seq, id"
+        rows = conn.execute(sql, params).fetchall()
+        if args.json:
+            print(json.dumps([{key: row[key] for key in row.keys()} for row in rows], indent=2))
+        else:
+            for row in rows:
+                print(
+                    f"{row['id']}\t{row['label']}\t{row['status']}\t"
+                    f"{row['participant']}\t{row['provider']}\t{row['workstream'] or ''}"
+                )
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_instances_show(args: argparse.Namespace) -> int:
+    config = load_config()
+    _rebuild_all_locked(config)
+    conn = connect(config.db_path)
+    try:
+        initialize_schema(conn)
+        row = resolve_agent_instance(conn, args.identifier)
+        if row is None:
+            print(f"agent-q instances show: not found: {args.identifier}", file=sys.stderr)
+            return 1
+        aliases = conn.execute(
+            "SELECT label, is_primary FROM agent_instance_aliases WHERE instance_id=? "
+            "ORDER BY is_primary DESC, label",
+            (row["id"],),
+        ).fetchall()
+        print(f"{row['id']}")
+        print(f"label: {row['label']}")
+        print(f"status: {row['status']}")
+        print(f"participant: {row['participant']}")
+        print(f"provider: {row['provider']}")
+        print(f"workstream: {row['workstream'] or ''}")
+        print(f"runtime_profile: {row['runtime_profile'] or ''}")
+        print(
+            "external_session_ref_digest: "
+            f"{row['external_session_ref_digest'] or ''}"
+        )
+        print(f"created_utc: {row['created_utc']}")
+        print(f"last_seen_utc: {row['last_seen_utc'] or ''}")
+        print(f"retired_utc: {row['retired_utc'] or ''}")
+        print("aliases: " + ", ".join(str(alias["label"]) for alias in aliases))
+    finally:
+        conn.close()
+    return 0
+
+
 def cmd_events(args: argparse.Namespace) -> int:
     config = load_config()
+    actor_instance_id = ""
+    if args.actor_instance:
+        _rebuild_all_locked(config)
+        conn = connect(config.db_path)
+        try:
+            initialize_schema(conn)
+            instance = resolve_agent_instance(conn, args.actor_instance)
+        finally:
+            conn.close()
+        if instance is None:
+            print(
+                f"agent-q events: instance not found: {args.actor_instance}",
+                file=sys.stderr,
+            )
+            return 1
+        actor_instance_id = str(instance["id"])
     rows = []
     for record in _event_records(config.events_path):
         if args.kind and record.get("kind") != args.kind:
             continue
         if args.thread and record.get("thread_id") != args.thread:
+            continue
+        if actor_instance_id and record.get("actor_instance_id") != actor_instance_id:
             continue
         rows.append(record)
     if args.json:
@@ -642,7 +814,8 @@ def cmd_events(args: argparse.Namespace) -> int:
         for record in rows:
             print(
                 f"{record['event_seq']}\t{record['kind']}\t{record['entity_id']}\t"
-                f"actor={record['actor']}\tthread={record['thread_id']}"
+                f"actor={record['actor']}\t"
+                f"instance={record.get('actor_instance_id', '')}\tthread={record['thread_id']}"
             )
     return 0
 
@@ -661,9 +834,21 @@ def cmd_backlog_list(args: argparse.Namespace) -> int:
         if args.lane:
             sql += " AND lane=?"
             params.append(args.lane)
+        if args.owner_instance:
+            instance = resolve_agent_instance(conn, args.owner_instance)
+            if instance is None:
+                raise ConfigError(f"AGENT_INSTANCE_UNKNOWN: {args.owner_instance}")
+            sql += " AND owner_instance_id=?"
+            params.append(str(instance["id"]))
+        if args.origin:
+            sql += " AND workflow_origin=?"
+            params.append(args.origin)
         sql += " ORDER BY priority ASC, updated_utc DESC, id ASC"
         for row in conn.execute(sql, params):
-            print(f"{row['id']}\t{row['status']}\t{row['lane'] or ''}\t{row['priority'] or ''}\t{row['title']}")
+            print(
+                f"{row['id']}\t{row['status']}\t{row['lane'] or ''}\t"
+                f"{row['priority'] or ''}\t{row['title']}\t{row['workflow_origin'] or ''}"
+            )
     finally:
         conn.close()
     return 0
@@ -684,6 +869,12 @@ def cmd_backlog_get(args: argparse.Namespace) -> int:
         print(f"status: {row['status']}")
         print(f"lane: {row['lane'] or ''}")
         print(f"priority: {row['priority'] or ''}")
+        print(f"owner_instance_id: {row['owner_instance_id'] or ''}")
+        print(f"workflow_origin: {row['workflow_origin'] or ''}")
+        print(f"workflow_origin_source: {row['workflow_origin_source']}")
+        print(f"workflow_origin_valid: {str(bool(row['workflow_origin_valid'])).lower()}")
+        if not row["workflow_origin_valid"]:
+            print("workflow_origin_warning: historical invalid or conflicting origin")
         if row["summary"]:
             print(f"summary: {row['summary']}")
         if row["notes"]:
@@ -755,7 +946,12 @@ def cmd_decisions_list(args: argparse.Namespace) -> int:
             params.append(args.scope)
         sql += " ORDER BY human_id"
         for row in conn.execute(sql, params):
-            print(f"{row['human_id']}\t{row['status']}\t{row['tier']}\t{row['title']}")
+            tier = row["tier"] if row["tier_valid"] else f"{row['tier']} [INVALID]"
+            issues = _decision_completeness_from_projection(conn, row)
+            completeness = "complete" if not issues else "INCOMPLETE"
+            print(
+                f"{row['human_id']}\t{row['status']}\t{tier}\t{completeness}\t{row['title']}"
+            )
     finally:
         conn.close()
     return 0
@@ -772,11 +968,52 @@ def cmd_decisions_show(args: argparse.Namespace) -> int:
             print(f"agent-q decisions show: not found: {args.identifier}", file=sys.stderr)
             return 1
         row = conn.execute("SELECT * FROM decisions WHERE dec_ulid=?", (dec_ulid,)).fetchone()
+        meta = json_loads(row["meta_json"], {})
+        if not isinstance(meta, dict):
+            meta = {}
+        lineage = decision_lineage_summary(meta)
+        supersedes = _decision_human_id(conn, row["supersedes"])
+        superseded_by = _decision_human_id(conn, row["superseded_by"])
         print(f"{row['human_id']} {row['dec_ulid']}")
         print(f"title: {row['title']}")
         print(f"tier: {row['tier']}")
+        print(f"tier_valid: {str(bool(row['tier_valid'])).lower()}")
+        if not row["tier_valid"]:
+            print("tier_warning: historical invalid tier; canonical event was not rewritten")
         print(f"status: {row['status']}")
         print(f"owner: {row['owner'] or ''}")
+        print(f"supersedes: {supersedes}")
+        print(f"superseded_by: {superseded_by}")
+        print(f"content_revisions: {lineage.content_revisions}")
+        print(f"revisit_annotations: {lineage.revisit_annotations}")
+        issues = _decision_completeness_from_projection(conn, row)
+        print(f"complete_for_acceptance: {str(not issues).lower()}")
+        for issue in issues:
+            print(f"completeness_issue: {issue}")
+        for item in conn.execute(
+            "SELECT pattern FROM decision_globs "
+            "WHERE dec_ulid=? AND kind='affected' ORDER BY pattern",
+            (dec_ulid,),
+        ):
+            print(f"affected_code_glob: {item['pattern']}")
+        for item in conn.execute(
+            "SELECT check_name FROM decision_checks WHERE dec_ulid=? ORDER BY check_name",
+            (dec_ulid,),
+        ):
+            print(f"required_check: {item['check_name']}")
+        print(f"last_verified_utc: {row['last_verified_utc'] or ''}")
+        for item in conn.execute(
+            "SELECT command, execution_mode, expected_signal, last_verified_utc, last_outcome "
+            "FROM decision_verifications WHERE dec_ulid=? ORDER BY command",
+            (dec_ulid,),
+        ):
+            print(
+                "verification: "
+                f"{item['last_outcome'] or 'never'}\t"
+                f"{item['last_verified_utc'] or ''}\t"
+                f"{item['command']}\texpected={item['expected_signal']}\t"
+                f"mode={item['execution_mode']}"
+            )
         if args.assumptions:
             for item in conn.execute(
                 "SELECT assumption_id, status, text FROM decision_assumptions "
@@ -797,10 +1034,35 @@ def cmd_decisions_show(args: argparse.Namespace) -> int:
                 "WHERE dec_ulid=? ORDER BY file_path, line_start",
                 (dec_ulid,),
             ):
-                print(f"reference {item['file_path']}:{item['line_start']} {item['reference_form']}")
+                print(
+                    f"reference {item['file_path']}:{item['line_start']} {item['reference_form']}"
+                )
     finally:
         conn.close()
     return 0
+
+
+def _decision_completeness_from_projection(conn, row) -> tuple[str, ...]:
+    globs = [
+        item["pattern"]
+        for item in conn.execute(
+            "SELECT pattern FROM decision_globs WHERE dec_ulid=? AND kind='affected'",
+            (row["dec_ulid"],),
+        )
+    ]
+    verification = [
+        {"command": item["command"], "expected_signal": item["expected_signal"]}
+        for item in conn.execute(
+            "SELECT command, expected_signal FROM decision_verifications WHERE dec_ulid=?",
+            (row["dec_ulid"],),
+        )
+    ]
+    return decision_completeness_issues(
+        tier=str(row["tier"]),
+        owner=str(row["owner"] or ""),
+        affected_code_globs=globs,
+        verification=verification,
+    )
 
 
 def cmd_decisions_log(args: argparse.Namespace) -> int:
@@ -814,11 +1076,38 @@ def cmd_decisions_log(args: argparse.Namespace) -> int:
             print(f"agent-q decisions log: not found: {args.identifier}", file=sys.stderr)
             return 1
         for record in _event_records(config.events_path):
-            if record.get("entity_id") == dec_ulid or record.get("payload", {}).get("decision_id") == dec_ulid:
-                print(f"{record['event_seq']}\t{record['kind']}\t{record['occurred_utc']}\t{record['event_id']}")
+            if (
+                record.get("entity_id") == dec_ulid
+                or record.get("payload", {}).get("decision_id") == dec_ulid
+            ):
+                print(
+                    f"{record['event_seq']}\t{record['kind']}\t{record['occurred_utc']}\t{record['event_id']}"
+                )
     finally:
         conn.close()
     return 0
+
+
+def cmd_decisions_diagnose(args: argparse.Namespace) -> int:
+    config = load_config()
+    diagnostic = diagnose_decision_replay(config)
+    if diagnostic.ok:
+        print(f"decision replay: OK ({diagnostic.total_events} events)")
+        return 0
+    print("decision replay: BLOCKED")
+    print(f"event_seq: {diagnostic.event_seq}")
+    print(f"event_id: {diagnostic.event_id}")
+    print(f"kind: {diagnostic.kind}")
+    print(f"code: {diagnostic.code}")
+    print(f"detail: {diagnostic.detail}")
+    print(f"valid_prefix_events: {diagnostic.valid_events}")
+    print(
+        "recovery: canonical events were not changed; do not hand-edit events.jsonl. "
+        "Restore a valid log backup or upgrade/migrate the identified legacy event, "
+        "then run agent-q rebuild --all."
+    )
+    _ = args
+    return 1
 
 
 def cmd_decisions_search(args: argparse.Namespace) -> int:
@@ -832,7 +1121,12 @@ def cmd_decisions_search(args: argparse.Namespace) -> int:
         for row in rows:
             meta = json_loads(row["meta_json"], {})
             haystack = " ".join(
-                [row["human_id"], row["title"], str(meta.get("context", "")), str(meta.get("decision", ""))]
+                [
+                    row["human_id"],
+                    row["title"],
+                    str(meta.get("context", "")),
+                    str(meta.get("decision", "")),
+                ]
             ).lower()
             if query in haystack:
                 print(f"{row['human_id']}\t{row['status']}\t{row['title']}")
@@ -865,6 +1159,7 @@ def cmd_decisions_at(args: argparse.Namespace) -> int:
 
 def cmd_decisions_verify(args: argparse.Namespace) -> int:
     config = load_config()
+    actor = _authoring_actor(config)
     _rebuild_all_locked(config)
     conn = connect(config.db_path)
     try:
@@ -873,57 +1168,238 @@ def cmd_decisions_verify(args: argparse.Namespace) -> int:
         if dec_ulid is None:
             print(f"agent-q decisions verify: not found: {args.identifier}", file=sys.stderr)
             return 1
+        decision = conn.execute(
+            "SELECT human_id, status FROM decisions WHERE dec_ulid=?", (dec_ulid,)
+        ).fetchone()
         rows = conn.execute(
-            "SELECT command, expected_signal FROM decision_verifications WHERE dec_ulid=? "
+            "SELECT command, execution_mode, argv_json, expected_signal, last_verified_utc "
+            "FROM decision_verifications WHERE dec_ulid=? "
             "ORDER BY command",
             (dec_ulid,),
         ).fetchall()
     finally:
         conn.close()
 
-    failed = 0
-    for row in rows:
-        result = subprocess.run(
-            row["command"],
-            cwd=config.project_root,
-            shell=True,
-            text=True,
-            capture_output=True,
-            check=False,
+    if not rows:
+        print("no verification commands")
+        return 0
+    status = str(decision["status"] if decision is not None else "")
+    if status not in VERIFICATION_EXECUTABLE_STATUSES:
+        print(
+            "agent-q decisions verify: refused: verification definitions are executable only "
+            f"after direct human acceptance; {args.identifier} is {status or 'unknown'}",
+            file=sys.stderr,
         )
-        if result.returncode == 0:
+        return 2
+
+    prepared: list[tuple[Any, list[str]]] = []
+    for row in rows:
+        argv_value = _projected_verification_argv(row)
+        if argv_value is None:
+            print(
+                "agent-q decisions verify: refused legacy shell-dependent definition: "
+                f"{row['command']!r}. Amend {decision['human_id']} to invoke a reviewed "
+                "repository script or executable as argv, then obtain fresh human acceptance.",
+                file=sys.stderr,
+            )
+            return 2
+        prepared.append((row, argv_value))
+
+    failed = 0
+    for row, argv in prepared:
+        process, exit_code, actual_signal, refusal = _start_decision_verification(
+            config,
+            dec_ulid=dec_ulid,
+            command=str(row["command"]),
+            execution_mode=str(row["execution_mode"]),
+            argv=argv,
+        )
+        if refusal is not None:
+            print(f"agent-q decisions verify: refused: {refusal}", file=sys.stderr)
+            return 2
+        if process is not None:
+            process.communicate()
+            exit_code = process.returncode
+            actual_signal = f"exit {exit_code}"
+        assert exit_code is not None
+        assert actual_signal is not None
+        outcome = "pass" if exit_code == 0 else "fail"
+        outcome_event = Event(
+            event_id=generate_event_id(),
+            actor=actor,
+            kind="decision_verification_recorded",
+            entity_id=dec_ulid,
+            thread_id=dec_ulid,
+            payload={
+                "decision_id": dec_ulid,
+                "command": row["command"],
+                "execution_mode": str(row["execution_mode"]),
+                "argv": argv,
+                "expected_signal": row["expected_signal"],
+                "actual_signal": actual_signal,
+                "outcome": outcome,
+                "exit_code": exit_code,
+                "last_verified_utc_before": row["last_verified_utc"],
+            },
+        )
+        append_event(config.events_path, outcome_event, lock_acquired=False)
+        if outcome == "pass":
             print(f"pass: {row['command']}")
             continue
         failed += 1
-        print(f"fail: {row['command']}", file=sys.stderr)
+        print(f"fail: {row['command']} ({actual_signal})", file=sys.stderr)
         event = Event(
             event_id=generate_event_id(),
-            actor=config.default_sender,
+            actor=actor,
             kind="decision_drift_detected",
             entity_id=dec_ulid,
             thread_id=dec_ulid,
             payload={
                 "decision_id": dec_ulid,
                 "command": row["command"],
+                "execution_mode": str(row["execution_mode"]),
+                "argv": argv,
                 "expected_signal": row["expected_signal"],
-                "actual_signal": f"exit {result.returncode}",
-                "last_verified_utc_before": None,
+                "actual_signal": actual_signal,
+                "last_verified_utc_before": row["last_verified_utc"],
             },
         )
         append_event(config.events_path, event, lock_acquired=False)
-    if not rows:
-        print("no verification commands")
     return 1 if failed else 0
+
+
+def _projected_verification_argv(row: Any) -> list[str] | None:
+    mode = str(row["execution_mode"] or "")
+    try:
+        argv_value = json.loads(str(row["argv_json"])) if row["argv_json"] else None
+    except (TypeError, ValueError):
+        return None
+    if (
+        mode not in {VERIFICATION_EXECUTION_MODE_ARGV, VERIFICATION_EXECUTION_MODE_LEGACY_ARGV}
+        or not isinstance(argv_value, list)
+        or not argv_value
+        or any(not isinstance(part, str) or not part or "\x00" in part for part in argv_value)
+    ):
+        return None
+    return argv_value
+
+
+def _start_decision_verification(
+    config: AgentMeshConfig,
+    *,
+    dec_ulid: str,
+    command: str,
+    execution_mode: str,
+    argv: list[str],
+) -> tuple[subprocess.Popen[str] | None, int | None, str | None, str | None]:
+    """Revalidate authorization and spawn while the append lock prevents a revision race."""
+
+    lock_handle = acquire(config.agent_dir / ".mail-lock")
+    try:
+        recover(config.events_path, config.agent_dir)
+        rebuild_all(config)
+        conn = connect(config.db_path)
+        try:
+            initialize_schema(conn)
+            decision = conn.execute(
+                "SELECT human_id, status FROM decisions WHERE dec_ulid=?", (dec_ulid,)
+            ).fetchone()
+            current = conn.execute(
+                "SELECT command, execution_mode, argv_json FROM decision_verifications "
+                "WHERE dec_ulid=? AND command=?",
+                (dec_ulid, command),
+            ).fetchone()
+        finally:
+            conn.close()
+        if decision is None or str(decision["status"]) not in VERIFICATION_EXECUTABLE_STATUSES:
+            status = str(decision["status"] if decision is not None else "unknown")
+            return None, None, None, f"decision is no longer human-approved ({status})"
+        if (
+            current is None
+            or str(current["execution_mode"]) != execution_mode
+            or _projected_verification_argv(current) != argv
+        ):
+            return None, None, None, "verification definition changed before execution"
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=config.project_root,
+                shell=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            return None, 127, "exec error: executable not found", None
+        except PermissionError:
+            return None, 126, "exec error: executable not permitted", None
+        return process, None, None, None
+    finally:
+        lock_handle.release()
+
+
+def _decision_human_id(conn, dec_ulid: str | None) -> str:
+    if not dec_ulid:
+        return ""
+    row = conn.execute("SELECT human_id FROM decisions WHERE dec_ulid=?", (dec_ulid,)).fetchone()
+    return str(row["human_id"]) if row else str(dec_ulid)
+
+
+def cmd_dispatches_preflight(args: argparse.Namespace) -> int:
+    config = load_config()
+    profile = config.runtime_profile_for_target(args.target)
+    result = preflight_runtime_profile(profile, project_root=config.project_root)
+    _print_runtime_preflight(result)
+    return 0 if result.passed else 1
+
+
+def _print_runtime_preflight(result: RuntimePreflightResult) -> None:
+    status = "PASS" if result.passed else "FAIL"
+    print(f"runtime preflight {status}\tprofile={result.profile_name}\ttarget={result.target}")
+    for check in result.checks:
+        check_status = "PASS" if check.passed else "FAIL"
+        print(f"{check_status}\t{check.name}\t{check.detail}")
+
+
+def _runtime_adapter_for(config, target: str) -> AgentRuntimeAdapter:
+    profile = config.runtime_profile_for_target(target)
+    result = preflight_runtime_profile(profile, project_root=config.project_root)
+    if not result.passed or result.binary_path is None:
+        raise ConfigError(
+            f"runtime preflight failed for profile {profile.name!r}: {result.failure_summary()}"
+        )
+    if profile.adapter != "codex-cli":
+        raise ConfigError(
+            f"runtime profile {profile.name!r} adapter {profile.adapter!r} is not enabled "
+            "for live dispatch"
+        )
+    return CodexCliRuntimeAdapter(
+        AdapterSpec(
+            name=profile.name,
+            domain="agent_runtime",
+            privacy_class="project_private",
+            options={
+                "binary": str(result.binary_path),
+                "version": profile.version,
+                "model": profile.model,
+                "role": profile.role,
+                "permission_mode": profile.permission_mode,
+                "capabilities": profile.required_capabilities,
+                "authentication_mode": profile.authentication_mode,
+                "billing_mode": profile.billing_mode,
+                "credential_denylist": profile.credential_denylist,
+            },
+        )
+    )
 
 
 def cmd_dispatches_once(args: argparse.Namespace) -> int:
     if not args.live:
         print("agent-q dispatches once: --live is required", file=sys.stderr)
         return 2
-    if args.target != "codex":
-        print("agent-q dispatches once: only --target codex is supported in this slice", file=sys.stderr)
-        return 2
     config = load_config()
+    actor = _authoring_actor(config)
+    runtime = _runtime_adapter_for(config, args.target)
     lock_handle = acquire(config.agent_dir / ".mail-lock")
     try:
         rebuild_all(config)
@@ -932,6 +1408,13 @@ def cmd_dispatches_once(args: argparse.Namespace) -> int:
             print(f"agent-q dispatches once: request not found: {args.message}", file=sys.stderr)
             return 1
         message = to_message(request_event, aliases=config.routing.aliases)
+        if message.recipient_instances:
+            print(
+                "agent-q dispatches once: instance-addressed requests must be retrieved by "
+                "the named running instance; generic participant dispatch is disabled",
+                file=sys.stderr,
+            )
+            return 1
         if args.target not in message.recipients:
             print(
                 f"agent-q dispatches once: target {args.target} is not a recipient of {args.message}",
@@ -943,7 +1426,9 @@ def cmd_dispatches_once(args: argparse.Namespace) -> int:
             initialize_schema(conn)
             row = resolve_message(conn, message.entity_id)
             if row is None or row["kind"] != "request":
-                print(f"agent-q dispatches once: request not found: {args.message}", file=sys.stderr)
+                print(
+                    f"agent-q dispatches once: request not found: {args.message}", file=sys.stderr
+                )
                 return 1
             if _open_dispatch_lease_exists(conn, message.entity_id, args.target):
                 print(
@@ -953,9 +1438,16 @@ def cmd_dispatches_once(args: argparse.Namespace) -> int:
                 return 1
             response_mode = str(request_event.get("payload", {}).get("response_mode") or "single")
             if response_mode not in {"single", "multi"}:
-                print(f"agent-q dispatches once: invalid response_mode for {message.entity_id}", file=sys.stderr)
+                print(
+                    f"agent-q dispatches once: invalid response_mode for {message.entity_id}",
+                    file=sys.stderr,
+                )
                 return 1
-            if args.post_response and response_mode == "single" and _direct_response_exists(conn, message.entity_id):
+            if (
+                args.post_response
+                and response_mode == "single"
+                and _direct_response_exists(conn, message.entity_id)
+            ):
                 print(
                     f"agent-q dispatches once: request {message.entity_id} already has response",
                     file=sys.stderr,
@@ -967,9 +1459,6 @@ def cmd_dispatches_once(args: argparse.Namespace) -> int:
 
         host = _CliDispatchHost(config, args.target)
         plan = plan_for(message, args.target, host, grounding={"complete": True})
-        runtime = CodexCliRuntimeAdapter(
-            AdapterSpec(name="codex-cli", domain="agent_runtime", privacy_class="project_private")
-        )
         result = execute_launch_plan(
             plan,
             events_path=config.events_path,
@@ -980,6 +1469,7 @@ def cmd_dispatches_once(args: argparse.Namespace) -> int:
             timeout_seconds=args.timeout_seconds,
             lock_acquired=True,
             post_response=args.post_response,
+            actor=actor,
         )
         rebuild_all(config)
     finally:
@@ -1006,11 +1496,22 @@ def cmd_dispatches_once(args: argparse.Namespace) -> int:
     return 0
 
 
-def _dispatch_message_locked(config, *, target: str, message_id: str, timeout_seconds: int, post_response: bool):
+def _dispatch_message_locked(
+    config,
+    *,
+    target: str,
+    message_id: str,
+    timeout_seconds: int,
+    post_response: bool,
+    runtime: AgentRuntimeAdapter,
+    actor: str,
+):
     request_event = _request_event_for_message(config.events_path, message_id)
     if request_event is None:
         raise ValueError(f"request not found: {message_id}")
     message = to_message(request_event, aliases=config.routing.aliases)
+    if message.recipient_instances:
+        raise ValueError("instance-addressed requests cannot use generic participant dispatch")
     conn = connect(config.db_path)
     try:
         initialize_schema(conn)
@@ -1022,9 +1523,6 @@ def _dispatch_message_locked(config, *, target: str, message_id: str, timeout_se
         conn.close()
     host = _CliDispatchHost(config, target)
     plan = plan_for(message, target, host, grounding={"complete": True})
-    runtime = CodexCliRuntimeAdapter(
-        AdapterSpec(name="codex-cli", domain="agent_runtime", privacy_class="project_private")
-    )
     result = execute_launch_plan(
         plan,
         events_path=config.events_path,
@@ -1035,6 +1533,7 @@ def _dispatch_message_locked(config, *, target: str, message_id: str, timeout_se
         timeout_seconds=timeout_seconds,
         lock_acquired=True,
         post_response=post_response,
+        actor=actor,
     )
     rebuild_all(config)
     return plan, result
@@ -1082,6 +1581,8 @@ def _eligible_dispatch_request_ids(
                 continue
             seen.add(request_id)
             message = to_message(record, aliases=config.routing.aliases)
+            if message.recipient_instances:
+                continue
             if target not in message.recipients:
                 continue
             row = resolve_message(conn, request_id)
@@ -1103,7 +1604,9 @@ def _eligible_dispatch_request_ids(
                 continue
             if response_mode == "multi" and _direct_response_from_exists(conn, request_id, target):
                 continue
-            plan = plan_for(message, target, _CliDispatchHost(config, target), grounding={"complete": True})
+            plan = plan_for(
+                message, target, _CliDispatchHost(config, target), grounding={"complete": True}
+            )
             if plan.gate != "auto-dispatch":
                 continue
             ids.append(request_id)
@@ -1116,9 +1619,6 @@ def cmd_dispatches_worker(args: argparse.Namespace) -> int:
     if not args.live:
         print("agent-q dispatches worker: --live is required", file=sys.stderr)
         return 2
-    if args.target != "codex":
-        print("agent-q dispatches worker: only --target codex is supported in this slice", file=sys.stderr)
-        return 2
     if args.max_runs < 1:
         print("agent-q dispatches worker: --max-runs must be >= 1", file=sys.stderr)
         return 2
@@ -1126,11 +1626,16 @@ def cmd_dispatches_worker(args: argparse.Namespace) -> int:
         print("agent-q dispatches worker: --after-event-seq must be >= 0", file=sys.stderr)
         return 2
     config = load_config()
+    actor = _authoring_actor(config)
     message_ids = set(args.message) if args.message else None
     runs = 0
     stopped = "max-runs"
     exit_code = 0
     while runs < args.max_runs:
+        # A bounded worker can span several long model runs. Re-run the no-prompt
+        # preflight before each possible launch so executable, model, auth/billing,
+        # capability, and credential-isolation drift fails before lifecycle writes.
+        runtime = _runtime_adapter_for(config, args.target)
         lock_handle = acquire(config.agent_dir / ".mail-lock")
         try:
             rebuild_all(config)
@@ -1151,11 +1656,15 @@ def cmd_dispatches_worker(args: argparse.Namespace) -> int:
                 message_id=message_id,
                 timeout_seconds=args.timeout_seconds,
                 post_response=args.post_response,
+                runtime=runtime,
+                actor=actor,
             )
         finally:
             lock_handle.release()
         runs += 1
-        terminal, candidate_status, candidate_reason = _dispatch_terminal(result, post_response=args.post_response)
+        terminal, candidate_status, candidate_reason = _dispatch_terminal(
+            result, post_response=args.post_response
+        )
         print(
             f"dispatch worker run {plan.run_id}\t{result.status}\t{terminal}\t"
             f"message={message_id}\tresponse_candidate={candidate_status}:{candidate_reason}"
@@ -1171,13 +1680,21 @@ def cmd_dispatches_worker(args: argparse.Namespace) -> int:
 class _CliDispatchHost(DispatchHost):
     def __init__(self, config, target: str) -> None:
         super().__init__(
-            AdapterSpec(name="cli-dispatch-host", domain="dispatch", privacy_class="project_private")
+            AdapterSpec(
+                name="cli-dispatch-host", domain="dispatch", privacy_class="project_private"
+            )
         )
         self.config = config
         self.target = target
 
     def routes(self) -> dict[str, dict[str, object]]:
-        return {self.target: {"gen_ai_system": "openai", "model": "codex-cli"}}
+        profile = self.config.runtime_profile_for_target(self.target)
+        return {
+            self.target: {
+                "gen_ai_system": profile.provider,
+                "model": profile.model,
+            }
+        }
 
     def classify(self, message: Message) -> str:
         return "routine"
@@ -1431,16 +1948,21 @@ def cmd_dispatches_verify(args: argparse.Namespace) -> int:
                     # bind against the request's canonical thread, not the run's stored thread
                     issues.append(f"DISPATCH_OUTPUT_THREAD_MISMATCH: {run['run_id']}")
         for lease in conn.execute("SELECT lease_id, run_id FROM dispatch_leases"):
-            if conn.execute(
-                "SELECT 1 FROM dispatch_runs WHERE run_id=?", (lease["run_id"],)
-            ).fetchone() is None:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM dispatch_runs WHERE run_id=?", (lease["run_id"],)
+                ).fetchone()
+                is None
+            ):
                 issues.append(f"DISPATCH_LEASE_UNKNOWN_RUN: {lease['lease_id']}")
         # re-assert the uq_dispatch_leases_open invariant independently of the index
         for dup in conn.execute(
             "SELECT input_message_id, target_agent, COUNT(*) AS n FROM dispatch_leases "
             "WHERE status='open' GROUP BY input_message_id, target_agent HAVING n > 1"
         ):
-            issues.append(f"DISPATCH_LEASE_DUPLICATE: {dup['input_message_id']}/{dup['target_agent']}")
+            issues.append(
+                f"DISPATCH_LEASE_DUPLICATE: {dup['input_message_id']}/{dup['target_agent']}"
+            )
         now = datetime.now(timezone.utc)
         for lease in conn.execute(
             "SELECT lease_id, created_utc, ttl_seconds FROM dispatch_leases WHERE status='open'"

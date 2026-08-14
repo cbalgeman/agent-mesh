@@ -6,6 +6,7 @@ slice and gain fields when the dispatch engine itself is promoted; ``EvalCase``/
 the host-owned eval contract the engine scores against (the host supplies the cases, scorer, and
 suite versions -- the package ships no default cases).
 """
+
 from __future__ import annotations
 
 import json
@@ -30,6 +31,7 @@ class Message:
     status: str = ""
     response_mode: str = "single"
     recipients: tuple[str, ...] = ()
+    recipient_instances: tuple[str, ...] = ()
     refs: tuple[str, ...] = ()
 
 
@@ -109,6 +111,7 @@ class AgentLaunchSpec:
     stdin_text: str
     metadata: dict[str, object] = field(default_factory=dict)
     stdout_file: Path | None = None
+    environment: dict[str, str] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)

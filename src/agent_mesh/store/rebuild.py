@@ -1,4 +1,5 @@
 """Deterministic projection from events.jsonl into SQLite."""
+
 from __future__ import annotations
 
 import hashlib
@@ -9,7 +10,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from agent_mesh.config import AgentMeshConfig, config_from_agent_dir, ensure_project_dirs, load_config
+from agent_mesh.config import (
+    AgentMeshConfig,
+    config_from_agent_dir,
+    ensure_project_dirs,
+    load_config,
+)
+from agent_mesh.core.agent_instances import (
+    INSTANCE_EVENT_KINDS,
+    INSTANCE_ID_RE,
+    MUTABLE_INSTANCE_FIELDS,
+    AgentInstanceError,
+    normalize_instance_label,
+    validate_actor_shadow,
+    validate_external_session_ref_digest,
+)
+from agent_mesh.core.decision_schema import (
+    DECISION_IN_FORCE_TIERS,
+    enforcement_for_tier,
+    is_valid_decision_tier,
+    normalize_decision_verification,
+)
 from agent_mesh.core.dispatch_schema import (
     DISPATCH_EVENT_KINDS,
     DispatchSchemaError,
@@ -21,6 +42,10 @@ from agent_mesh.core.provenance import (
     body_fidelity_for_payload,
     confidence_value,
     validate_event_provenance,
+)
+from agent_mesh.core.workflow_origin import (
+    ProjectedWorkflowOrigin,
+    project_workflow_origin,
 )
 from agent_mesh.store.sqlite import (
     ALL_TABLES,
@@ -39,13 +64,19 @@ from agent_mesh.store.sqlite import (
 # Bump this whenever replay semantics change in a way that requires existing
 # SQLite projections to be regenerated. Event-log equality alone cannot detect
 # a package upgrade that changes how historical events are interpreted.
-PROJECTION_VERSION = "1"
+PROJECTION_VERSION = "7"
 
 DECISION_PARENT_MISSING = "DECISION_PARENT_MISSING"
 DECISION_SUPERSEDE_TARGET_INVALID = "DECISION_SUPERSEDE_TARGET_INVALID"
 DECISION_SUPERSEDE_CYCLE = "DECISION_SUPERSEDE_CYCLE"
 DECISION_HUMAN_ID_COLLISION = "DECISION_HUMAN_ID_COLLISION"
 DECISION_ALIAS_FORK = "DECISION_ALIAS_FORK"
+DECISION_IDENTITY_MISMATCH = "DECISION_IDENTITY_MISMATCH"
+DECISION_TRANSITION_INVALID = "DECISION_TRANSITION_INVALID"
+DECISION_METADATA_INVALID = "DECISION_METADATA_INVALID"
+
+BACKLOG_ID_COLLISION = "BACKLOG_ID_COLLISION"
+BACKLOG_ITEM_MISSING = "BACKLOG_ITEM_MISSING"
 
 DECISION_STOP_LINE_CODES = {
     DECISION_PARENT_MISSING,
@@ -53,7 +84,21 @@ DECISION_STOP_LINE_CODES = {
     DECISION_SUPERSEDE_CYCLE,
     DECISION_HUMAN_ID_COLLISION,
     DECISION_ALIAS_FORK,
+    DECISION_IDENTITY_MISMATCH,
+    DECISION_TRANSITION_INVALID,
+    DECISION_METADATA_INVALID,
 }
+
+DECISION_TERMINAL_STATUSES = frozenset({"superseded", "retired", "rejected"})
+DECISION_MUTATING_EVENT_KINDS = frozenset(
+    {
+        "decision_accepted",
+        "decision_superseded",
+        "decision_retired",
+        "decision_rejected",
+        "decision_metadata_updated",
+    }
+)
 
 DISPATCH_BODY_LEAK = "DISPATCH_BODY_LEAK"
 DISPATCH_LEASE_DUPLICATE = "DISPATCH_LEASE_DUPLICATE"
@@ -96,6 +141,7 @@ DECISION_EVENT_KINDS = {
     "decision_assumption_violated",
     "decision_check_failed",
     "decision_drift_detected",
+    "decision_verification_recorded",
 }
 
 
@@ -106,6 +152,267 @@ class DecisionStopLine(RuntimeError):
         self.code = code
         self.detail = detail
         super().__init__(f"{code}: {detail}")
+
+
+class BacklogStopLine(RuntimeError):
+    """Raised when a create-only or update-only backlog write is invalid."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(f"{code}: {detail}")
+
+
+class AgentInstanceStopLine(RuntimeError):
+    """Raised when replay encounters invalid instance lifecycle or attribution."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(f"{code}: {detail}")
+
+
+def validate_backlog_write(conn: sqlite3.Connection, item_id: str, intent: str) -> None:
+    """Validate explicit backlog create/update intent against the projection."""
+    if intent not in {"create", "update", "upsert"}:
+        raise ValueError(f"invalid backlog write_intent: {intent}")
+    if intent == "upsert":
+        return
+    existing = conn.execute(
+        "SELECT 1 FROM backlog_items WHERE id=?",
+        (item_id,),
+    ).fetchone()
+    if intent == "create" and existing is not None:
+        raise BacklogStopLine(BACKLOG_ID_COLLISION, item_id)
+    if intent == "update" and existing is None:
+        raise BacklogStopLine(BACKLOG_ITEM_MISSING, item_id)
+
+
+def validate_decision_proposal_identity(
+    conn: sqlite3.Connection,
+    human_id: str,
+    *,
+    dec_ulid: str | None = None,
+    aliases: Iterable[str] = (),
+) -> None:
+    """Validate a proposed decision ID against the current projection.
+
+    Semantic decision writers call this while holding the mesh write lock and
+    before writing a body or appending an event. Replay uses the same check so
+    live writes and historical projection enforce one collision rule.
+    """
+    if not DECISION_ID_RE.fullmatch(human_id):
+        raise ValueError(f"invalid decision human_id: {human_id}")
+    existing = resolve_decision(conn, human_id)
+    if existing is not None:
+        raise DecisionStopLine(DECISION_HUMAN_ID_COLLISION, human_id)
+    if dec_ulid is not None:
+        existing_entity = conn.execute(
+            "SELECT human_id FROM decisions WHERE dec_ulid=?",
+            (dec_ulid,),
+        ).fetchone()
+        if existing_entity is not None:
+            raise DecisionStopLine(
+                DECISION_HUMAN_ID_COLLISION,
+                f"{human_id} reuses {dec_ulid}",
+            )
+    for alias in aliases:
+        existing_alias = conn.execute(
+            "SELECT dec_ulid FROM decision_aliases WHERE human_id=?",
+            (alias,),
+        ).fetchone()
+        if existing_alias is not None:
+            raise DecisionStopLine(DECISION_ALIAS_FORK, alias)
+
+
+def validate_decision_event(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    entity_id: str,
+    thread_id: str,
+    payload: dict[str, Any],
+) -> str:
+    """Validate one decision event against the current projection.
+
+    Durable append calls this before journaling; replay calls the same validator
+    before projection so the store remains a defense-in-depth boundary.
+    """
+
+    if kind not in DECISION_EVENT_KINDS:
+        raise ValueError(f"not a decision lifecycle event: {kind}")
+    if kind == "decision_proposed":
+        human_id = str(payload.get("human_id") or "")
+        if entity_id != thread_id or not entity_id.startswith("dec_"):
+            raise DecisionStopLine(
+                DECISION_IDENTITY_MISMATCH,
+                f"{kind} requires matching canonical dec_ entity_id and thread_id",
+            )
+        raw_aliases = payload.get("aliases", [])
+        if not isinstance(raw_aliases, list) or not all(
+            isinstance(alias, str) for alias in raw_aliases
+        ):
+            raise DecisionStopLine(
+                DECISION_METADATA_INVALID, "decision aliases must be a string array"
+            )
+        aliases = tuple(raw_aliases)
+        invalid_alias = next(
+            (alias for alias in aliases if not DECISION_ID_RE.fullmatch(alias)),
+            None,
+        )
+        if invalid_alias is not None:
+            raise DecisionStopLine(DECISION_METADATA_INVALID, f"invalid alias: {invalid_alias}")
+        if human_id in aliases or len(set(aliases)) != len(aliases):
+            raise DecisionStopLine(
+                DECISION_ALIAS_FORK, f"aliases for {human_id} must be unique and non-primary"
+            )
+        try:
+            validate_decision_proposal_identity(
+                conn,
+                human_id,
+                dec_ulid=entity_id,
+                aliases=aliases,
+            )
+        except ValueError as exc:
+            raise DecisionStopLine(DECISION_METADATA_INVALID, str(exc)) from exc
+        supersedes = payload.get("supersedes")
+        if supersedes:
+            predecessor = resolve_decision(conn, str(supersedes))
+            if predecessor is None:
+                raise DecisionStopLine(
+                    DECISION_SUPERSEDE_TARGET_INVALID, str(supersedes)
+                )
+            _ensure_supersede_target_valid(conn, predecessor)
+            _ensure_no_supersede_cycle(conn, predecessor, entity_id)
+        return entity_id
+
+    dec_ulid = resolve_decision(conn, entity_id)
+    payload_identifier = str(payload.get("decision_id") or "")
+    payload_dec_ulid = resolve_decision(conn, payload_identifier)
+    if dec_ulid is None or payload_dec_ulid is None:
+        raise DecisionStopLine(DECISION_PARENT_MISSING, entity_id or payload_identifier)
+    if entity_id != dec_ulid or thread_id != dec_ulid or payload_dec_ulid != dec_ulid:
+        raise DecisionStopLine(
+            DECISION_IDENTITY_MISMATCH,
+            f"{kind} must use {dec_ulid} for entity_id, thread_id, and decision_id",
+        )
+
+    row = conn.execute(
+        "SELECT human_id, status FROM decisions WHERE dec_ulid=?", (dec_ulid,)
+    ).fetchone()
+    if row is None:
+        raise DecisionStopLine(DECISION_PARENT_MISSING, dec_ulid)
+    status = str(row["status"])
+    if status in DECISION_TERMINAL_STATUSES and kind in DECISION_MUTATING_EVENT_KINDS:
+        raise DecisionStopLine(
+            DECISION_TRANSITION_INVALID, f"{kind} cannot mutate {dec_ulid} while {status}"
+        )
+
+    if kind == "decision_accepted" and status != "proposed":
+        raise DecisionStopLine(
+            DECISION_TRANSITION_INVALID, f"cannot accept {dec_ulid} while {status}"
+        )
+    if kind == "decision_superseded":
+        successor = resolve_decision(conn, str(payload.get("superseded_by") or ""))
+        if successor is None:
+            raise DecisionStopLine(
+                DECISION_SUPERSEDE_TARGET_INVALID, str(payload.get("superseded_by") or "")
+            )
+        _ensure_supersede_target_valid(conn, successor)
+        _ensure_no_supersede_cycle(conn, dec_ulid, successor)
+        if status not in {"accepted", "in_force"}:
+            raise DecisionStopLine(
+                DECISION_TRANSITION_INVALID, f"cannot supersede {dec_ulid} while {status}"
+            )
+    elif kind == "decision_retired" and status not in {"accepted", "in_force"}:
+        raise DecisionStopLine(
+            DECISION_TRANSITION_INVALID, f"cannot retire {dec_ulid} while {status}"
+        )
+    elif kind == "decision_rejected" and status != "proposed":
+        raise DecisionStopLine(
+            DECISION_TRANSITION_INVALID, f"cannot reject {dec_ulid} while {status}"
+        )
+    elif kind == "decision_revisited":
+        new_id = payload.get("new_decision_id")
+        if new_id and resolve_decision(conn, str(new_id)) is None:
+            raise DecisionStopLine(DECISION_PARENT_MISSING, str(new_id))
+    elif kind == "decision_metadata_updated":
+        _validate_decision_metadata_update(conn, dec_ulid, row, payload)
+    elif kind == "decision_verification_recorded":
+        outcome = str(payload.get("outcome") or "")
+        if outcome not in {"pass", "fail"}:
+            raise DecisionStopLine(
+                DECISION_METADATA_INVALID,
+                f"invalid decision verification outcome: {outcome}",
+            )
+    return dec_ulid
+
+
+def _validate_decision_metadata_update(
+    conn: sqlite3.Connection,
+    dec_ulid: str,
+    row: sqlite3.Row,
+    payload: dict[str, Any],
+) -> None:
+    fields = payload.get("fields_changed")
+    if not isinstance(fields, dict) or not fields:
+        raise DecisionStopLine(
+            DECISION_METADATA_INVALID, "fields_changed must be a non-empty object"
+        )
+    malformed = next(
+        (
+            field_name
+            for field_name, old_new in fields.items()
+            if not isinstance(old_new, list) or len(old_new) != 2
+        ),
+        None,
+    )
+    if malformed is not None:
+        raise DecisionStopLine(
+            DECISION_METADATA_INVALID, f"{malformed} must contain [old, new] values"
+        )
+
+    status = str(row["status"])
+    status_change = fields.get("status")
+    if status_change is not None:
+        old_status, new_status = (str(status_change[0]), str(status_change[1]))
+        allowed = {
+            ("accepted", "in_force"),
+            ("accepted", "proposed"),
+            ("in_force", "proposed"),
+        }
+        if old_status != status or (old_status, new_status) not in allowed:
+            raise DecisionStopLine(
+                DECISION_TRANSITION_INVALID,
+                f"invalid metadata status transition {old_status}->{new_status} from {status}",
+            )
+    if status in {"accepted", "in_force"} and set(fields) != {"status"}:
+        if not isinstance(status_change, list) or str(status_change[1]) != "proposed":
+            raise DecisionStopLine(
+                DECISION_TRANSITION_INVALID,
+                f"editing {dec_ulid} while {status} must return it to proposed",
+            )
+    if status == "proposed" and status_change is not None:
+        raise DecisionStopLine(
+            DECISION_TRANSITION_INVALID,
+            "proposed decision metadata cannot set lifecycle status directly",
+        )
+
+    human_id_change = fields.get("human_id")
+    if human_id_change is not None:
+        old_human_id, new_human_id = map(str, human_id_change)
+        if old_human_id != str(row["human_id"]) or not DECISION_ID_RE.fullmatch(new_human_id):
+            raise DecisionStopLine(
+                DECISION_METADATA_INVALID,
+                f"invalid human_id change {old_human_id}->{new_human_id}",
+            )
+        existing = resolve_decision(conn, new_human_id)
+        if existing is not None and existing != dec_ulid:
+            raise DecisionStopLine(DECISION_ALIAS_FORK, new_human_id)
+
+    tier_change = fields.get("tier")
+    if tier_change is not None and not str(tier_change[1]).strip():
+        raise DecisionStopLine(DECISION_METADATA_INVALID, "tier must not be empty")
 
 
 class DispatchStopLine(RuntimeError):
@@ -122,6 +429,47 @@ class RebuildResult:
     event_count: int
     last_event_seq: int
     table_hashes: dict[str, str]
+
+
+@dataclass(frozen=True)
+class DecisionReplayDiagnostic:
+    valid_events: int
+    total_events: int
+    event_seq: int | None = None
+    event_id: str = ""
+    kind: str = ""
+    code: str = ""
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.event_seq is None
+
+
+def diagnose_decision_replay(config: AgentMeshConfig) -> DecisionReplayDiagnostic:
+    """Replay in memory and identify the first decision stop-line without mutations."""
+
+    records = list(read_event_records(config.events_path))
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        initialize_schema(conn)
+        for index, record in enumerate(records):
+            try:
+                apply_record(record, config, conn=conn, require_next=True)
+            except DecisionStopLine as exc:
+                return DecisionReplayDiagnostic(
+                    valid_events=index,
+                    total_events=len(records),
+                    event_seq=int(record["event_seq"]),
+                    event_id=str(record["event_id"]),
+                    kind=str(record["kind"]),
+                    code=exc.code,
+                    detail=exc.detail,
+                )
+        return DecisionReplayDiagnostic(valid_events=len(records), total_events=len(records))
+    finally:
+        conn.close()
 
 
 def rebuild_all(
@@ -145,7 +493,9 @@ def rebuild_all(
         with conn:
             set_meta(conn, "events_jsonl_sha", file_sha256(cfg.events_path))
             set_meta(conn, "projection_version", PROJECTION_VERSION)
-        return RebuildResult(event_count=event_count, last_event_seq=last_seq, table_hashes=table_hashes)
+        return RebuildResult(
+            event_count=event_count, last_event_seq=last_seq, table_hashes=table_hashes
+        )
     finally:
         conn.close()
 
@@ -250,7 +600,15 @@ def projection_is_current(config: AgentMeshConfig) -> bool:
 def _project_record(conn, record: dict[str, Any], config: AgentMeshConfig) -> None:
     kind = str(record["kind"])
     validate_event_provenance(kind, record.get("payload", {}), str(record.get("entity_id", "")))
-    if kind == "req_created":
+    try:
+        validate_actor_shadow(kind, str(record.get("actor", "")), record.get("payload", {}))
+    except AgentInstanceError as exc:
+        code, _, detail = str(exc).partition(": ")
+        raise AgentInstanceStopLine(code, detail or str(exc)) from exc
+    _validate_projected_instance_attribution(conn, record)
+    if kind in INSTANCE_EVENT_KINDS:
+        _project_agent_instance_event(conn, record)
+    elif kind == "req_created":
         _project_req_created(conn, record, config)
     elif kind == "res_posted":
         _project_res_posted(conn, record)
@@ -276,14 +634,33 @@ def _project_record(conn, record: dict[str, Any], config: AgentMeshConfig) -> No
         )
     elif kind == "message_ref_added":
         payload = record["payload"]
+        message_id = payload.get("source_message_id") or record["entity_id"]
         conn.execute(
             "INSERT OR IGNORE INTO message_refs(message_id, ref_type, ref_value) VALUES (?, ?, ?)",
             (
-                payload.get("source_message_id") or record["entity_id"],
+                message_id,
                 payload["ref_type"],
                 payload["ref_value"],
             ),
         )
+        if payload.get("ref_type") == "origin":
+            row = conn.execute(
+                "SELECT workflow_origin, workflow_origin_source FROM messages WHERE id=?",
+                (message_id,),
+            ).fetchone()
+            value = str(payload.get("ref_value") or "").strip()
+            if row is not None and not row["workflow_origin"]:
+                conn.execute(
+                    "UPDATE messages SET workflow_origin=?, workflow_origin_valid=1, "
+                    "workflow_origin_source='legacy_ref' WHERE id=?",
+                    (value, message_id),
+                )
+            elif row is not None and row["workflow_origin"] != value:
+                conn.execute(
+                    "UPDATE messages SET workflow_origin_valid=0, "
+                    "workflow_origin_source='conflict' WHERE id=?",
+                    (message_id,),
+                )
     elif kind in DECISION_EVENT_KINDS:
         _project_decision_event(conn, record)
     elif kind in DISPATCH_EVENT_KINDS:
@@ -307,6 +684,239 @@ def _project_record(conn, record: dict[str, Any], config: AgentMeshConfig) -> No
         "message_body_stored",
     }:
         _project_ops_event(conn, record)
+    _project_instance_last_seen(conn, record)
+
+
+def _validate_projected_instance_attribution(conn, record: dict[str, Any]) -> None:
+    actor = str(record.get("actor", ""))
+    instance_id = str(record.get("actor_instance_id", "")).strip()
+    if instance_id:
+        row = conn.execute(
+            "SELECT participant, status FROM agent_instances WHERE id=?", (instance_id,)
+        ).fetchone()
+        if row is None:
+            raise AgentInstanceStopLine("AGENT_INSTANCE_UNKNOWN", instance_id)
+        if row["status"] != "active":
+            raise AgentInstanceStopLine("AGENT_INSTANCE_RETIRED", instance_id)
+        if row["participant"] != actor:
+            raise AgentInstanceStopLine(
+                "AGENT_INSTANCE_ACTOR_MISMATCH",
+                f"{instance_id} belongs to {row['participant']!r}, not {actor!r}",
+            )
+        return
+    active = conn.execute(
+        "SELECT id FROM agent_instances WHERE participant=? AND status='active' LIMIT 1",
+        (actor,),
+    ).fetchone()
+    if active is not None:
+        raise AgentInstanceStopLine(
+            "AGENT_INSTANCE_REQUIRED", f"participant {actor!r} has active registered instances"
+        )
+
+
+def _project_agent_instance_event(conn, record: dict[str, Any]) -> None:
+    kind = str(record["kind"])
+    payload = record.get("payload", {})
+    identifier = str(payload.get("id") or record["entity_id"])
+    event_seq = int(record["event_seq"])
+    if kind == "agent_instance_registered":
+        if not INSTANCE_ID_RE.fullmatch(identifier):
+            raise AgentInstanceStopLine("AGENT_INSTANCE_ID_INVALID", identifier)
+        try:
+            label = normalize_instance_label(str(payload.get("label", "")))
+            session_digest = validate_external_session_ref_digest(
+                str(payload.get("external_session_ref_digest", ""))
+            )
+        except ValueError as exc:
+            raise AgentInstanceStopLine("AGENT_INSTANCE_METADATA_INVALID", str(exc)) from exc
+        participant = str(payload.get("participant", "")).strip()
+        provider = str(payload.get("provider", "")).strip().lower()
+        if not participant or not provider:
+            raise AgentInstanceStopLine(
+                "AGENT_INSTANCE_METADATA_INVALID",
+                "participant and provider must be non-empty",
+            )
+        if conn.execute("SELECT 1 FROM agent_instances WHERE id=?", (identifier,)).fetchone():
+            raise AgentInstanceStopLine("AGENT_INSTANCE_ID_COLLISION", identifier)
+        if conn.execute(
+            "SELECT 1 FROM agent_instance_aliases WHERE label=?", (label,)
+        ).fetchone():
+            raise AgentInstanceStopLine("AGENT_INSTANCE_LABEL_COLLISION", label)
+        conn.execute(
+            """
+            INSERT INTO agent_instances(
+              id, participant, provider, label, workstream, runtime_profile,
+              external_session_ref_digest, status, created_utc, updated_utc,
+              created_event_seq, event_seq
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+            """,
+            (
+                identifier,
+                participant,
+                provider,
+                label,
+                str(payload.get("workstream", "")),
+                str(payload.get("runtime_profile", "")),
+                session_digest,
+                record["occurred_utc"],
+                record["occurred_utc"],
+                event_seq,
+                event_seq,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO agent_instance_aliases(label, instance_id, is_primary, event_seq) "
+            "VALUES (?, ?, 1, ?)",
+            (label, identifier, event_seq),
+        )
+        return
+
+    current = conn.execute("SELECT * FROM agent_instances WHERE id=?", (identifier,)).fetchone()
+    if current is None:
+        raise AgentInstanceStopLine("AGENT_INSTANCE_UNKNOWN", identifier)
+    if current["status"] != "active":
+        raise AgentInstanceStopLine("AGENT_INSTANCE_RETIRED", identifier)
+    if kind == "agent_instance_retired":
+        if not str(payload.get("reason", "")).strip():
+            raise AgentInstanceStopLine(
+                "AGENT_INSTANCE_RETIRE_INVALID", "reason must be non-empty"
+            )
+        conn.execute(
+            "UPDATE agent_instances SET status='retired', retired_utc=?, updated_utc=?, "
+            "event_seq=? WHERE id=?",
+            (record["occurred_utc"], record["occurred_utc"], event_seq, identifier),
+        )
+        return
+
+    if not str(payload.get("reason", "")).strip():
+        raise AgentInstanceStopLine(
+            "AGENT_INSTANCE_UPDATE_INVALID", "reason must be non-empty"
+        )
+    fields = payload.get("fields_changed", {})
+    if not isinstance(fields, dict) or not fields:
+        raise AgentInstanceStopLine(
+            "AGENT_INSTANCE_UPDATE_INVALID", "fields_changed must be non-empty"
+        )
+    unsupported = set(fields) - set(MUTABLE_INSTANCE_FIELDS)
+    if unsupported:
+        raise AgentInstanceStopLine(
+            "AGENT_INSTANCE_UPDATE_INVALID",
+            "immutable or unknown fields: " + ", ".join(sorted(unsupported)),
+        )
+    updates: dict[str, str] = {}
+    for field_name in MUTABLE_INSTANCE_FIELDS:
+        if field_name not in fields:
+            continue
+        old_new = fields[field_name]
+        if not isinstance(old_new, list) or len(old_new) != 2:
+            raise AgentInstanceStopLine("AGENT_INSTANCE_UPDATE_INVALID", field_name)
+        old_value = str(old_new[0]).strip()
+        current_value = str(current[field_name] or "").strip()
+        if old_value != current_value:
+            raise AgentInstanceStopLine(
+                "AGENT_INSTANCE_UPDATE_INVALID",
+                f"{field_name} old value does not match current state",
+            )
+        value = str(old_new[1]).strip()
+        if field_name == "label":
+            try:
+                value = normalize_instance_label(value)
+            except ValueError as exc:
+                raise AgentInstanceStopLine("AGENT_INSTANCE_LABEL_INVALID", str(exc)) from exc
+            collision = conn.execute(
+                "SELECT instance_id FROM agent_instance_aliases WHERE label=?", (value,)
+            ).fetchone()
+            if collision is not None and collision["instance_id"] != identifier:
+                raise AgentInstanceStopLine("AGENT_INSTANCE_LABEL_COLLISION", value)
+            conn.execute(
+                "UPDATE agent_instance_aliases SET is_primary=0 WHERE instance_id=?",
+                (identifier,),
+            )
+            conn.execute(
+                "INSERT INTO agent_instance_aliases(label, instance_id, is_primary, event_seq) "
+                "VALUES (?, ?, 1, ?) ON CONFLICT(label) DO UPDATE SET "
+                "is_primary=1, event_seq=excluded.event_seq",
+                (value, identifier, event_seq),
+            )
+        elif field_name == "external_session_ref_digest":
+            try:
+                value = validate_external_session_ref_digest(value)
+            except ValueError as exc:
+                raise AgentInstanceStopLine(
+                    "AGENT_INSTANCE_METADATA_INVALID", str(exc)
+                ) from exc
+        if value == current_value:
+            raise AgentInstanceStopLine(
+                "AGENT_INSTANCE_UPDATE_INVALID", f"{field_name} does not change"
+            )
+        updates[field_name] = value
+    if updates:
+        assignments = ", ".join(f"{name}=?" for name in updates)
+        conn.execute(
+            f"UPDATE agent_instances SET {assignments}, updated_utc=?, event_seq=? WHERE id=?",
+            (*updates.values(), record["occurred_utc"], event_seq, identifier),
+        )
+
+
+def _project_instance_last_seen(conn, record: dict[str, Any]) -> None:
+    instance_id = str(record.get("actor_instance_id", "")).strip()
+    if not instance_id:
+        return
+    conn.execute(
+        "UPDATE agent_instances SET last_seen_utc=?, last_seen_event_seq=? WHERE id=?",
+        (record["occurred_utc"], record["event_seq"], instance_id),
+    )
+
+
+def _validate_instance_recipients(
+    conn, recipients: list[str], instance_ids: list[Any]
+) -> None:
+    recipient_set = {str(value) for value in recipients}
+    seen: set[str] = set()
+    for raw_id in instance_ids:
+        instance_id = str(raw_id)
+        if instance_id in seen:
+            raise AgentInstanceStopLine("AGENT_INSTANCE_ADDRESS_DUPLICATE", instance_id)
+        seen.add(instance_id)
+        row = conn.execute(
+            "SELECT participant, status FROM agent_instances WHERE id=?", (instance_id,)
+        ).fetchone()
+        if row is None:
+            raise AgentInstanceStopLine("AGENT_INSTANCE_UNKNOWN", instance_id)
+        if row["status"] != "active":
+            raise AgentInstanceStopLine("AGENT_INSTANCE_RETIRED", instance_id)
+        if row["participant"] not in recipient_set:
+            raise AgentInstanceStopLine(
+                "AGENT_INSTANCE_RECIPIENT_MISMATCH",
+                f"{instance_id} belongs to {row['participant']!r}",
+            )
+
+
+def _validate_instance_response(conn, record: dict[str, Any], request_id: str) -> None:
+    request = conn.execute(
+        "SELECT recipient_instance_ids_json FROM messages WHERE id=? AND kind='request'",
+        (request_id,),
+    ).fetchone()
+    if request is None:
+        return
+    target_ids = json_loads(request["recipient_instance_ids_json"], [])
+    if not isinstance(target_ids, list) or not target_ids:
+        return
+    placeholders = ",".join("?" for _ in target_ids)
+    rows = conn.execute(
+        f"SELECT id, participant FROM agent_instances WHERE id IN ({placeholders})",
+        tuple(str(value) for value in target_ids),
+    ).fetchall()
+    actor = str(record.get("actor", ""))
+    addressed_participants = {str(row["participant"]) for row in rows}
+    if actor not in addressed_participants:
+        return
+    actor_instance_id = str(record.get("actor_instance_id", ""))
+    if actor_instance_id not in {str(value) for value in target_ids}:
+        raise AgentInstanceStopLine(
+            "AGENT_INSTANCE_NOT_ADDRESSED",
+            f"{actor_instance_id or actor} is not addressed by {request_id}",
+        )
 
 
 def _project_req_created(conn, record: dict[str, Any], config: AgentMeshConfig) -> None:
@@ -315,20 +925,28 @@ def _project_req_created(conn, record: dict[str, Any], config: AgentMeshConfig) 
     recipients = payload.get("to", [])
     if isinstance(recipients, str):
         recipients = config.canonical_recipients(recipients)
+    recipient_instance_ids = payload.get("to_instances", [])
+    if not isinstance(recipient_instance_ids, list):
+        raise AgentInstanceStopLine("AGENT_INSTANCE_ADDRESS_INVALID", "to_instances must be a list")
+    _validate_instance_recipients(conn, recipients, recipient_instance_ids)
     meta = {"body": body}
     if "original_to" in payload:
         meta["original_to"] = payload["original_to"]
     meta["response_mode"] = str(payload.get("response_mode") or "single")
     _add_provenance_to_meta(meta, payload)
+    workflow_origin = project_workflow_origin(payload)
     _insert_message(
         conn,
         record=record,
         kind="request",
         request_id=None,
         parent_id=None,
-        sender=str(payload.get("from", record.get("actor", ""))),
+        sender=str(record.get("actor", "")),
+        sender_instance_id=str(record.get("actor_instance_id", "")),
         recipients=recipients,
+        recipient_instance_ids=[str(value) for value in recipient_instance_ids],
         feature_id=str(payload.get("feature", "")),
+        workflow_origin=workflow_origin,
         title=str(payload.get("title", "")),
         summary=None,
         body=body,
@@ -347,6 +965,7 @@ def _project_res_posted(conn, record: dict[str, Any]) -> None:
     request_id = str(payload.get("request_id") or record["thread_id"])
     parent_id = str(payload.get("parent_id") or request_id)
     _validate_response_parent(conn, record, request_id, parent_id)
+    _validate_instance_response(conn, record, request_id)
     meta = {"body": body}
     if parent_id:
         meta["parent_id"] = parent_id
@@ -355,15 +974,30 @@ def _project_res_posted(conn, record: dict[str, Any]) -> None:
     if isinstance(payload.get("authorship_policy"), dict):
         meta["authorship_policy"] = payload["authorship_policy"]
     _add_provenance_to_meta(meta, payload)
+    request = conn.execute(
+        "SELECT workflow_origin, workflow_origin_valid FROM messages WHERE id=?",
+        (request_id,),
+    ).fetchone()
+    inherited_origin = None
+    if request is not None and request["workflow_origin"]:
+        inherited_origin = ProjectedWorkflowOrigin(
+            str(request["workflow_origin"]),
+            bool(request["workflow_origin_valid"]),
+            "inherited",
+        )
+    workflow_origin = project_workflow_origin(payload, inherited=inherited_origin)
     _insert_message(
         conn,
         record=record,
         kind="response",
         request_id=request_id,
         parent_id=parent_id,
-        sender=str(payload.get("from", record.get("actor", ""))),
+        sender=str(record.get("actor", "")),
+        sender_instance_id=str(record.get("actor_instance_id", "")),
         recipients=[],
+        recipient_instance_ids=[],
         feature_id="",
+        workflow_origin=workflow_origin,
         title=None,
         summary=str(payload.get("summary", "")),
         body=body,
@@ -388,15 +1022,21 @@ def _project_res_posted(conn, record: dict[str, Any]) -> None:
     )
 
 
-def _validate_response_parent(conn, record: dict[str, Any], request_id: str, parent_id: str) -> None:
-    request = conn.execute("SELECT kind, thread_id FROM messages WHERE id=?", (request_id,)).fetchone()
+def _validate_response_parent(
+    conn, record: dict[str, Any], request_id: str, parent_id: str
+) -> None:
+    request = conn.execute(
+        "SELECT kind, thread_id FROM messages WHERE id=?", (request_id,)
+    ).fetchone()
     if request is None or request["kind"] != "request":
         raise RuntimeError(f"RES_REQUEST_MISSING: {record['entity_id']} request_id={request_id}")
     if str(record["thread_id"]) != request_id:
         raise RuntimeError(
             f"RES_THREAD_MISMATCH: {record['entity_id']} thread_id={record['thread_id']} request_id={request_id}"
         )
-    parent = conn.execute("SELECT kind, thread_id, request_id FROM messages WHERE id=?", (parent_id,)).fetchone()
+    parent = conn.execute(
+        "SELECT kind, thread_id, request_id FROM messages WHERE id=?", (parent_id,)
+    ).fetchone()
     if parent is None:
         raise RuntimeError(f"RES_PARENT_MISSING: {record['entity_id']} parent_id={parent_id}")
     declared_parent_kind = record.get("payload", {}).get("parent_kind")
@@ -445,8 +1085,11 @@ def _insert_message(
     request_id: str | None,
     parent_id: str | None,
     sender: str,
+    sender_instance_id: str,
     recipients: list[str],
+    recipient_instance_ids: list[str],
     feature_id: str,
+    workflow_origin: ProjectedWorkflowOrigin,
     title: str | None,
     summary: str | None,
     body: str,
@@ -461,18 +1104,26 @@ def _insert_message(
         """
         INSERT INTO messages(
           id, kind, schema_version, thread_id, request_id, parent_id, sender,
-          recipients_json, feature_id, title, summary, body_preview, body_sha, body_path,
+          sender_instance_id, recipients_json, recipient_instance_ids_json, feature_id,
+          workflow_origin, workflow_origin_valid, workflow_origin_source, title, summary,
+          body_preview, body_sha, body_path,
           body_bytes, body_media_type, body_authority, body_fidelity, status, resolution,
           resolved_utc, claimed_by,
           claimed_utc, has_fenced_json, json_packet_type, created_utc, updated_utc,
           event_seq, source_file, source_line_start, source_line_end, import_batch_id, meta_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'text/markdown',
-          ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?,
+          'text/markdown', ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, NULL, NULL,
+          NULL, NULL, ?)
         ON CONFLICT(id) DO UPDATE SET
           updated_utc=excluded.updated_utc,
           event_seq=excluded.event_seq,
+          sender_instance_id=excluded.sender_instance_id,
+          recipient_instance_ids_json=excluded.recipient_instance_ids_json,
           body_authority=excluded.body_authority,
           body_fidelity=excluded.body_fidelity,
+          workflow_origin=excluded.workflow_origin,
+          workflow_origin_valid=excluded.workflow_origin_valid,
+          workflow_origin_source=excluded.workflow_origin_source,
           meta_json=excluded.meta_json
         """,
         (
@@ -483,8 +1134,13 @@ def _insert_message(
             request_id,
             parent_id,
             sender,
+            sender_instance_id or None,
             json_dumps(recipients),
+            json_dumps(recipient_instance_ids),
             feature_id,
+            workflow_origin.value,
+            workflow_origin.valid,
+            workflow_origin.source,
             title,
             summary,
             body[:500],
@@ -511,6 +1167,8 @@ def _insert_refs(conn, message_id: str, refs: list[Any]) -> None:
         else:
             ref_value = str(ref)
             ref_type = _infer_ref_type(ref_value)
+            if ref_type == "origin":
+                ref_value = ref_value.partition(":")[2].strip()
         if ref_value:
             conn.execute(
                 "INSERT OR IGNORE INTO message_refs(message_id, ref_type, ref_value) VALUES (?, ?, ?)",
@@ -676,13 +1334,31 @@ def _extra_fields(item: dict[str, Any], known: set[str]) -> dict[str, Any]:
 def _project_backlog_item_upserted(conn, record: dict[str, Any]) -> None:
     payload = record["payload"]
     item_id = str(payload.get("id") or record["entity_id"])
+    write_intent = str(payload.get("write_intent") or "upsert")
+    validate_backlog_write(conn, item_id, write_intent)
     refs = payload.get("refs", [])
     if not isinstance(refs, list):
         refs = []
+    workflow_origin = project_workflow_origin(payload)
+    raw_owner_instance_id = payload.get("owner_instance_id")
+    owner_instance_id = (
+        str(raw_owner_instance_id).strip()
+        if raw_owner_instance_id is not None
+        else ""
+    )
+    if owner_instance_id:
+        owner_instance = conn.execute(
+            "SELECT status FROM agent_instances WHERE id=?", (owner_instance_id,)
+        ).fetchone()
+        if owner_instance is None:
+            raise AgentInstanceStopLine("AGENT_INSTANCE_UNKNOWN", owner_instance_id)
+        if owner_instance["status"] != "active":
+            raise AgentInstanceStopLine("AGENT_INSTANCE_RETIRED", owner_instance_id)
     meta = {
         key: value
         for key, value in payload.items()
-        if key not in {
+        if key
+        not in {
             "id",
             "title",
             "item_type",
@@ -696,8 +1372,10 @@ def _project_backlog_item_upserted(conn, record: dict[str, Any]) -> None:
             "production_state",
             "disposition",
             "owner_hint",
+            "owner_instance_id",
             "lane",
             "notes",
+            "workflow_origin",
             "refs",
         }
     }
@@ -706,8 +1384,9 @@ def _project_backlog_item_upserted(conn, record: dict[str, Any]) -> None:
         INSERT INTO backlog_items(
           id, title, item_type, summary, root_cause_summary, architectural_category,
           status, priority, launch_scope, release_phase, production_state, disposition,
-          owner_hint, lane, notes, refs_json, created_utc, updated_utc, event_seq, meta_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          owner_hint, owner_instance_id, lane, notes, workflow_origin, workflow_origin_valid,
+          workflow_origin_source, refs_json, created_utc, updated_utc, event_seq, meta_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           title=excluded.title,
           item_type=excluded.item_type,
@@ -721,8 +1400,12 @@ def _project_backlog_item_upserted(conn, record: dict[str, Any]) -> None:
           production_state=excluded.production_state,
           disposition=excluded.disposition,
           owner_hint=excluded.owner_hint,
+          owner_instance_id=excluded.owner_instance_id,
           lane=excluded.lane,
           notes=excluded.notes,
+          workflow_origin=excluded.workflow_origin,
+          workflow_origin_valid=excluded.workflow_origin_valid,
+          workflow_origin_source=excluded.workflow_origin_source,
           refs_json=excluded.refs_json,
           updated_utc=excluded.updated_utc,
           event_seq=excluded.event_seq,
@@ -742,8 +1425,12 @@ def _project_backlog_item_upserted(conn, record: dict[str, Any]) -> None:
             payload.get("production_state"),
             payload.get("disposition"),
             payload.get("owner_hint"),
+            owner_instance_id or None,
             payload.get("lane"),
             payload.get("notes"),
+            workflow_origin.value,
+            workflow_origin.valid,
+            workflow_origin.source,
             json_dumps(refs),
             record["occurred_utc"],
             record["occurred_utc"],
@@ -781,14 +1468,16 @@ def _project_backlog_event_recorded(conn, record: dict[str, Any]) -> None:
     conn.execute(
         """
         INSERT OR REPLACE INTO backlog_events(
-          event_id, item_id, event_type, actor, created_utc, details_json, event_seq
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          event_id, item_id, event_type, actor, actor_instance_id, created_utc,
+          details_json, event_seq
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             record["event_id"],
             item_id,
             str(payload.get("event_type", record["kind"])),
-            str(payload.get("actor") or record.get("actor", "")),
+            str(record.get("actor", "")),
+            str(record.get("actor_instance_id", "")) or None,
             record["occurred_utc"],
             json_dumps(details),
             record["event_seq"],
@@ -941,9 +1630,7 @@ def _project_dispatch_run_blocked(conn, record, payload, event_seq: int) -> None
 
 def _project_dispatch_lease_acquired(conn, payload, event_seq: int) -> None:
     run_id = str(payload["run_id"])
-    known_run = conn.execute(
-        "SELECT 1 FROM dispatch_runs WHERE run_id=?", (run_id,)
-    ).fetchone()
+    known_run = conn.execute("SELECT 1 FROM dispatch_runs WHERE run_id=?", (run_id,)).fetchone()
     if known_run is None:
         # The contract §4 FK dispatch_leases.run_id -> dispatch_runs.run_id, enforced at replay
         # (the codebase enforces FKs via stop-lines, not SQL FK clauses on log-rebuilt tables).
@@ -1062,7 +1749,9 @@ def _project_dispatch_run_terminal(conn, kind: str, payload, event_seq: int) -> 
             )
         # Bind against the input request's CANONICAL thread (resolved from messages), never the run's
         # self-declared/possibly-empty stored thread. Fail closed if it cannot be established.
-        req_thread = _request_thread_for_run(conn, row["input_message_id"] if row is not None else None)
+        req_thread = _request_thread_for_run(
+            conn, row["input_message_id"] if row is not None else None
+        )
         if not req_thread or str(out["thread_id"]) != str(req_thread):
             raise DispatchStopLine(
                 DISPATCH_OUTPUT_THREAD_MISMATCH,
@@ -1096,13 +1785,16 @@ def _project_dispatch_run_terminal(conn, kind: str, payload, event_seq: int) -> 
 def _project_decision_event(conn, record: dict[str, Any]) -> None:
     kind = record["kind"]
     payload = record["payload"]
+    dec_ulid = validate_decision_event(
+        conn,
+        kind=str(kind),
+        entity_id=str(record["entity_id"]),
+        thread_id=str(record["thread_id"]),
+        payload=payload,
+    )
     if kind == "decision_proposed":
         _project_decision_proposed(conn, record)
         return
-
-    dec_ulid = _decision_id_for_event(conn, record)
-    if dec_ulid is None:
-        raise DecisionStopLine(DECISION_PARENT_MISSING, record["entity_id"])
 
     if kind == "decision_accepted":
         row = conn.execute(
@@ -1113,11 +1805,7 @@ def _project_decision_event(conn, record: dict[str, Any]) -> None:
         _append_decision_log(conn, dec_ulid, record)
         if not _decision_quorum_reached(meta, record):
             return
-        status = "in_force" if tier in {
-            "architecture_contract",
-            "production_invariant",
-            "compliance_security",
-        } else "accepted"
+        status = "in_force" if tier in DECISION_IN_FORCE_TIERS else "accepted"
         conn.execute(
             "UPDATE decisions SET status=?, accepted_utc=?, in_force_utc=?, event_seq=? "
             "WHERE dec_ulid=?",
@@ -1137,7 +1825,9 @@ def _project_decision_event(conn, record: dict[str, Any]) -> None:
     elif kind == "decision_superseded":
         successor = resolve_decision(conn, str(payload.get("superseded_by", "")))
         if successor is None:
-            raise DecisionStopLine(DECISION_SUPERSEDE_TARGET_INVALID, str(payload.get("superseded_by")))
+            raise DecisionStopLine(
+                DECISION_SUPERSEDE_TARGET_INVALID, str(payload.get("superseded_by"))
+            )
         _ensure_supersede_target_valid(conn, successor)
         _ensure_no_supersede_cycle(conn, dec_ulid, successor)
         conn.execute(
@@ -1174,6 +1864,31 @@ def _project_decision_event(conn, record: dict[str, Any]) -> None:
             "last_event_id=? WHERE dec_ulid=? AND command=?",
             (record["occurred_utc"], record["event_id"], dec_ulid, payload.get("command")),
         )
+        conn.execute(
+            "UPDATE decisions SET last_verified_utc=?, event_seq=? WHERE dec_ulid=?",
+            (record["occurred_utc"], record["event_seq"], dec_ulid),
+        )
+        _append_decision_log(conn, dec_ulid, record)
+    elif kind == "decision_verification_recorded":
+        outcome = str(payload.get("outcome") or "")
+        if outcome not in {"pass", "fail"}:
+            raise ValueError(f"invalid decision verification outcome: {outcome}")
+        conn.execute(
+            "UPDATE decision_verifications SET last_verified_utc=?, last_outcome=?, "
+            "last_event_id=? WHERE dec_ulid=? AND command=?",
+            (
+                record["occurred_utc"],
+                outcome,
+                record["event_id"],
+                dec_ulid,
+                payload.get("command"),
+            ),
+        )
+        conn.execute(
+            "UPDATE decisions SET last_verified_utc=?, event_seq=? WHERE dec_ulid=?",
+            (record["occurred_utc"], record["event_seq"], dec_ulid),
+        )
+        _append_decision_log(conn, dec_ulid, record)
 
 
 def _project_decision_proposed(conn, record: dict[str, Any]) -> None:
@@ -1181,11 +1896,12 @@ def _project_decision_proposed(conn, record: dict[str, Any]) -> None:
     dec_ulid = record["entity_id"]
     human_id = str(payload["human_id"])
     parent = parent_human_id(human_id)
-    if not DECISION_ID_RE.match(human_id):
-        raise ValueError(f"invalid decision human_id: {human_id}")
-    existing = resolve_decision(conn, human_id)
-    if existing is not None and existing != dec_ulid:
-        raise DecisionStopLine(DECISION_HUMAN_ID_COLLISION, human_id)
+    validate_decision_proposal_identity(
+        conn,
+        human_id,
+        dec_ulid=dec_ulid,
+        aliases=(str(alias) for alias in payload.get("aliases", [])),
+    )
 
     supersedes = payload.get("supersedes")
     supersedes_ulid = None
@@ -1205,16 +1921,19 @@ def _project_decision_proposed(conn, record: dict[str, Any]) -> None:
         "exemptions": payload.get("exemptions", []),
         "generated_artifact_paths": payload.get("generated_artifact_paths", []),
     }
-    verification = payload.get("verification", [])
-    drift_risk = _max_drift_risk(item.get("drift_risk") for item in verification if isinstance(item, dict))
+    verification = normalize_decision_verification(payload.get("verification", []))
+    drift_risk = _max_drift_risk(
+        item.get("drift_risk") for item in verification if isinstance(item, dict)
+    )
     conn.execute(
         """
         INSERT INTO decisions(
-          dec_ulid, human_id, parent_human_id, title, tier, status, enforcement_mode, owner,
+          dec_ulid, human_id, parent_human_id, title, tier, tier_valid, status,
+          enforcement_mode, owner,
           body_sha, body_path, body_bytes, body_media_type, superseded_by, supersedes,
           proposed_utc, accepted_utc, in_force_utc, retired_utc, last_verified_utc, drift_risk,
           event_seq, meta_json
-        ) VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, 'text/markdown', NULL, ?,
+        ) VALUES (?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, 'text/markdown', NULL, ?,
           ?, NULL, NULL, NULL, NULL, ?, ?, ?)
         """,
         (
@@ -1223,6 +1942,7 @@ def _project_decision_proposed(conn, record: dict[str, Any]) -> None:
             parent,
             payload["title"],
             payload["tier"],
+            is_valid_decision_tier(str(payload["tier"])),
             payload.get("enforcement_mode") or enforcement_for_tier(str(payload["tier"])),
             payload.get("owner"),
             payload["body_sha"],
@@ -1253,12 +1973,15 @@ def _project_decision_proposed(conn, record: dict[str, Any]) -> None:
         if isinstance(item, dict):
             conn.execute(
                 "INSERT OR IGNORE INTO decision_verifications("
-                "dec_ulid, command, expected_signal, runtime_cost, drift_risk, "
+                "dec_ulid, command, execution_mode, argv_json, expected_signal, "
+                "runtime_cost, drift_risk, "
                 "last_verified_utc, last_outcome, last_event_id"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
                 (
                     dec_ulid,
                     str(item.get("command", "")),
+                    str(item.get("execution_mode") or "legacy_shell"),
+                    json_dumps(item.get("argv")) if item.get("argv") else None,
                     str(item.get("expected_signal", "")),
                     item.get("runtime_cost"),
                     item.get("drift_risk"),
@@ -1311,9 +2034,7 @@ def _project_decision_metadata_updated(conn, record: dict[str, Any], dec_ulid: s
             existing = resolve_decision(conn, new_id)
             if existing is not None and existing != dec_ulid:
                 raise DecisionStopLine(DECISION_ALIAS_FORK, new_id)
-            conn.execute(
-                "UPDATE decision_aliases SET is_primary=0 WHERE dec_ulid=?", (dec_ulid,)
-            )
+            conn.execute("UPDATE decision_aliases SET is_primary=0 WHERE dec_ulid=?", (dec_ulid,))
             _insert_alias(conn, old_id, dec_ulid, is_primary=False)
             _insert_alias(conn, new_id, dec_ulid, is_primary=True)
             conn.execute(
@@ -1340,8 +2061,15 @@ def _project_decision_metadata_updated(conn, record: dict[str, Any], dec_ulid: s
         if not new_tier:
             raise ValueError("decision tier must not be empty")
         conn.execute(
-            "UPDATE decisions SET tier=?, enforcement_mode=?, event_seq=? WHERE dec_ulid=?",
-            (new_tier, enforcement_for_tier(new_tier), record["event_seq"], dec_ulid),
+            "UPDATE decisions SET tier=?, tier_valid=?, enforcement_mode=?, event_seq=? "
+            "WHERE dec_ulid=?",
+            (
+                new_tier,
+                is_valid_decision_tier(new_tier),
+                enforcement_for_tier(new_tier),
+                record["event_seq"],
+                dec_ulid,
+            ),
         )
     meta_fields = {
         "context",
@@ -1364,6 +2092,67 @@ def _project_decision_metadata_updated(conn, record: dict[str, Any], dec_ulid: s
         conn.execute(
             "UPDATE decisions SET meta_json=?, event_seq=? WHERE dec_ulid=?",
             (json_dumps(meta), record["event_seq"], dec_ulid),
+        )
+
+    collections_changed = False
+    if "affected_code_globs" in fields:
+        values = _decision_changed_value(fields["affected_code_globs"])
+        conn.execute("DELETE FROM decision_globs WHERE dec_ulid=? AND kind='affected'", (dec_ulid,))
+        for pattern in values if isinstance(values, list) else []:
+            _insert_glob(conn, dec_ulid, str(pattern), "affected")
+        collections_changed = True
+    if "required_checks" in fields:
+        values = _decision_changed_value(fields["required_checks"])
+        conn.execute("DELETE FROM decision_checks WHERE dec_ulid=?", (dec_ulid,))
+        for check in values if isinstance(values, list) else []:
+            conn.execute(
+                "INSERT OR IGNORE INTO decision_checks(dec_ulid, check_name) VALUES (?, ?)",
+                (dec_ulid, str(check)),
+            )
+        collections_changed = True
+    if "verification" in fields:
+        raw_values = _decision_changed_value(fields["verification"])
+        values = normalize_decision_verification(
+            raw_values if isinstance(raw_values, list) else []
+        )
+        conn.execute("DELETE FROM decision_verifications WHERE dec_ulid=?", (dec_ulid,))
+        for item in values if isinstance(values, list) else []:
+            if not isinstance(item, dict):
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO decision_verifications("
+                "dec_ulid, command, execution_mode, argv_json, expected_signal, "
+                "runtime_cost, drift_risk, "
+                "last_verified_utc, last_outcome, last_event_id"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)",
+                (
+                    dec_ulid,
+                    str(item.get("command", "")),
+                    str(item.get("execution_mode") or "legacy_shell"),
+                    json_dumps(item.get("argv")) if item.get("argv") else None,
+                    str(item.get("expected_signal", "")),
+                    item.get("runtime_cost"),
+                    item.get("drift_risk"),
+                ),
+            )
+        conn.execute(
+            "UPDATE decisions SET last_verified_utc=NULL, drift_risk=NULL WHERE dec_ulid=?",
+            (dec_ulid,),
+        )
+        collections_changed = True
+    if "tags" in fields:
+        values = _decision_changed_value(fields["tags"])
+        conn.execute("DELETE FROM decision_tags WHERE dec_ulid=?", (dec_ulid,))
+        for tag in values if isinstance(values, list) else []:
+            conn.execute(
+                "INSERT OR IGNORE INTO decision_tags(dec_ulid, tag) VALUES (?, ?)",
+                (dec_ulid, str(tag)),
+            )
+        collections_changed = True
+    if collections_changed:
+        conn.execute(
+            "UPDATE decisions SET event_seq=? WHERE dec_ulid=?",
+            (record["event_seq"], dec_ulid),
         )
     if "status" in fields:
         old_new = fields["status"]
@@ -1396,7 +2185,9 @@ def _decision_changed_value(value: Any) -> Any:
 def _project_ops_event(conn, record: dict[str, Any]) -> None:
     if record["kind"] == "decision_reference_resolved":
         payload = record["payload"]
-        dec_ulid = resolve_decision(conn, str(payload.get("dec_ulid") or payload.get("decision_id")))
+        dec_ulid = resolve_decision(
+            conn, str(payload.get("dec_ulid") or payload.get("decision_id"))
+        )
         if dec_ulid:
             conn.execute(
                 "INSERT OR REPLACE INTO decision_references_in_code("
@@ -1413,20 +2204,6 @@ def _project_ops_event(conn, record: dict[str, Any]) -> None:
                 ),
             )
     _ = conn
-
-
-def _decision_id_for_event(conn, record: dict[str, Any]) -> str | None:
-    payload = record["payload"]
-    candidates = [
-        payload.get("decision_id"),
-        record.get("entity_id"),
-    ]
-    for candidate in candidates:
-        if candidate:
-            resolved = resolve_decision(conn, str(candidate))
-            if resolved:
-                return resolved
-    return None
 
 
 def _insert_alias(conn, human_id: str, dec_ulid: str, *, is_primary: bool) -> None:
@@ -1500,7 +2277,9 @@ def _decision_quorum_reached(meta: dict[str, Any], current_record: dict[str, Any
         for item in meta.get("event_log", [])
         if item.get("kind") == "decision_accepted"
     }
-    accepted_by.add(str(current_record.get("payload", {}).get("accepted_by", current_record.get("actor", ""))))
+    accepted_by.add(
+        str(current_record.get("payload", {}).get("accepted_by", current_record.get("actor", "")))
+    )
     return len(accepted_by.intersection({str(item) for item in required})) >= quorum
 
 
@@ -1511,16 +2290,6 @@ def parent_human_id(human_id: str) -> str | None:
     if not match or not match.group(2):
         return None
     return f"D{match.group(1)}"
-
-
-def enforcement_for_tier(tier: str) -> str:
-    return {
-        "note": "none",
-        "implementation_plan": "none",
-        "architecture_contract": "advisory",
-        "production_invariant": "required",
-        "compliance_security": "required",
-    }.get(tier, "none")
 
 
 def _max_drift_risk(values: Iterable[Any]) -> str | None:
@@ -1544,6 +2313,8 @@ def _packet_type(body: str) -> str | None:
 
 
 def _infer_ref_type(ref_value: str) -> str:
+    if ref_value.startswith("origin:"):
+        return "origin"
     if ref_value.startswith("REQ-"):
         return "req"
     if ref_value.startswith("RES-"):
@@ -1552,6 +2323,8 @@ def _infer_ref_type(ref_value: str) -> str:
         return "feedback"
     if ref_value.startswith("BKL-"):
         return "backlog"
+    if ref_value.startswith("AI-"):
+        return "agent_instance"
     if re.fullmatch(r"[0-9a-f]{7,40}", ref_value):
         return "commit"
     return "unknown"

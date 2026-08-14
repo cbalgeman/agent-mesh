@@ -13,6 +13,11 @@ from typing import Callable, Protocol
 
 from agent_mesh.core.chain import ChainAnchor, ChainResult
 from agent_mesh.core.events import Event, append_event, generate_event_id
+from agent_mesh.core.agent_instances import (
+    reduce_agent_instances,
+    reset_agent_instance,
+    suspend_agent_instance,
+)
 from agent_mesh.store.rebuild import read_event_records
 from agent_mesh.core.ids import new_ulid
 
@@ -78,6 +83,7 @@ def execute_launch_plan(
         if plan.thread_id != plan.input_message_id:
             raise ValueError("post_response plan thread_id must equal input_message_id")
         _ensure_response_candidate_post_allowed(path, plan.input_message_id)
+        _ensure_runtime_response_attribution_allowed(path, plan.target_agent)
 
     _append_and_verify(
         path,
@@ -327,6 +333,23 @@ def _ensure_response_candidate_post_allowed(events_path: Path, request_id: str) 
         raise ValueError(f"request {request_id} already has response {existing_direct_response}")
 
 
+def _ensure_runtime_response_attribution_allowed(
+    events_path: Path, target_participant: str
+) -> None:
+    """Reject a launch whose generic runtime cannot legally attribute its eventual response."""
+
+    instances = reduce_agent_instances(read_event_records(events_path))
+    if any(
+        instance.participant == target_participant and instance.status == "active"
+        for instance in instances.values()
+    ):
+        raise ValueError(
+            "AGENT_INSTANCE_RUNTIME_UNBOUND: generic dispatch cannot post a response for "
+            f"participant {target_participant!r} while it has active registered instances; "
+            "use a distinct runtime-owned instance"
+        )
+
+
 def _append_response_candidate(
     events_path: Path,
     *,
@@ -360,18 +383,22 @@ def _append_response_candidate(
     }
 
     def append_response() -> None:
-        append_event(
-            events_path,
-            Event(
-                event_id=generate_event_id(),
-                actor=actor,
-                kind="res_posted",
-                entity_id=response_id,
-                thread_id=plan.input_message_id,
-                payload=payload,
-            ),
-            lock_acquired=lock_acquired,
-        )
+        token = suspend_agent_instance()
+        try:
+            append_event(
+                events_path,
+                Event(
+                    event_id=generate_event_id(),
+                    actor=actor,
+                    kind="res_posted",
+                    entity_id=response_id,
+                    thread_id=plan.input_message_id,
+                    payload=payload,
+                ),
+                lock_acquired=lock_acquired,
+            )
+        finally:
+            reset_agent_instance(token)
 
     _append_and_verify(events_path, append_response, verify=verify)
     return response_id

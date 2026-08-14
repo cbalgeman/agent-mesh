@@ -10,6 +10,7 @@ Design contract (RES-2-phase5-impl.md §3, §2):
 - Destination I/O lives in callers (CLI / install). Git commit lookup is
   best-effort and degrades to `unknown` outside a git checkout.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -40,6 +41,10 @@ use the agent-mesh handoff substrate.
 ## Read Before Write
 - Run `agent-q status` and targeted `agent-q list/locate/body` before
   responding.
+- Run `agent-q instances list --participant <your-participant>` when the project
+  uses long-lived AI-agent instances. If this chat has an assigned instance,
+  read its work with `agent-q list --to-instance <ID-or-label>` and
+  `agent-q backlog list --owner-instance <ID-or-label>`.
 - Read `.agent-mesh/config.toml` to learn participants, routing defaults,
   response_mode, state sharing, and compatibility view paths before writing.
 - For code changes, run decision/quality preflight once those event domains
@@ -56,10 +61,19 @@ use the agent-mesh handoff substrate.
 
 ## Write
 - Use `agent-mesh request/respond/resolve/reopen`.
+- Keep participant, provider, runtime profile, and AI-agent instance separate.
+  When your participant has active registered instances, bind every write from
+  this chat with global `--instance <ID-or-label>` or
+  `AGENT_MESH_INSTANCE_ID` and use the instance participant as `--from` or
+  `--actor`; never use another chat's identity. Use request
+  `--to-instance` or backlog `--owner-instance` for a durable handoff to a
+  named active instance. Instance IDs attribute Agent Mesh events; they are not
+  authentication and do not preserve or mirror the provider chat context.
 - Use Workbench or `agent-mesh decision propose` for new decisions. Do not
   allocate a decision ID from memory.
-- Run `agent-mesh decision accept` only after explicit human approval and name
-  the approving human with `--by`.
+- Agents may propose or revise decisions but must never accept them. Direct the
+  human to Workbench's Approve and accept control or give them the interactive
+  `agent-mesh decision accept` command with `--by` and `--notes`.
 - Use Workbench for append-only decision revisions. Revising an accepted or
   in-force decision requires a reason and returns it to Proposed until the
   human accepts it again.
@@ -109,14 +123,20 @@ Read side (safe, no writes):
   agent-q list [--from X] [--to Y] [--status open|resolved]
   agent-q locate <message_id>
   agent-q body <message_id>
+  agent-q instances list [--participant X]
+  agent-q list --to-instance <AI-id-or-label>
+  agent-q backlog list --owner-instance <AI-id-or-label>
 
 Write side (append-only events):
   agent-mesh request --to <agent> "<title>" "<body>"
   agent-mesh respond <REQ-id> "<summary>" "<details>"
   agent-mesh resolve <REQ-id> "<reason>"
   agent-mesh reopen <REQ-id> "<reason>"
+  agent-mesh --instance <sender-instance> request --to-instance <target-instance> "<title>" "<body>"
+  agent-mesh --instance <sender-instance> backlog create --actor <participant> --owner-instance <target-instance> --title "<title>"
   agent-mesh decision propose --id <D-id> --title "<title>" --tier <tier> --decision "<choice>"
-  agent-mesh decision accept <D-id> --by <human> --notes "<approval source>"
+Human-operated approval (never run this command as an agent):
+  agent-mesh decision accept <D-id> --by <human> --notes "<approval reason>"
 
 Adoption health:
   agent-mesh adopt --repo .
@@ -126,6 +146,7 @@ References (read these for full contract, do not paraphrase from memory):
   README.md
   docs/adoption.md
   docs/configuration.md
+  docs/agent-instances.md
   docs/privacy.md
 """
 
@@ -187,9 +208,7 @@ _HERMES = Target(
 )
 
 
-SUPPORTED_TARGETS: dict[str, Target] = {
-    t.name: t for t in (_GENERIC, _CLAUDE, _CODEX, _HERMES)
-}
+SUPPORTED_TARGETS: dict[str, Target] = {t.name: t for t in (_GENERIC, _CLAUDE, _CODEX, _HERMES)}
 
 
 class UnknownTargetError(ValueError):
@@ -251,9 +270,7 @@ def render_skill(target_name: str) -> str:
     target = SUPPORTED_TARGETS.get(target_name)
     if target is None:
         known = ", ".join(sorted(SUPPORTED_TARGETS))
-        raise UnknownTargetError(
-            f"unknown skill target {target_name!r}; known targets: {known}"
-        )
+        raise UnknownTargetError(f"unknown skill target {target_name!r}; known targets: {known}")
     provenance = _provenance_block(target)
     if target.provenance_after_preamble:
         return target.preamble + provenance + CANONICAL_SKILL_BODY
