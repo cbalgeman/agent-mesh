@@ -3,7 +3,7 @@
 All notable public changes to Agent Mesh are recorded here. Agent Mesh is
 pre-1.0, so minor releases may change command or storage contracts.
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-08-15
 
 This is the first Agent Mesh release distributed through PyPI.
 
@@ -41,7 +41,7 @@ This is the first Agent Mesh release distributed through PyPI.
 
 1. Back up the target repository's `.agent-mesh` directory.
 2. Install the release with
-   `python -m pip install --upgrade agent-mesh==0.3.0`.
+   `python -m pip install --upgrade my-agent-mesh==0.3.0`.
 3. Run `agent-mesh adopt --repo . --check`. If the managed contract is stale,
    review and run `agent-mesh adopt --repo .`, then repeat the check.
 4. Run `agent-q verify-chain` before writing new durable records.

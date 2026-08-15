@@ -114,7 +114,7 @@ dependency.
 Install a published PyPI release with:
 
 ```bash
-python -m pip install agent-mesh
+python -m pip install my-agent-mesh
 ```
 
 See the [changelog](https://github.com/cbalgeman/agent-mesh/blob/main/CHANGELOG.md)
@@ -278,7 +278,7 @@ choice.
 ## Manual Quickstart
 
 ```bash
-pip install agent-mesh
+pip install my-agent-mesh
 cd ~/your-project
 agent-mesh init --participants human,agent --default-sender human --default-recipient agent
 agent-mesh adopt --repo .

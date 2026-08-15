@@ -11,7 +11,7 @@ exact artifacts, but GitHub environment approval remains a direct human action.
 
    | Field | Value |
    |---|---|
-   | PyPI project | `agent-mesh` |
+   | PyPI project | `my-agent-mesh` |
    | GitHub owner | `cbalgeman` |
    | GitHub repository | `agent-mesh` |
    | Workflow filename | `publish.yml` |
@@ -66,7 +66,7 @@ Verify from a clean environment without consulting PyPI for dependencies:
 ```bash
 python -m venv /tmp/agent-mesh-testpypi
 /tmp/agent-mesh-testpypi/bin/python -m pip install \
-  --index-url https://test.pypi.org/simple/ --no-deps agent-mesh==0.3.0
+  --index-url https://test.pypi.org/simple/ --no-deps my-agent-mesh==0.3.0
 /tmp/agent-mesh-testpypi/bin/agent-mesh --help
 /tmp/agent-mesh-testpypi/bin/agent-q --help
 /tmp/agent-mesh-testpypi/bin/python -c \
@@ -92,7 +92,7 @@ package do not have to change with it.
 
    ```bash
    python -m venv /tmp/agent-mesh-pypi
-   /tmp/agent-mesh-pypi/bin/python -m pip install agent-mesh==0.3.0
+   /tmp/agent-mesh-pypi/bin/python -m pip install my-agent-mesh==0.3.0
    /tmp/agent-mesh-pypi/bin/python -c \
      'import agent_mesh; print(agent_mesh.__version__)'
    /tmp/agent-mesh-pypi/bin/agent-mesh --help

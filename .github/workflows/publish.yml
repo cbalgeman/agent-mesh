@@ -56,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/agent-mesh
+      url: https://test.pypi.org/p/my-agent-mesh
     permissions:
       contents: read
       id-token: write
@@ -78,7 +78,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/agent-mesh
+      url: https://pypi.org/p/my-agent-mesh
     permissions:
       contents: read
       id-token: write
