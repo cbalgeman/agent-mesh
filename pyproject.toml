@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-mesh"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local, auditable coordination and decision tracking for human and AI-agent teams"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,6 +23,12 @@ classifiers = [
 dependencies = [
     # Stdlib-only by design for core. Optional integrations can wrap the CLI.
 ]
+
+[project.urls]
+Homepage = "https://github.com/cbalgeman/agent-mesh"
+Repository = "https://github.com/cbalgeman/agent-mesh"
+Issues = "https://github.com/cbalgeman/agent-mesh/issues"
+Changelog = "https://github.com/cbalgeman/agent-mesh/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 test = [

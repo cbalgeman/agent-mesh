@@ -109,6 +109,18 @@ release. Agent Mesh is implemented with the Python standard library and has no
 required hosted service, model provider, database server, or third-party runtime
 dependency.
 
+## Installation and releases
+
+Install a published PyPI release with:
+
+```bash
+python -m pip install agent-mesh
+```
+
+See the [changelog](https://github.com/cbalgeman/agent-mesh/blob/main/CHANGELOG.md)
+for release notes. Maintainers use the documented
+[release procedure](https://github.com/cbalgeman/agent-mesh/blob/main/docs/releasing.md).
+
 ## Verify the published source
 
 The public repository includes a privacy-reviewed contract pack covering the
@@ -127,9 +139,9 @@ larger development suite is deliberately not copied into the curated repository.
 
 ## Support
 
-Use [GitHub Issues](../../issues) for bug reports, feature requests, and usage
-questions. Do not include credentials, private repository content, or local
-`.agent-mesh/` state in a public issue.
+Use [GitHub Issues](https://github.com/cbalgeman/agent-mesh/issues) for bug
+reports, feature requests, and usage questions. Do not include credentials,
+private repository content, or local `.agent-mesh/` state in a public issue.
 
 ## License
 
