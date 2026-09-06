@@ -15,6 +15,7 @@ NOT prove that an arbitrary earlier prefix line was not rewritten in place at th
 that requires the full walk (kept as the audit backstop). This is acceptable because event-backed
 writers are append-only through ``append_event``.
 """
+
 from __future__ import annotations
 
 import json
@@ -87,8 +88,14 @@ def verify_chain(events_path: str | Path, *, anchor: ChainAnchor | None = None) 
     except FileNotFoundError:
         return ChainResult(False, 0, f"events log not found: {path}", None)
     if anchor is None:
-        return _verify_suffix(data, 0, SENTINEL_PREV_HASH, 1)
+        return verify_chain_bytes(data)
     return _verify_from_anchor(data, anchor)
+
+
+def verify_chain_bytes(data: bytes) -> ChainResult:
+    """Verify one already captured canonical-log snapshot without reading again."""
+
+    return _verify_suffix(data, 0, SENTINEL_PREV_HASH, 1)
 
 
 def _verify_from_anchor(data: bytes, anchor: ChainAnchor) -> ChainResult:
@@ -106,7 +113,10 @@ def _verify_from_anchor(data: bytes, anchor: ChainAnchor) -> ChainResult:
         tail_hash = hash_event_line(data.splitlines(keepends=True)[-1])
         if tail_hash != anchor.last_hash:
             return ChainResult(
-                False, 0, f"tail rewritten since anchor (expected {anchor.last_hash}, got {tail_hash})", None
+                False,
+                0,
+                f"tail rewritten since anchor (expected {anchor.last_hash}, got {tail_hash})",
+                None,
             )
         return ChainResult(True, 0)
     # now_size > anchor.size: there is an appended suffix.
@@ -146,6 +156,8 @@ def _check_line(line: bytes, line_number: int, previous_hash: str, expected_seq:
         record = json.loads(line)
     except json.JSONDecodeError as exc:
         return f"line {line_number} invalid JSON: {exc.msg}"
+    if not isinstance(record, dict):
+        return f"line {line_number} event record must be a JSON object"
     actual_prev = record.get("prev_event_hash")
     if actual_prev != previous_hash:
         return (
@@ -154,7 +166,5 @@ def _check_line(line: bytes, line_number: int, previous_hash: str, expected_seq:
         )
     actual_seq = record.get("event_seq")
     if actual_seq != expected_seq:
-        return (
-            f"line {line_number} event_seq mismatch (expected {expected_seq}, got {actual_seq})"
-        )
+        return f"line {line_number} event_seq mismatch (expected {expected_seq}, got {actual_seq})"
     return None

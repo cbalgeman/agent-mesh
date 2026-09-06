@@ -65,6 +65,14 @@ class RunPlan:
     status: str = "dry_run"
     planned_utc: str = ""
     grounding: dict = field(default_factory=dict)
+    policy_id: str = ""
+    policy_digest: str = ""
+    attempt_number: int = 0
+    previous_attempt_id: str = ""
+    management_level: str = ""
+    runtime_profile: str = ""
+    effective_capability_evidence_digest: str = ""
+    capability_receipt: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -92,6 +100,7 @@ class AgentRunRequest:
     session_uuid: str
     project_root: Path
     prompt: str
+    workstream: str = ""
     timeout_seconds: int = 3600
 
 
@@ -112,6 +121,7 @@ class AgentLaunchSpec:
     metadata: dict[str, object] = field(default_factory=dict)
     stdout_file: Path | None = None
     environment: dict[str, str] | None = field(default=None, repr=False, compare=False)
+    child_instance_handle: str = field(default="", repr=False, compare=False)
 
 
 @dataclass(frozen=True)

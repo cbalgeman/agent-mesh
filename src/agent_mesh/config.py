@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent_mesh.core.ids import new_ulid
 from agent_mesh.core.lock import acquire
+from agent_mesh.core.decision_glob import DecisionGlobError, compile_meshglob
 
 
 DEFAULT_CONFIG_NAME = "config.toml"
@@ -24,8 +25,24 @@ STATE_SHARING_LOCAL_ONLY = "local-only"
 STATE_SHARING_GIT_SHARED = "git-shared"
 STATE_SHARING_CHOICES = (STATE_SHARING_LOCAL_ONLY, STATE_SHARING_GIT_SHARED)
 RUNTIME_CAPABILITY_CHOICES = ("repository", "tools", "network")
+REVIEW_ASSURANCE_ENFORCEMENT_CHOICES = ("advisory", "blocking")
+REVIEW_ASSURANCE_INDEPENDENCE_CHOICES = (
+    "distinct_instance",
+    "distinct_context",
+    "distinct_instance_and_context",
+)
+DEFAULT_CONTEXT_BUDGET_BYTES = 128 * 1024
+MAX_CONTEXT_BUDGET_BYTES = 64 * 1024 * 1024
+MAX_CONTEXT_BUDGET_PATHS = 32
+LOCAL_RUNTIME_DRIVER_SOURCE = "project-local"
+LOCAL_RUNTIME_DRIVER_PROTOCOL = "agent-mesh.runtime-driver.v1"
+LOCAL_RUNTIME_ADAPTER_RE = re.compile(
+    r"^local:[a-z0-9](?:[a-z0-9._-]{0,62}):[a-z0-9](?:[a-z0-9._-]{0,62})$"
+)
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 PROJECT_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 STORE_ID_RE = re.compile(r"^store_[0-9A-HJKMNP-TV-Z]{26}$")
+LEGACY_STORE_ID_RE = re.compile(r"^repo-[0-9a-f]{16}$")
 
 
 class ConfigError(RuntimeError):
@@ -70,6 +87,56 @@ class WorkbenchConfig:
 
 
 @dataclass(frozen=True)
+class IdentityConfig:
+    """Scoped non-human principals permitted to perform automatic runtime handshakes."""
+
+    integration_registrars: tuple[str, ...] = ("agent-mesh-runtime",)
+    cross_project_instance_mappings: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DecisionApprovalConfig:
+    """Direct-human decision authority, separate from agent routing identities.
+
+    ``human_approvers=None`` is the explicit legacy-compatibility state: existing
+    participant-based approval behavior remains available until a project opts
+    into the separated authority.  An empty configured authority is not valid.
+    """
+
+    human_approvers: tuple[str, ...] | None = None
+
+    @property
+    def migrated(self) -> bool:
+        return self.human_approvers is not None
+
+
+@dataclass(frozen=True)
+class ReviewAssuranceConfig:
+    """Project policy for subject-bound ``review.v1`` assurance evidence."""
+
+    enforcement: str = "advisory"
+    reviewer_roles: tuple[str, ...] = ()
+    independence: str = "distinct_instance"
+    quorum: int = 1
+    validity_seconds: int = 7 * 24 * 60 * 60
+    covered_decisions: tuple[str, ...] = ()
+    path_globs: tuple[str, ...] = ()
+    backlog_transitions: tuple[str, ...] = ()
+    release_gates: tuple[str, ...] = ()
+    artifact_roots: tuple[str, ...] = ("docs", ".agent-mesh/reviews")
+    authorized_uri_schemes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ContextBudgetConfig:
+    """Local report scope for resident instruction and generated hook context."""
+
+    ceiling_bytes: int = DEFAULT_CONTEXT_BUDGET_BYTES
+    instruction_paths: tuple[str, ...] = ("AGENTS.md", "CLAUDE.md", "MEMORY.md")
+    hook_sample_paths: tuple[str, ...] = ("AGENTS.md",)
+
+
+@dataclass(frozen=True)
 class AdapterDeclaration:
     name: str
     class_path: str
@@ -90,6 +157,7 @@ class RuntimeProfile:
     binary: str
     version: str
     model: str
+    durable_role: str
     role: str
     permission_mode: str
     repository_scope: str
@@ -97,7 +165,16 @@ class RuntimeProfile:
     authentication_mode: str
     billing_mode: str
     credential_denylist: tuple[str, ...]
+    adapter_trust: str
+    session_identity_mode: str
+    resumable: bool
+    concurrent_attachment: bool
+    terminal_observation: str
     enabled: bool = False
+    driver_source: str = "builtin"
+    driver_protocol: str = ""
+    driver_manifest: str = ""
+    driver_manifest_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -128,6 +205,10 @@ class AgentMeshConfig:
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     checks: ChecksConfig = field(default_factory=ChecksConfig)
     workbench: WorkbenchConfig = field(default_factory=WorkbenchConfig)
+    identity: IdentityConfig = field(default_factory=IdentityConfig)
+    decision_approval: DecisionApprovalConfig = field(default_factory=DecisionApprovalConfig)
+    review_assurance: ReviewAssuranceConfig = field(default_factory=ReviewAssuranceConfig)
+    context_budget: ContextBudgetConfig = field(default_factory=ContextBudgetConfig)
     adapters: dict[str, AdapterDeclaration] = field(default_factory=dict)
     runtime_profiles: dict[str, RuntimeProfile] = field(default_factory=dict)
 
@@ -164,11 +245,99 @@ class AgentMeshConfig:
     def canonical_recipients(self, raw_to: str) -> list[str]:
         return self.routing.aliases.get(raw_to, [raw_to])
 
-    def runtime_profile_for_target(self, target: str) -> RuntimeProfile:
+    @property
+    def decision_approval_identities(self) -> tuple[str, ...]:
+        """Return current direct-human approvers without rewriting legacy authority."""
+
+        configured = self.decision_approval.human_approvers
+        return configured if configured is not None else tuple(self.participants)
+
+    @property
+    def decision_approval_diagnosis(self) -> str:
+        return (
+            "configured"
+            if self.decision_approval.migrated
+            else "unmigrated_participant_compatibility"
+        )
+
+    @property
+    def decision_approval_authority_mode(self) -> str:
+        """Return the explicit compatibility mode bound into new approvals."""
+
+        return (
+            "explicit_human_approvers" if self.decision_approval.migrated else "legacy_participants"
+        )
+
+    @property
+    def decision_approval_authority_revision(self) -> str:
+        """Content commitment for the authority used by a new acceptance event."""
+
+        payload = {
+            "mode": self.decision_approval_authority_mode,
+            "approvers": list(self.decision_approval_identities),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def runtime_profiles_for_target(
+        self,
+        target: str,
+        *,
+        durable_role: str | None = None,
+        required_capabilities: tuple[str, ...] = (),
+    ) -> tuple[RuntimeProfile, ...]:
+        required = set(required_capabilities)
+        return tuple(
+            sorted(
+                (
+                    profile
+                    for profile in self.runtime_profiles.values()
+                    if profile.enabled
+                    and profile.target == target
+                    and (durable_role is None or profile.durable_role == durable_role)
+                    and required.issubset(profile.required_capabilities)
+                ),
+                key=lambda profile: profile.name,
+            )
+        )
+
+    def runtime_profile_for_target(
+        self,
+        target: str,
+        *,
+        profile_name: str | None = None,
+        durable_role: str | None = None,
+        required_capabilities: tuple[str, ...] = (),
+    ) -> RuntimeProfile:
+        if profile_name:
+            profile = self.runtime_profiles.get(profile_name)
+            if profile is None:
+                raise ConfigError(f"unknown dispatch runtime profile {profile_name!r}")
+            if not profile.enabled:
+                raise ConfigError(f"dispatch runtime profile {profile_name!r} is disabled")
+            if profile.target != target:
+                raise ConfigError(
+                    f"dispatch runtime profile {profile_name!r} targets "
+                    f"{profile.target!r}, not {target!r}"
+                )
+            if durable_role is not None and profile.durable_role != durable_role:
+                raise ConfigError(
+                    f"dispatch runtime profile {profile_name!r} has durable role "
+                    f"{profile.durable_role!r}, not {durable_role!r}"
+                )
+            missing = sorted(set(required_capabilities) - set(profile.required_capabilities))
+            if missing:
+                raise ConfigError(
+                    f"dispatch runtime profile {profile_name!r} does not declare required "
+                    f"capabilities: {', '.join(missing)}"
+                )
+            return profile
         matches = [
-            profile
-            for profile in self.runtime_profiles.values()
-            if profile.enabled and profile.target == target
+            *self.runtime_profiles_for_target(
+                target,
+                durable_role=durable_role,
+                required_capabilities=required_capabilities,
+            )
         ]
         if not matches:
             raise ConfigError(
@@ -178,7 +347,8 @@ class AgentMeshConfig:
         if len(matches) > 1:
             names = ", ".join(sorted(profile.name for profile in matches))
             raise ConfigError(
-                f"multiple enabled dispatch runtime profiles for participant {target!r}: {names}"
+                f"multiple enabled dispatch runtime profiles are eligible for participant "
+                f"{target!r}: {names}; select one explicitly"
             )
         return matches[0]
 
@@ -214,7 +384,7 @@ def load_config(start: str | Path | None = None) -> AgentMeshConfig:
     paths_data = _table(data.get("paths", {}), "paths")
     version_control_data = _table(data.get("version_control", {}), "version_control")
 
-    project_name = str(project_data.get("name", root.name))
+    project_name = str(project_data.get("name", data.get("name", root.name)))
     project_timezone = _project_timezone(
         project_data.get("timezone", "UTC"),
         "project.timezone",
@@ -334,6 +504,173 @@ def load_config(start: str | Path | None = None) -> AgentMeshConfig:
         ),
     )
 
+    identity_data = _table(data.get("identity", {}), "identity")
+    integration_registrars = tuple(
+        _list_of_strings(
+            identity_data.get("integration_registrars", ["agent-mesh-runtime"]),
+            "identity.integration_registrars",
+        )
+    )
+    if not integration_registrars or any(not item.strip() for item in integration_registrars):
+        raise ConfigError("identity.integration_registrars must contain non-empty principals")
+    if len(set(integration_registrars)) != len(integration_registrars):
+        raise ConfigError("identity.integration_registrars must not contain duplicates")
+    cross_project_instance_mappings = _dict_of_strings(
+        identity_data.get("cross_project_instance_mappings", {}),
+        "identity.cross_project_instance_mappings",
+    )
+    identity = IdentityConfig(
+        integration_registrars=integration_registrars,
+        cross_project_instance_mappings=cross_project_instance_mappings,
+    )
+
+    if "decision_approval" in data:
+        approval_data = _table(data.get("decision_approval"), "decision_approval")
+        human_approvers = tuple(
+            _list_of_strings(
+                approval_data.get("human_approvers"),
+                "decision_approval.human_approvers",
+            )
+        )
+        if not human_approvers:
+            raise ConfigError(
+                "decision_approval.human_approvers must contain at least one identity"
+            )
+        if len(set(human_approvers)) != len(human_approvers):
+            raise ConfigError("decision_approval.human_approvers must not contain duplicates")
+        unknown_approvers = sorted(set(human_approvers) - set(participants))
+        if unknown_approvers:
+            raise ConfigError(
+                "decision_approval.human_approvers references unknown participant(s): "
+                + ", ".join(unknown_approvers)
+            )
+        decision_approval = DecisionApprovalConfig(human_approvers=human_approvers)
+    else:
+        decision_approval = DecisionApprovalConfig()
+
+    review_data = _table(data.get("review_assurance", {}), "review_assurance")
+    review_enforcement = str(review_data.get("enforcement", "advisory")).strip()
+    if review_enforcement not in REVIEW_ASSURANCE_ENFORCEMENT_CHOICES:
+        raise ConfigError("review_assurance.enforcement must be advisory or blocking")
+    review_independence = str(review_data.get("independence", "distinct_instance")).strip()
+    if review_independence not in REVIEW_ASSURANCE_INDEPENDENCE_CHOICES:
+        raise ConfigError(
+            "review_assurance.independence must be distinct_instance, "
+            "distinct_context, or distinct_instance_and_context"
+        )
+    review_quorum = review_data.get("quorum", 1)
+    review_validity_seconds = review_data.get("validity_seconds", 7 * 24 * 60 * 60)
+    if isinstance(review_quorum, bool) or not isinstance(review_quorum, int) or review_quorum < 1:
+        raise ConfigError("review_assurance.quorum must be an integer >= 1")
+    if (
+        isinstance(review_validity_seconds, bool)
+        or not isinstance(review_validity_seconds, int)
+        or review_validity_seconds < 60
+        or review_validity_seconds > 365 * 24 * 60 * 60
+    ):
+        raise ConfigError("review_assurance.validity_seconds must be between 60 and 31536000")
+    reviewer_roles = tuple(
+        _list_of_strings(
+            review_data.get("reviewer_roles", []),
+            "review_assurance.reviewer_roles",
+        )
+    )
+    artifact_roots = tuple(
+        _list_of_strings(
+            review_data.get("artifact_roots", ["docs", ".agent-mesh/reviews"]),
+            "review_assurance.artifact_roots",
+        )
+    )
+    for index, root_value in enumerate(artifact_roots):
+        candidate = Path(root_value)
+        if candidate.is_absolute() or ".." in candidate.parts or not candidate.parts:
+            raise ConfigError(
+                f"review_assurance.artifact_roots[{index}] must be a non-escaping "
+                "repository-relative path"
+            )
+    path_globs = tuple(
+        _list_of_strings(
+            review_data.get("path_globs", []),
+            "review_assurance.path_globs",
+        )
+    )
+    for index, pattern in enumerate(path_globs):
+        try:
+            compile_meshglob(pattern)
+        except DecisionGlobError as exc:
+            raise ConfigError(
+                f"review_assurance.path_globs[{index}] is not valid meshglob-v1: {exc}"
+            ) from exc
+    if review_enforcement == "blocking" and not reviewer_roles:
+        raise ConfigError("blocking review_assurance requires at least one reviewer role")
+    if review_enforcement == "blocking" and not artifact_roots:
+        raise ConfigError("blocking review_assurance requires at least one artifact root")
+    uri_schemes = tuple(
+        _list_of_strings(
+            review_data.get("authorized_uri_schemes", []),
+            "review_assurance.authorized_uri_schemes",
+        )
+    )
+    if any(not re.fullmatch(r"[a-z][a-z0-9+.-]{0,31}", item) for item in uri_schemes):
+        raise ConfigError("review_assurance.authorized_uri_schemes contains an invalid URI scheme")
+    review_assurance = ReviewAssuranceConfig(
+        enforcement=review_enforcement,
+        reviewer_roles=reviewer_roles,
+        independence=review_independence,
+        quorum=review_quorum,
+        validity_seconds=review_validity_seconds,
+        covered_decisions=tuple(
+            _list_of_strings(
+                review_data.get("covered_decisions", []),
+                "review_assurance.covered_decisions",
+            )
+        ),
+        path_globs=path_globs,
+        backlog_transitions=tuple(
+            _list_of_strings(
+                review_data.get("backlog_transitions", []),
+                "review_assurance.backlog_transitions",
+            )
+        ),
+        release_gates=tuple(
+            _list_of_strings(
+                review_data.get("release_gates", []),
+                "review_assurance.release_gates",
+            )
+        ),
+        artifact_roots=artifact_roots,
+        authorized_uri_schemes=uri_schemes,
+    )
+
+    context_budget_data = _table(data.get("context_budget", {}), "context_budget")
+    context_ceiling = context_budget_data.get(
+        "ceiling_bytes", DEFAULT_CONTEXT_BUDGET_BYTES
+    )
+    if (
+        isinstance(context_ceiling, bool)
+        or not isinstance(context_ceiling, int)
+        or context_ceiling < 1
+        or context_ceiling > MAX_CONTEXT_BUDGET_BYTES
+    ):
+        raise ConfigError(
+            f"context_budget.ceiling_bytes must be between 1 and {MAX_CONTEXT_BUDGET_BYTES}"
+        )
+    context_budget = ContextBudgetConfig(
+        ceiling_bytes=context_ceiling,
+        instruction_paths=_context_budget_paths(
+            context_budget_data.get(
+                "instruction_paths", ["AGENTS.md", "CLAUDE.md", "MEMORY.md"]
+            ),
+            "context_budget.instruction_paths",
+            root_files_only=True,
+        ),
+        hook_sample_paths=_context_budget_paths(
+            context_budget_data.get("hook_sample_paths", ["AGENTS.md"]),
+            "context_budget.hook_sample_paths",
+            root_files_only=False,
+        ),
+    )
+
     adapters = _adapter_declarations(data.get("adapters", None))
     dispatch_data = _table(data.get("dispatch", {}), "dispatch")
     runtime_profiles = _runtime_profiles(
@@ -359,6 +696,10 @@ def load_config(start: str | Path | None = None) -> AgentMeshConfig:
         routing=routing,
         checks=checks,
         workbench=workbench,
+        identity=identity,
+        decision_approval=decision_approval,
+        review_assurance=review_assurance,
+        context_budget=context_budget,
         adapters=adapters,
         runtime_profiles=runtime_profiles,
     )
@@ -429,7 +770,30 @@ def default_config_text(
         "\n"
         "[compatibility_views.outbox]\n"
         "\n"
+        "[identity]\n"
+        'integration_registrars = ["agent-mesh-runtime"]\n'
+        "\n"
+        "[identity.cross_project_instance_mappings]\n"
+        "\n"
         "[workbench]\n"
+        "\n"
+        "[review_assurance]\n"
+        'enforcement = "advisory"\n'
+        'independence = "distinct_instance"\n'
+        "quorum = 1\n"
+        "validity_seconds = 604800\n"
+        "reviewer_roles = []\n"
+        "covered_decisions = []\n"
+        "path_globs = []\n"
+        "backlog_transitions = []\n"
+        "release_gates = []\n"
+        'artifact_roots = ["docs", ".agent-mesh/reviews"]\n'
+        "authorized_uri_schemes = []\n"
+        "\n"
+        "[context_budget]\n"
+        f"ceiling_bytes = {DEFAULT_CONTEXT_BUDGET_BYTES}\n"
+        'instruction_paths = ["AGENTS.md", "CLAUDE.md", "MEMORY.md"]\n'
+        'hook_sample_paths = ["AGENTS.md"]\n'
         "\n"
         "[dispatch]\n"
         "\n"
@@ -458,11 +822,23 @@ def project_identity_status(repo: str | Path) -> dict[str, Any]:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         return {"complete": False, "error": str(exc)}
     project = data.get("project")
+    if project is None:
+        return {
+            "complete": False,
+            "error": "legacy top-level config requires a [project] table",
+            "migration_kind": "legacy_top_level",
+            "remediation": "run agent-mesh adopt to migrate project identity safely",
+        }
     if not isinstance(project, dict):
-        return {"complete": False, "error": "missing [project] table"}
+        return {"complete": False, "error": "[project] must be a table"}
     missing = [field for field in ("timezone", "key", "store_id") if not project.get(field)]
     if missing:
-        return {"complete": False, "missing": missing}
+        return {
+            "complete": False,
+            "missing": missing,
+            "migration_kind": "missing_project_fields",
+            "remediation": "run agent-mesh adopt to fill missing project identity fields",
+        }
     try:
         timezone_name = _project_timezone(project["timezone"], "project.timezone")
         key = _project_key(project["key"], "project.key")
@@ -470,7 +846,12 @@ def project_identity_status(repo: str | Path) -> dict[str, Any]:
     except ConfigError as exc:
         return {"complete": False, "error": str(exc)}
     if not STORE_ID_RE.fullmatch(store_id):
-        return {"complete": False, "error": "project.store_id requires migration"}
+        return {
+            "complete": False,
+            "error": "project.store_id requires migration",
+            "migration_kind": "legacy_store_id",
+            "remediation": "run agent-mesh adopt to replace the legacy project store ID",
+        }
     return {
         "complete": True,
         "timezone": timezone_name,
@@ -507,14 +888,41 @@ def _ensure_project_identity_config_locked(
     """Perform one identity migration while the repository lock is held."""
     root = find_project_root(repo)
     config_path = root / ".agent-mesh" / DEFAULT_CONFIG_NAME
-    text = config_path.read_text(encoding="utf-8")
+    text = config_path.read_bytes().decode("utf-8")
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"cannot migrate invalid config {config_path}: {exc}") from exc
     project = data.get("project")
+    if project is None:
+        legacy_config = load_config(root)
+        timezone_value = _project_timezone(
+            timezone_name or detect_local_timezone(),
+            "project.timezone",
+        )
+        key_value = _project_key(
+            project_key or project_key_from_name(legacy_config.project_name or root.name),
+            "project.key",
+        )
+        store_value = new_ulid("store")
+        project_block = (
+            "[project]\n"
+            f"name = {json.dumps(legacy_config.project_name or root.name)}\n"
+            f"timezone = {json.dumps(timezone_value)}\n"
+            f"key = {json.dumps(key_value)}\n"
+            f"store_id = {json.dumps(store_value)}\n"
+            f"default_sender = {json.dumps(legacy_config.default_sender)}\n"
+            f"default_recipient = {json.dumps(legacy_config.default_recipient)}\n"
+        )
+        separator = ""
+        if text and not text.endswith("\n"):
+            separator += "\n"
+        if text and not text.endswith("\n\n"):
+            separator += "\n"
+        _atomic_write_text(config_path, f"{text}{separator}{project_block}")
+        return ProjectIdentityUpdate(True, timezone_value, key_value, store_value)
     if not isinstance(project, dict):
-        raise ConfigError(f"cannot migrate config without [project]: {config_path}")
+        raise ConfigError(f"cannot migrate config with non-table [project]: {config_path}")
 
     existing_timezone = project.get("timezone")
     existing_key = project.get("key")
@@ -621,7 +1029,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
     temporary_path = Path(temporary_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -726,6 +1134,37 @@ def _list_of_strings(value: Any, name: str) -> list[str]:
     return list(value)
 
 
+def _context_budget_paths(
+    value: Any,
+    name: str,
+    *,
+    root_files_only: bool,
+) -> tuple[str, ...]:
+    values = _list_of_strings(value, name)
+    if len(values) > MAX_CONTEXT_BUDGET_PATHS:
+        raise ConfigError(f"{name} must contain at most {MAX_CONTEXT_BUDGET_PATHS} paths")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(values):
+        path = Path(raw)
+        if (
+            not raw
+            or "\x00" in raw
+            or path.is_absolute()
+            or ".." in path.parts
+            or not path.parts
+        ):
+            raise ConfigError(f"{name}[{index}] must be a non-escaping repository-relative path")
+        clean = Path(*[part for part in path.parts if part not in {"", "."}]).as_posix()
+        if root_files_only and len(Path(clean).parts) != 1:
+            raise ConfigError(f"{name}[{index}] must name a repository-root file")
+        if clean in seen:
+            raise ConfigError(f"{name} must not contain duplicate paths")
+        normalized.append(clean)
+        seen.add(clean)
+    return tuple(normalized)
+
+
 def _optional_string(value: Any, name: str) -> str | None:
     if value is None:
         return None
@@ -790,7 +1229,7 @@ def _store_id_or_legacy(value: Any, name: str) -> str:
     if not isinstance(value, str):
         raise ConfigError(f"{name} must be a string")
     normalized = value.strip()
-    if STORE_ID_RE.fullmatch(normalized) or re.fullmatch(r"repo-[0-9a-f]{16}", normalized):
+    if STORE_ID_RE.fullmatch(normalized) or LEGACY_STORE_ID_RE.fullmatch(normalized):
         return normalized
     raise ConfigError(f"{name} must be a store_<ULID> identifier")
 
@@ -870,7 +1309,6 @@ def _runtime_profiles(
         raise ConfigError("[dispatch.runtime_profiles] must be a table")
 
     profiles: dict[str, RuntimeProfile] = {}
-    enabled_targets: dict[str, str] = {}
     required_strings = (
         "target",
         "provider",
@@ -878,11 +1316,15 @@ def _runtime_profiles(
         "binary",
         "version",
         "model",
+        "durable_role",
         "role",
         "permission_mode",
         "repository_scope",
         "authentication_mode",
         "billing_mode",
+        "adapter_trust",
+        "session_identity_mode",
+        "terminal_observation",
     )
     for raw_name, raw_profile in value.items():
         name = str(raw_name)
@@ -949,6 +1391,94 @@ def _runtime_profiles(
         enabled_value = raw_profile.get("enabled", False)
         if not isinstance(enabled_value, bool):
             raise ConfigError(f"dispatch.runtime_profiles.{name}.enabled must be a boolean")
+        resumable = raw_profile.get("resumable")
+        concurrent_attachment = raw_profile.get("concurrent_attachment")
+        if not isinstance(resumable, bool):
+            raise ConfigError(f"dispatch.runtime_profiles.{name}.resumable must be a boolean")
+        if not isinstance(concurrent_attachment, bool):
+            raise ConfigError(
+                f"dispatch.runtime_profiles.{name}.concurrent_attachment must be a boolean"
+            )
+        driver_source = _required_nonempty_string(
+            raw_profile.get("driver_source", "builtin"),
+            f"dispatch.runtime_profiles.{name}.driver_source",
+        )
+        driver_protocol = str(raw_profile.get("driver_protocol", "")).strip()
+        driver_manifest = str(raw_profile.get("driver_manifest", "")).strip()
+        driver_manifest_sha256 = str(raw_profile.get("driver_manifest_sha256", "")).strip()
+        if driver_source not in {"builtin", LOCAL_RUNTIME_DRIVER_SOURCE}:
+            raise ConfigError(
+                f"dispatch.runtime_profiles.{name}.driver_source must be builtin or "
+                f"{LOCAL_RUNTIME_DRIVER_SOURCE}"
+            )
+        if driver_source == LOCAL_RUNTIME_DRIVER_SOURCE:
+            if not LOCAL_RUNTIME_ADAPTER_RE.fullmatch(values["adapter"]):
+                raise ConfigError(
+                    f"dispatch.runtime_profiles.{name}.adapter must use "
+                    "local:<owner>:<runtime> for a project-local driver"
+                )
+            if values["adapter_trust"] != LOCAL_RUNTIME_DRIVER_SOURCE:
+                raise ConfigError(
+                    f"dispatch.runtime_profiles.{name}.adapter_trust must be "
+                    f"'{LOCAL_RUNTIME_DRIVER_SOURCE}'"
+                )
+            if driver_protocol != LOCAL_RUNTIME_DRIVER_PROTOCOL:
+                raise ConfigError(
+                    f"dispatch.runtime_profiles.{name}.driver_protocol must be "
+                    f"'{LOCAL_RUNTIME_DRIVER_PROTOCOL}'"
+                )
+            manifest_path = Path(driver_manifest)
+            if not driver_manifest or manifest_path.is_absolute() or ".." in manifest_path.parts:
+                raise ConfigError(
+                    f"dispatch.runtime_profiles.{name}.driver_manifest must be a "
+                    "project-relative non-escaping path"
+                )
+            if not SHA256_RE.fullmatch(driver_manifest_sha256):
+                raise ConfigError(
+                    f"dispatch.runtime_profiles.{name}.driver_manifest_sha256 must be "
+                    "64 lowercase hex characters"
+                )
+            if (
+                values["session_identity_mode"] != "none"
+                or resumable
+                or concurrent_attachment
+                or values["terminal_observation"] != "process"
+            ):
+                raise ConfigError(
+                    f"dispatch.runtime_profiles.{name} project-local V1 drivers support "
+                    "only none/non-resumable/non-concurrent/process lifecycle"
+                )
+        else:
+            if values["adapter"].startswith("local:"):
+                raise ConfigError(
+                    f"dispatch.runtime_profiles.{name}.adapter reserves local: for "
+                    "project-local drivers"
+                )
+            if values["adapter_trust"] != "configured":
+                raise ConfigError(
+                    f"dispatch.runtime_profiles.{name}.adapter_trust must be 'configured'"
+                )
+            if driver_protocol or driver_manifest or driver_manifest_sha256:
+                raise ConfigError(
+                    f"dispatch.runtime_profiles.{name} builtin drivers must not set "
+                    "project-local driver fields"
+                )
+        if values["session_identity_mode"] not in {"exact", "none"}:
+            raise ConfigError(
+                f"dispatch.runtime_profiles.{name}.session_identity_mode must be exact or none"
+            )
+        if values["terminal_observation"] not in {"process", "provider", "none"}:
+            raise ConfigError(
+                f"dispatch.runtime_profiles.{name}.terminal_observation must be process, provider, or none"
+            )
+        if resumable and values["session_identity_mode"] != "exact":
+            raise ConfigError(
+                f"dispatch.runtime_profiles.{name}.resumable requires session_identity_mode='exact'"
+            )
+        if not resumable and values["terminal_observation"] == "none":
+            raise ConfigError(
+                f"dispatch.runtime_profiles.{name}.terminal_observation must observe non-resumable runtimes"
+            )
         profile = RuntimeProfile(
             name=name,
             target=target,
@@ -957,6 +1487,7 @@ def _runtime_profiles(
             binary=values["binary"],
             version=values["version"],
             model=values["model"],
+            durable_role=values["durable_role"],
             role=values["role"],
             permission_mode=values["permission_mode"],
             repository_scope=values["repository_scope"],
@@ -964,16 +1495,17 @@ def _runtime_profiles(
             authentication_mode=values["authentication_mode"],
             billing_mode=values["billing_mode"],
             credential_denylist=denylist,
+            adapter_trust=values["adapter_trust"],
+            session_identity_mode=values["session_identity_mode"],
+            resumable=resumable,
+            concurrent_attachment=concurrent_attachment,
+            terminal_observation=values["terminal_observation"],
             enabled=enabled_value,
+            driver_source=driver_source,
+            driver_protocol=driver_protocol,
+            driver_manifest=driver_manifest,
+            driver_manifest_sha256=driver_manifest_sha256,
         )
-        if profile.enabled and target in enabled_targets:
-            other = enabled_targets[target]
-            raise ConfigError(
-                f"dispatch runtime profiles {other!r} and {name!r} are both enabled for "
-                f"participant {target!r}"
-            )
-        if profile.enabled:
-            enabled_targets[target] = name
         profiles[name] = profile
     return profiles
 

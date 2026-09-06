@@ -1,4 +1,4 @@
-"""Prefixed ULID minting, shared by every domain that needs a sortable opaque id.
+"""Shared identifier minting for public records and internal lifecycle objects.
 
 A ULID body is a 26-char Crockford base-32 encoding of a 128-bit value: a 48-bit millisecond
 timestamp in the high bits (so ids sort by creation time) plus 80 bits of randomness. The mesh uses
@@ -7,10 +7,37 @@ they all share this one implementation so the format can never drift between dom
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime
+import re
 import secrets
 import time
 
 _CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+_PUBLIC_MESSAGE_PREFIXES = frozenset({"REQ", "RES"})
+
+
+def new_public_message_id(
+    prefix: str,
+    actor: str,
+    *,
+    occurred_at: datetime | None = None,
+) -> str:
+    """Return the sole human- and machine-facing identifier for a REQ or RES.
+
+    Internal ULIDs remain appropriate for events, policies, runs, and leases. Messages are
+    different: their canonical entity identifier is also their public reference, so every writer
+    must use the same readable format.
+    """
+
+    normalized_prefix = prefix.strip().upper()
+    if normalized_prefix not in _PUBLIC_MESSAGE_PREFIXES:
+        raise ValueError("public message prefix must be REQ or RES")
+    instant = occurred_at or datetime.now(UTC)
+    if instant.tzinfo is None:
+        raise ValueError("occurred_at must be timezone-aware")
+    stamp = instant.astimezone(UTC).replace(microsecond=0).strftime("%Y%m%dT%H%M%SZ")
+    safe_actor = re.sub(r"[^A-Za-z0-9_-]+", "-", actor).strip("-_").upper()[:20] or "ACTOR"
+    return f"{normalized_prefix}-{stamp}-{safe_actor}-{secrets.randbelow(100000):05d}"
 
 
 def new_ulid(prefix: str) -> str:

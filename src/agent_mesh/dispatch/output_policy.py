@@ -106,6 +106,47 @@ def extract_response_candidate(
     return ResponseCandidateDecision(status="accepted", reason="ok", body=body, summary=_summary(body))
 
 
+def extract_final_message_candidate(
+    result: AgentLaunchResult, *, max_body_chars: int = DEFAULT_MAX_BODY_CHARS
+) -> ResponseCandidateDecision:
+    """Accept one provider-protocol final message as the response boundary.
+
+    A built-in runtime may call this only when its trusted protocol has already
+    separated the final assistant message from tool output and transport logs.
+    Explicit textual markers remain valid for compatibility. Ordinary process
+    stdout must continue through :func:`extract_response_candidate`.
+    """
+
+    if result.status != "completed" or result.exit_code != 0:
+        return extract_response_candidate(result, max_body_chars=max_body_chars)
+
+    stdout_raw = result.stdout.replace("\r\n", "\n").replace("\r", "\n")
+    if _has_unterminated_terminal_string(stdout_raw):
+        return ResponseCandidateDecision(
+            status="rejected",
+            reason="unterminated_terminal_control",
+            safe_detail="unterminated terminal string control detected",
+        )
+    stdout = _normalize_stdout(stdout_raw)
+    if RESPONSE_BEGIN in stdout or RESPONSE_END in stdout:
+        return extract_response_candidate(result, max_body_chars=max_body_chars)
+
+    body = stdout.strip()
+    if not body:
+        return ResponseCandidateDecision(
+            status="rejected",
+            reason="empty_response_body",
+            safe_detail="provider final message was empty",
+        )
+    if len(body) > max_body_chars:
+        return ResponseCandidateDecision(
+            status="rejected",
+            reason="response_body_too_large",
+            safe_detail=f"body_chars={len(body)} max_body_chars={max_body_chars}",
+        )
+    return ResponseCandidateDecision(status="accepted", reason="ok", body=body, summary=_summary(body))
+
+
 def _has_unterminated_terminal_string(stdout: str) -> bool:
     without_terminated = _STRING_CONTROL_RE.sub("", _OSC_RE.sub("", stdout))
     return bool(re.search(r"(?:\x1b\]|\x9d|\x1b[P_X^]|[\x90\x98\x9e\x9f])", without_terminated))

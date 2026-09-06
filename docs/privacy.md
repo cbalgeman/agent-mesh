@@ -13,6 +13,29 @@ The digest can still act as a correlator, so do not treat it as anonymous data.
 Instance attribution applies only to promoted Agent Mesh records and does not
 automatically copy ordinary chat transcripts.
 
+## Correction, redaction, retention, and export
+
+Agent Mesh currently supports domain-native append-only corrections. Those
+corrections preserve the earlier canonical bytes. It does not currently provide
+an emergency history-rewrite command, retrieval tombstones, automatic retention,
+or a privacy-reviewed export command.
+
+The development contract in
+[`docs/privacy-lifecycle.md`](privacy-lifecycle.md) keeps those meanings
+separate. In particular, hiding or superseding a record is not deletion;
+removing a current file is not removal from Git history, backups, caches, or
+clones; and a structural privacy class is not proof that free-form content is
+safe to publish. Development provenance is tracked by decision `D008` in the full
+development checkout. Published bundles do not contain that canonical decision
+state. The current capability statement here, actual CLI help, and release notes
+remain authoritative for public users.
+
+If sensitive content enters Agent Mesh today, stop sharing and writing, rotate
+or revoke exposed credentials, restrict access to every known copy, and obtain a
+reviewed remediation plan. Do not hand-edit `events.jsonl` or its externalized
+bodies: changing one canonical byte invalidates the downstream hash chain and
+can make replay fail.
+
 ## Privacy-first default
 
 New projects use `local-only` state sharing unless `git-shared` is selected
@@ -100,6 +123,9 @@ The final command should print nothing for a fully local-only project.
 Changing `.gitignore` does not erase prior commits, forks, caches, or clones. If
 sensitive Agent Mesh data was previously published, rotate any exposed secrets
 and either rewrite every affected ref or publish from a reviewed clean history.
+That Git operation is separate from Agent Mesh canonical redaction and requires
+explicit human authorization. It cannot establish deletion from copies outside
+the operator's control.
 
 ## Before making a repository public
 
@@ -115,7 +141,3 @@ git grep -n -I -E '(BEGIN [A-Z ]*PRIVATE KEY|api[_-]?key|access[_-]?token|passwo
 Also inspect commit authors, remote URLs, documentation examples, screenshots,
 recordings, archives, environment files, and package artifacts. Secret scanners
 reduce risk but do not replace a human review of identities and project context.
-
-The Agent Mesh package repository uses a separate positive publish manifest to
-build its curated GitHub surface. `.gitignore` remains a conventional local
-safety control; it is not used as the package release manifest.

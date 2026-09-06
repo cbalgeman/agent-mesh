@@ -1,24 +1,22 @@
 """Default adapter implementations for the mail domain."""
+
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 from agent_mesh.adapters.base import ExtractedRef, LookupAdapter, MessageBlock, RefExtractionAdapter
 from agent_mesh.config import config_from_agent_dir
+from agent_mesh.core.reference_syntax import REFERENCE_RE
 from agent_mesh.store.rebuild import rebuild_all
-from agent_mesh.store.sqlite import body_from_message_row, connect, initialize_schema, resolve_message
+from agent_mesh.store.sqlite import (
+    body_from_message_row,
+    connect,
+    initialize_schema,
+    resolve_message,
+)
 from agent_mesh.views import locate_message, render_all
 
-REF_RE = re.compile(
-    r"(?<![A-Za-z0-9_])("
-    r"D\d+(?:-(?:[SB]\d+|[A-Z]))?(?:-§[A-Za-z0-9._-]+)?|"
-    r"REQ-\d{8}T\d{6}Z-[A-Z0-9_-]+-\d{5}|"
-    r"RES-\d{8}T\d{6}Z-[A-Z0-9_-]+-\d{5}|"
-    r"FBK-[A-Za-z0-9][\w-]*|DI-[A-Za-z0-9][\w-]*|J-[A-Za-z0-9][\w-]*|"
-    r"BKL-[A-Za-z0-9][\w-]*|IMP-[A-Za-z0-9][\w-]*"
-    r")(?![A-Za-z0-9_])"
-)
+REF_RE = REFERENCE_RE
 
 
 class DefaultMessageLookupAdapter(LookupAdapter):
@@ -60,8 +58,10 @@ class DefaultRefExtractionAdapter(RefExtractionAdapter):
 
     def extract(self, text: str, *, source_field: str = "body") -> list[ExtractedRef]:
         refs: list[ExtractedRef] = []
-        for match in REF_RE.finditer(text):
-            value = match.group(1)
+        for match in REFERENCE_RE.finditer(text):
+            value = match.group("reference")
+            if value.startswith("AI-"):
+                continue
             refs.append(
                 ExtractedRef(
                     ref_type=_ref_type(value),

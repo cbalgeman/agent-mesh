@@ -9,7 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_mesh.config import AgentMeshConfig, ensure_project_dirs
-from agent_mesh.core.decision_schema import decision_lineage_summary
+from agent_mesh.core.decision_projection import decision_revision_sha_from_projection
+from agent_mesh.core.decision_schema import (
+    decision_lineage_summary,
+    decision_review_progress,
+    normalize_decision_review_policy,
+)
+from agent_mesh.message_packet import public_message_recipients, public_message_sender
 from agent_mesh.store.sqlite import body_from_message_row, connect, initialize_schema, json_loads
 
 
@@ -46,13 +52,13 @@ def render_inbox(config: AgentMeshConfig) -> RenderedView:
         parts = ["# Inbox", "", "## Open Requests", ""]
         if open_rows:
             for row in open_rows:
-                parts.extend(_request_block(row))
+                parts.extend(_request_block(conn, row))
         else:
             parts.extend(["_No open requests._", ""])
         parts.extend(["## Recent Closed Requests", ""])
         if closed_rows:
             for row in closed_rows:
-                parts.extend(_request_block(row))
+                parts.extend(_request_block(conn, row))
         else:
             parts.extend(["_No recent closed requests._", ""])
         text = "\n".join(parts).rstrip() + "\n"
@@ -84,7 +90,7 @@ def render_outboxes(config: AgentMeshConfig) -> list[RenderedView]:
             ).fetchall()
             parts = [f"# Outbox: {sender}", ""]
             for row in rows:
-                parts.extend(_response_block(row))
+                parts.extend(_response_block(conn, row))
             if not rows:
                 parts.extend(["_No responses._", ""])
             text = "\n".join(parts).rstrip() + "\n"
@@ -108,9 +114,12 @@ def render_log(config: AgentMeshConfig) -> RenderedView:
         ).fetchall()
         parts = ["# Message Log", ""]
         for row in rows:
+            sender = public_message_sender(
+                conn, str(row["sender"]), str(row["sender_instance_id"] or "")
+            )
             parts.append(
                 f"- {row['event_seq']}: {row['id']} ({row['kind']}) "
-                f"from={row['sender']} instance={row['sender_instance_id'] or ''} "
+                f"from={sender} "
                 f"thread={row['thread_id']} status={row['status']} "
                 f"created={row['created_utc']}"
             )
@@ -137,7 +146,7 @@ def render_archive(config: AgentMeshConfig) -> list[RenderedView]:
         target = archive_dir / "inbox-all.md"
         parts = ["# Archive: Inbox", ""]
         for row in rows:
-            parts.extend(_request_block(row))
+            parts.extend(_request_block(conn, row))
         if not rows:
             parts.extend(["_No archived requests._", ""])
         return [_write_one(target, "\n".join(parts).rstrip() + "\n")]
@@ -162,15 +171,28 @@ def render_decisions(config: AgentMeshConfig) -> list[RenderedView]:
             parts = [
                 f"# {row['human_id']} — {row['title']}",
                 "",
-                f"- dec_ulid: {row['dec_ulid']}",
                 f"- tier: {row['tier']}",
                 f"- tier_valid: {str(bool(row['tier_valid'])).lower()}",
                 f"- status: {row['status']}",
+                f"- applicability_scope: {row['applicability_scope']}",
                 f"- enforcement_mode: {row['enforcement_mode']}",
                 f"- owner: {row['owner'] or ''}",
-                f"- last_verified_utc: {row['last_verified_utc'] or ''}",
-                "",
             ]
+            revision_sha = decision_revision_sha_from_projection(conn, row)
+            review_progress = decision_review_progress(meta, revision_sha)
+            parts.append(f"- revision_sha: {revision_sha}")
+            if review_progress["approval_binding"] == "legacy_pre_authoring_digest":
+                parts.extend(
+                    [
+                        f"- approved_revision_sha: {review_progress['approval_revision_sha']}",
+                        "- approval_binding: legacy_pre_authoring_digest",
+                    ]
+                )
+            if row["drift_risk"]:
+                parts.append(f"- drift_risk: {row['drift_risk']}")
+            if row["last_verified_utc"]:
+                parts.append(f"- last_verified_utc: {row['last_verified_utc']}")
+            parts.append("")
             if not row["tier_valid"]:
                 parts.extend(
                     [
@@ -178,13 +200,76 @@ def render_decisions(config: AgentMeshConfig) -> list[RenderedView]:
                         "",
                     ]
                 )
+            parts.append("## Lineage")
+            if row["parent_human_id"]:
+                parts.append(f"- parent_human_id: {row['parent_human_id']}")
+            if supersedes:
+                parts.append(f"- supersedes: {supersedes}")
+            if superseded_by:
+                parts.append(f"- superseded_by: {superseded_by}")
             parts.extend(
                 [
-                    "## Lineage",
-                    f"- supersedes: {supersedes}",
-                    f"- superseded_by: {superseded_by}",
                     f"- content_revisions: {lineage.content_revisions}",
                     f"- revisit_annotations: {lineage.revisit_annotations}",
+                    "",
+                    "## Applicability",
+                ]
+            )
+            applicability_rows = conn.execute(
+                "SELECT kind, pattern FROM decision_globs WHERE dec_ulid=? ORDER BY kind, pattern",
+                (row["dec_ulid"],),
+            ).fetchall()
+            if applicability_rows:
+                for item in applicability_rows:
+                    parts.append(f"- {item['kind']}: `{item['pattern']}`")
+            else:
+                parts.append("- _No path filters._")
+            parts.extend(["", "## Assumptions"])
+            assumption_rows = conn.execute(
+                "SELECT assumption_id, status, text, references_json "
+                "FROM decision_assumptions "
+                "WHERE dec_ulid=? ORDER BY rowid",
+                (row["dec_ulid"],),
+            ).fetchall()
+            if assumption_rows:
+                for item in assumption_rows:
+                    suffix = ""
+                    references = json_loads(item["references_json"], [])
+                    if isinstance(references, list) and references:
+                        suffix = " (references: " + ", ".join(
+                            str(ref) for ref in references
+                        ) + ")"
+                    parts.append(
+                        f"- assumption {item['assumption_id']} "
+                        f"[{item['status']}]: {item['text']}{suffix}"
+                    )
+            else:
+                parts.append("- _No assumptions._")
+            parts.extend(["", "## Evidence"])
+            evidence_rows = conn.execute(
+                "SELECT evidence_kind, ref_value FROM decision_evidence "
+                "WHERE dec_ulid=? ORDER BY evidence_kind, ref_value",
+                (row["dec_ulid"],),
+            ).fetchall()
+            if evidence_rows:
+                for item in evidence_rows:
+                    parts.append(f"- evidence {item['evidence_kind']}: {item['ref_value']}")
+            else:
+                parts.append("- _No evidence._")
+            parts.extend(["", "## Review Policy"])
+            review_policy = normalize_decision_review_policy(
+                meta.get("review_policy", {}), allow_extensions=True
+            )
+            if review_policy:
+                parts.append(
+                    "- required_reviewers: "
+                    + ", ".join(review_policy["required_reviewers"])
+                )
+                parts.append(f"- approval_quorum: {review_policy['approval_quorum']}")
+            else:
+                parts.append("- _No reviewer quorum._")
+            parts.extend(
+                [
                     "",
                     "## Verification",
                 ]
@@ -226,7 +311,7 @@ def _decision_human_id(conn, dec_ulid: str | None) -> str:
     if not dec_ulid:
         return ""
     row = conn.execute("SELECT human_id FROM decisions WHERE dec_ulid=?", (dec_ulid,)).fetchone()
-    return str(row["human_id"]) if row else str(dec_ulid)
+    return str(row["human_id"]) if row else "[unresolved decision]"
 
 
 def locate_message(config: AgentMeshConfig, message_id: str) -> tuple[Path, int, int] | None:
@@ -251,18 +336,22 @@ def locate_message(config: AgentMeshConfig, message_id: str) -> tuple[Path, int,
     return None
 
 
-def _request_block(row) -> list[str]:
+def _request_block(conn, row) -> list[str]:
     body = body_from_message_row(row)
     meta = json_loads(row["meta_json"], {})
-    to_value = meta.get("original_to") or ", ".join(json_loads(row["recipients_json"], []))
-    to_instances = json_loads(row["recipient_instance_ids_json"], [])
+    recipients = public_message_recipients(
+        conn,
+        json_loads(row["recipients_json"], []),
+        json_loads(row["recipient_instance_ids_json"], []),
+    )
+    sender = public_message_sender(
+        conn, str(row["sender"]), str(row["sender_instance_id"] or "")
+    )
     return _projection_marker(row, meta) + [
         f"### {row['id']}",
         f"- created_utc: {row['created_utc']}",
-        f"- from: {row['sender']}",
-        f"- from_instance: {row['sender_instance_id'] or ''}",
-        f"- to: {to_value}",
-        f"- to_instances: {', '.join(to_instances)}",
+        f"- from: {sender}",
+        f"- to: {', '.join(recipients)}",
         f"- feature: {row['feature_id']}",
         f"- workflow_origin: {row['workflow_origin'] or ''}",
         f"- status: {row['status']}",
@@ -277,14 +366,16 @@ def _request_block(row) -> list[str]:
     ]
 
 
-def _response_block(row) -> list[str]:
+def _response_block(conn, row) -> list[str]:
     body = body_from_message_row(row)
     meta = json_loads(row["meta_json"], {})
+    sender = public_message_sender(
+        conn, str(row["sender"]), str(row["sender_instance_id"] or "")
+    )
     return _projection_marker(row, meta) + [
         f"### {row['id']}",
         f"- created_utc: {row['created_utc']}",
-        f"- from: {row['sender']}",
-        f"- from_instance: {row['sender_instance_id'] or ''}",
+        f"- from: {sender}",
         f"- request_id: {row['request_id']}",
         f"- summary: {row['summary']}",
         f"- workflow_origin: {row['workflow_origin'] or ''}",

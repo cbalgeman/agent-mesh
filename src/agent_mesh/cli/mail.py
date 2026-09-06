@@ -10,8 +10,9 @@ import math
 import os
 import re
 import secrets
-import subprocess
+import shlex
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -38,22 +39,55 @@ from agent_mesh.config import (
     write_agent_dir_gitignore,
 )
 from agent_mesh.core.decision_schema import (
+    DECISION_APPLICABILITY_SCOPES,
+    DECISION_BODY_FORMAT_CUSTOM,
+    DECISION_BODY_FORMAT_GENERATED_V1,
+    DECISION_BODY_FORMAT_UNKNOWN,
     DECISION_TIERS,
+    DecisionBodyIntegrityError,
     DecisionVerificationError,
+    applicability_scope_for,
+    decision_applicability_issues,
     decision_completeness_issues,
+    generated_decision_body,
+    decision_review_progress,
+    decision_revision_digest,
+    normalize_decision_assumptions,
+    normalize_decision_review_policy,
     normalize_decision_strings,
     normalize_decision_verification,
+    parse_decision_evidence_entries,
+    read_verified_decision_body,
+)
+from agent_mesh.core.decision_applicability import DecisionPathError
+from agent_mesh.core.decision_context import (
+    build_decision_context,
+    build_unavailable_decision_context,
+    render_bounded_decision_context_json,
+)
+from agent_mesh.core.context_delivery import capability_state_counts
+from agent_mesh.core.context_budget import (
+    CONTEXT_BUDGET_TIMEOUT_SECONDS,
+    build_context_budget_report,
+    render_context_budget_text,
+)
+from agent_mesh.core.git_changes import (
+    GitChangeRequestError,
+    GitChangeUnavailable,
+    collect_git_changes,
+    read_bounded_git_diff_paths,
+    read_bounded_git_tracked_paths,
 )
 from agent_mesh.core.agent_instances import (
     INSTANCE_ID_RE,
     AgentInstanceError,
     bind_agent_instance,
-    digest_external_session_ref,
-    normalize_instance_label,
+    normalize_new_instance_handle,
     resolve_agent_instance_from_records,
     resolve_authoring_actor,
     reset_agent_instance,
     selected_agent_instance,
+    validate_external_session_ref_digest,
 )
 from agent_mesh.core.provenance import BODY_AUTHORITY_VALUES, BODY_FIDELITY_VALUES
 from agent_mesh.core.events import (
@@ -64,19 +98,39 @@ from agent_mesh.core.events import (
     utc_now,
 )
 from agent_mesh.core.lock import acquire
+from agent_mesh.core.ids import new_public_message_id
+from agent_mesh.core.reference_context import (
+    BoundedReferenceText,
+    MAX_REFERENCE_CONTEXT_OCCURRENCES,
+    MAX_REFERENCE_CONTEXT_TEXT_BYTES,
+    MAX_REFERENCE_SNAPSHOT_BYTES,
+    MAX_REFERENCE_SNAPSHOT_EVENTS,
+    MAX_REFERENCE_SNAPSHOT_SECONDS,
+    build_reference_context,
+    build_unavailable_reference_context,
+    render_bounded_reference_context_json,
+)
+from agent_mesh.core.reference_syntax import (
+    REFERENCE_RE,
+    ReferenceOccurrence,
+    extract_reference_occurrences,
+)
 from agent_mesh.core.recovery import recover
 from agent_mesh.core.workflow_origin import WORKFLOW_ORIGINS, refs_with_workflow_origin
 from agent_mesh.project_registry import (
     ProjectRegistryError,
     RegisteredProject,
+    apply_project_unregistration,
     list_registered_projects,
+    list_registered_projects_bounded,
+    prepare_project_unregistration,
     register_project,
     registry_path,
     resolve_registered_project,
-    unregister_project,
 )
 from agent_mesh.skill import SUPPORTED_TARGETS, UnknownTargetError, render_skill
 from agent_mesh.store.rebuild import (
+    BACKLOG_ID_COLLISION,
     DECISION_ID_RE,
     AgentInstanceStopLine,
     BacklogStopLine,
@@ -93,18 +147,18 @@ from agent_mesh.store.sqlite import (
     resolve_decision,
     resolve_message,
 )
+from agent_mesh.store.read_model import ReadModelUnavailable, open_read_model
 from agent_mesh.views import locate_message, render_all
+from agent_mesh.dispatch.local_driver import scaffold_project_local_driver
 
-REF_RE = re.compile(
-    r"(?<![A-Za-z0-9_])("
-    r"D\d+(?:-(?:[SB]\d+|[A-Z]))?(?:-§[A-Za-z0-9._-]+)?|"
-    r"REQ-\d{8}T\d{6}Z-[A-Z0-9_-]+-\d{5}|"
-    r"RES-\d{8}T\d{6}Z-[A-Z0-9_-]+-\d{5}|"
-    r"AI-\d{8}-\d{2,}|"
-    r"FBK-[A-Za-z0-9][\w-]*|DI-[A-Za-z0-9][\w-]*|J-[A-Za-z0-9][\w-]*|"
-    r"BKL-[A-Za-z0-9][\w-]*|IMP-[A-Za-z0-9][\w-]*"
-    r")(?![A-Za-z0-9_])"
-)
+MAX_DECISION_CHECK_TEXT_BYTES = 16 * 1024
+MAX_REFERENCE_CHECK_FILE_BYTES = 4 * 1024 * 1024
+MAX_REFERENCE_CHECK_INPUT_BYTES = 64 * 1024 * 1024
+MAX_REFERENCE_CHECK_PATHS = 10_000
+MAX_REFERENCE_CHECK_PATH_BYTES = 4_096
+MAX_REFERENCE_CHECK_FILESYSTEM_ENTRIES = 50_000
+MAX_REFERENCE_CHECK_FILESYSTEM_SECONDS = 5.0
+REF_RE = REFERENCE_RE
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -113,12 +167,41 @@ def main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code or 0)
+    explicit_instance = getattr(args, "instance", None) or ""
+    if INSTANCE_ID_RE.fullmatch(selected_agent_instance(explicit_instance)):
+        print(
+            "agent-mesh: raw AI instance IDs are diagnostic-only; use the instance handle",
+            file=sys.stderr,
+        )
+        return 2
     instance_token = bind_agent_instance(getattr(args, "instance", None))
     try:
         return int(args.func(args))
     except AdoptionContractError as exc:
         print(f"agent-mesh: {exc}", file=sys.stderr)
         return 2
+    except (DecisionPathError, GitChangeRequestError) as exc:
+        print(f"agent-mesh check decisions: invalid request: {exc}", file=sys.stderr)
+        return 2
+    except (GitChangeUnavailable, ReadModelUnavailable) as exc:
+        if getattr(args, "func", None) is cmd_check_decisions and getattr(args, "json", False):
+            mode = str(getattr(args, "mode", "full"))
+            base = getattr(args, "base", None)
+            if mode in {"pr", "full"} and base is None:
+                base = "main"
+            print(
+                json.dumps(
+                    build_unavailable_decision_context(
+                        mode=mode,
+                        base=base,
+                        diagnostic=str(exc),
+                    ),
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(f"agent-mesh check decisions: context unavailable: {exc}", file=sys.stderr)
+        return 3
     except (AgentInstanceError, ConfigError, DecisionVerificationError) as exc:
         print(f"agent-mesh: {exc}", file=sys.stderr)
         return 2
@@ -155,9 +238,7 @@ def _render_all_locked(config):
         lock_handle.release()
 
 
-def _authoring_actor(
-    config: AgentMeshConfig, *, explicit_actor: str | None = None
-) -> str:
+def _authoring_actor(config: AgentMeshConfig, *, explicit_actor: str | None = None) -> str:
     return resolve_authoring_actor(
         read_event_records(config.events_path),
         default_actor=config.default_sender,
@@ -168,54 +249,51 @@ def _authoring_actor(
 def _cross_project_authoring_actor(
     source_config: AgentMeshConfig,
     target_config: AgentMeshConfig,
-) -> str:
+) -> tuple[str, str]:
     """Resolve one bound chat across project-local registries without reusing its local ID."""
 
     selected = selected_agent_instance()
     if not selected:
-        return _authoring_actor(target_config)
+        return _authoring_actor(target_config), ""
     if INSTANCE_ID_RE.fullmatch(selected):
         raise AgentInstanceError(
             "CROSS_PROJECT_INSTANCE_ID_FORBIDDEN: AI-agent instance IDs are project-local; "
-            "bind a shared instance label for cross-project writes"
+            "bind a shared instance handle for cross-project writes"
         )
 
     source_instance = resolve_agent_instance_from_records(
         read_event_records(source_config.events_path), selected
     )
-    target_instance = resolve_agent_instance_from_records(
-        read_event_records(target_config.events_path), selected
-    )
     if source_instance is None or source_instance.status != "active":
         raise AgentInstanceError(f"AGENT_INSTANCE_UNKNOWN: {selected}")
+    mapping_key = f"{source_config.project_key}/{source_instance.label}"
+    mapped_handle = target_config.identity.cross_project_instance_mappings.get(mapping_key)
+    if not mapped_handle or INSTANCE_ID_RE.fullmatch(mapped_handle):
+        raise AgentInstanceError(
+            f"CROSS_PROJECT_INSTANCE_MAPPING_MISSING: target project must explicitly map "
+            f"{mapping_key!r} to an active target-local handle"
+        )
+    target_instance = resolve_agent_instance_from_records(
+        read_event_records(target_config.events_path), mapped_handle
+    )
     if target_instance is None or target_instance.status != "active":
         raise AgentInstanceError(
-            f"CROSS_PROJECT_INSTANCE_MAPPING_MISSING: active label {selected!r} "
-            "must be registered in the target project"
+            f"CROSS_PROJECT_INSTANCE_MAPPING_MISSING: mapped target handle "
+            f"{mapped_handle!r} must be active in the target project"
         )
-    source_identity = (
-        source_instance.participant,
-        source_instance.provider,
-        source_instance.external_session_ref_digest,
-    )
-    target_identity = (
-        target_instance.participant,
-        target_instance.provider,
-        target_instance.external_session_ref_digest,
-    )
-    if source_identity != target_identity:
+    if source_instance.participant != target_instance.participant:
         raise AgentInstanceError(
-            f"CROSS_PROJECT_INSTANCE_MAPPING_MISMATCH: label {selected!r} must map to "
-            "the same participant, provider, and external session digest in both projects"
+            f"CROSS_PROJECT_INSTANCE_MAPPING_MISMATCH: {mapping_key!r} maps to a "
+            "target handle owned by a different participant"
         )
-    return target_instance.participant
+    return target_instance.participant, target_instance.label
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-mesh")
     parser.add_argument(
         "--instance",
-        help="authoring AI instance ID or label; alternatively set AGENT_MESH_INSTANCE_ID",
+        help="authoring AI instance handle; alternatively set AGENT_MESH_INSTANCE_ID",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -248,19 +326,22 @@ def _build_parser() -> argparse.ArgumentParser:
     init.set_defaults(func=cmd_init)
 
     instance = sub.add_parser(
-        "instance", help="register or manage a durable addressable AI-agent instance"
+        "instance", help="register or manage a durable public AI-agent instance handle"
     )
     instance_sub = instance.add_subparsers(dest="instance_command", required=True)
 
     instance_register = instance_sub.add_parser("register")
     instance_register.add_argument("--participant", required=True)
     instance_register.add_argument("--provider", required=True)
-    instance_register.add_argument("--label", required=True)
+    register_handle = instance_register.add_mutually_exclusive_group(required=True)
+    register_handle.add_argument("--handle", dest="label")
+    register_handle.add_argument("--label", dest="label", help=argparse.SUPPRESS)
     instance_register.add_argument("--workstream", default="")
     instance_register.add_argument("--runtime-profile", default="")
     instance_register.add_argument(
-        "--external-session-ref",
-        help="provider chat/session reference; only its SHA-256 digest is recorded",
+        "--external-session-ref-digest",
+        default="",
+        help="precomputed project-scoped SHA-256 session digest for unmanaged recovery",
     )
     instance_register.add_argument("--actor")
     instance_register.set_defaults(func=cmd_instance_register)
@@ -268,10 +349,12 @@ def _build_parser() -> argparse.ArgumentParser:
     instance_update = instance_sub.add_parser("update")
     instance_update.add_argument("identifier")
     instance_update.add_argument("--reason", required=True)
-    instance_update.add_argument("--label")
+    update_handle = instance_update.add_mutually_exclusive_group()
+    update_handle.add_argument("--handle", dest="label")
+    update_handle.add_argument("--label", dest="label", help=argparse.SUPPRESS)
     instance_update.add_argument("--workstream")
     instance_update.add_argument("--runtime-profile")
-    instance_update.add_argument("--external-session-ref")
+    instance_update.add_argument("--external-session-ref-digest")
     instance_update.add_argument("--actor")
     instance_update.set_defaults(func=cmd_instance_update)
 
@@ -308,6 +391,41 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     adopt.set_defaults(func=cmd_adopt)
 
+    doctor = sub.add_parser(
+        "doctor",
+        help="run bounded local diagnostics without changing canonical state",
+    )
+    doctor.add_argument(
+        "--context-budget",
+        action="store_true",
+        help="measure declared instruction files and representative decision-digest output",
+    )
+    doctor.add_argument(
+        "--scope",
+        choices=("repo", "registered-projects"),
+        default="repo",
+        help="inspect this repo or the explicit machine-local project registry",
+    )
+    doctor.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        help="override configured representative digest sample paths; may repeat",
+    )
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(func=cmd_doctor)
+
+    drivers = sub.add_parser("drivers", help="author project-local runtime drivers")
+    drivers_sub = drivers.add_subparsers(dest="driver_command", required=True)
+    driver_scaffold = drivers_sub.add_parser(
+        "scaffold",
+        description="Create a new fail-closed project-local one-shot driver skeleton.",
+    )
+    driver_scaffold.add_argument("--id", required=True, dest="driver_id")
+    driver_scaffold.add_argument("--provider", required=True)
+    driver_scaffold.add_argument("--output", required=True)
+    driver_scaffold.set_defaults(func=cmd_drivers_scaffold)
+
     projects = sub.add_parser("projects", help="manage registered Workbench repos")
     projects_sub = projects.add_subparsers(dest="projects_command", required=True)
     projects_list = projects_sub.add_parser("list", help="list registered repos")
@@ -315,7 +433,15 @@ def _build_parser() -> argparse.ArgumentParser:
     projects_register = projects_sub.add_parser("register", help="register an agent-mesh repo")
     projects_register.add_argument("--repo", type=Path, default=Path("."))
     projects_register.set_defaults(func=cmd_projects_register)
-    projects_unregister = projects_sub.add_parser("unregister", help="unregister a repo")
+    projects_unregister = projects_sub.add_parser(
+        "unregister",
+        help="interactively remove a repo from the machine-local Workbench registry",
+        description=(
+            "Interactively remove a repo from the machine-local Workbench registry. "
+            "This destructive command requires two direct human confirmations and "
+            "has no non-interactive bypass."
+        ),
+    )
     projects_unregister.add_argument("--repo", type=Path, default=Path("."))
     projects_unregister.set_defaults(func=cmd_projects_unregister)
 
@@ -420,8 +546,21 @@ def _build_parser() -> argparse.ArgumentParser:
     propose.add_argument("--id", required=True, dest="human_id")
     propose.add_argument("--title", required=True)
     propose.add_argument("--tier", required=True, choices=DECISION_TIERS)
+    propose.add_argument(
+        "--scope",
+        dest="applicability_scope",
+        choices=DECISION_APPLICABILITY_SCOPES,
+        help="applicability authority; defaults to paths with --affects, otherwise manual",
+    )
     propose.add_argument("--owner")
     propose.add_argument("--affects", action="append", default=[])
+    propose.add_argument("--exempt", action="append", default=[])
+    propose.add_argument(
+        "--generated-artifact",
+        dest="generated_artifact_paths",
+        action="append",
+        default=[],
+    )
     propose.add_argument("--required-check", action="append", default=[])
     propose.add_argument(
         "--verification",
@@ -438,6 +577,30 @@ def _build_parser() -> argparse.ArgumentParser:
     propose.add_argument("--context", default="")
     propose.add_argument("--decision", default="")
     propose.add_argument("--tag", action="append", default=[])
+    propose.add_argument(
+        "--assumption",
+        action="append",
+        default=[],
+        help="add an assumption statement; repeat to assign stable A1, A2, ... identities",
+    )
+    propose.add_argument(
+        "--evidence",
+        action="append",
+        default=[],
+        metavar="KIND=REFERENCE",
+        help="add typed evidence; repeat for every reference",
+    )
+    propose.add_argument(
+        "--required-reviewer",
+        action="append",
+        default=[],
+        help="require a configured participant reviewer; repeat for the full reviewer set",
+    )
+    propose.add_argument(
+        "--approval-quorum",
+        type=int,
+        help="approvals required from the required-reviewer set; defaults to all",
+    )
     propose.set_defaults(func=cmd_decision_propose)
 
     amend = decision_sub.add_parser(
@@ -445,6 +608,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="append a metadata revision; accepted decisions return to Proposed",
         description=(
             "Append a metadata revision; accepted decisions return to Proposed. "
+            "Title, context, and decision edits keep package-generated canonical Markdown "
+            "synchronized; custom Markdown must be replaced in full with --from-file. "
             "Supplying a collection option replaces the whole stored collection, "
             "so repeat the option for every value to retain. Use its clear option "
             "alone to remove the collection."
@@ -454,6 +619,12 @@ def _build_parser() -> argparse.ArgumentParser:
     amend.add_argument("--reason", required=True)
     amend.add_argument("--title")
     amend.add_argument("--tier", choices=DECISION_TIERS)
+    amend.add_argument(
+        "--scope",
+        dest="applicability_scope",
+        choices=DECISION_APPLICABILITY_SCOPES,
+        help="replace applicability authority for this revision",
+    )
     amend.add_argument("--owner")
     amend.add_argument("--clear-owner", action="store_true")
     amend.add_argument(
@@ -466,6 +637,19 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="remove all affected code globs; cannot be combined with --affects",
     )
+    amend.add_argument(
+        "--exempt",
+        action="append",
+        help="replace exemption globs; repeat for every glob to retain",
+    )
+    amend.add_argument("--clear-exemptions", action="store_true")
+    amend.add_argument(
+        "--generated-artifact",
+        dest="generated_artifact_paths",
+        action="append",
+        help="replace generated-artifact globs; repeat for every glob to retain",
+    )
+    amend.add_argument("--clear-generated-artifact-paths", action="store_true")
     amend.add_argument(
         "--required-check",
         action="append",
@@ -501,7 +685,31 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="remove all tags; cannot be combined with --tag",
     )
-    amend.add_argument("--from-file", type=Path)
+    amend.add_argument(
+        "--assumption",
+        action="append",
+        help="replace assumptions; repeat for every assumption to retain",
+    )
+    amend.add_argument("--clear-assumptions", action="store_true")
+    amend.add_argument(
+        "--evidence",
+        action="append",
+        metavar="KIND=REFERENCE",
+        help="replace evidence; repeat for every reference to retain",
+    )
+    amend.add_argument("--clear-evidence", action="store_true")
+    amend.add_argument(
+        "--required-reviewer",
+        action="append",
+        help="replace the full configured-participant reviewer set; repeat to retain",
+    )
+    amend.add_argument("--approval-quorum", type=int)
+    amend.add_argument("--clear-review-policy", action="store_true")
+    amend.add_argument(
+        "--from-file",
+        type=Path,
+        help="replace the complete canonical Markdown body for a custom decision",
+    )
     amend.add_argument("--context")
     amend.add_argument("--decision")
     amend.set_defaults(func=cmd_decision_amend)
@@ -556,7 +764,7 @@ def _build_parser() -> argparse.ArgumentParser:
     backlog_fields.add_argument("--disposition")
     backlog_fields.add_argument("--owner-hint")
     backlog_fields.add_argument(
-        "--owner-instance", help="active AI instance ID or label responsible for this item"
+        "--owner-instance", help="active public AI instance handle responsible for this item"
     )
     backlog_fields.add_argument("--lane")
     backlog_fields.add_argument("--notes")
@@ -588,15 +796,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "upsert",
         parents=[backlog_fields],
         description=(
-            "Compatibility/import surface. Omit --id to create a normal item with "
-            "an atomically allocated BKL-YYYYMMDD-NN identifier."
+            "Compatibility/import surface. An explicit --id may only import a missing "
+            "item; collisions fail loudly and existing items require backlog update. "
+            "Omit --id to create a normal item with an atomically allocated "
+            "BKL-YYYYMMDD-NN identifier."
         ),
     )
     backlog_upsert.add_argument(
         "--id",
         dest="item_id",
         metavar="BKL-ID",
-        help="existing or imported item ID; normal creation should use backlog create",
+        help="missing imported item ID; existing items require backlog update",
     )
     backlog_upsert.set_defaults(func=cmd_backlog_upsert, backlog_write_mode="upsert")
 
@@ -662,8 +872,35 @@ def _build_parser() -> argparse.ArgumentParser:
     refs.add_argument("--paths", default="**/*")
     refs.add_argument("--ci-mode", choices=("pr", "full"), default="full")
     refs.add_argument("--base", default="main")
+    refs.add_argument(
+        "--file",
+        action="append",
+        type=Path,
+        default=[],
+        help="scan an explicit project-local file, including ignored/private files; may repeat",
+    )
+    refs.add_argument("--stdin", action="store_true", dest="read_stdin")
+    refs.add_argument("--json", action="store_true")
     refs.add_argument("--record-scan", action="store_true")
     refs.set_defaults(func=cmd_check_refs)
+    decision_check = check_sub.add_parser(
+        "decisions",
+        description=(
+            "Evaluate applicable decisions against one local Git change set. "
+            "Version 0.4.0 results are advisory and never execute stored verification."
+        ),
+    )
+    decision_check.add_argument(
+        "--mode",
+        choices=("pr", "staged", "worktree", "full"),
+        default="full",
+    )
+    decision_check.add_argument(
+        "--base",
+        help="local Git ref used only by pr/full mode (default: main)",
+    )
+    decision_check.add_argument("--json", action="store_true")
+    decision_check.set_defaults(func=cmd_check_decisions)
 
     workbench = sub.add_parser(
         "workbench",
@@ -676,7 +913,16 @@ def _build_parser() -> argparse.ArgumentParser:
     workbench.add_argument(
         "service_action",
         nargs="?",
-        choices=("install", "status", "open", "start", "restart", "uninstall"),
+        choices=(
+            "install",
+            "repair",
+            "status",
+            "open",
+            "start",
+            "restart",
+            "relinquish",
+            "uninstall",
+        ),
     )
     workbench.add_argument("--repo", type=Path, default=Path("."))
     workbench.add_argument("--host", default="127.0.0.1")
@@ -789,13 +1035,44 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    if not args.context_budget:
+        raise ConfigError("doctor currently requires --context-budget")
+    deadline = time.monotonic() + CONTEXT_BUDGET_TIMEOUT_SECONDS
+    current = load_config()
+    configs: dict[Path, AgentMeshConfig] = {
+        current.project_root.resolve(): current,
+    }
+    if args.scope == "registered-projects":
+        projects = list_registered_projects_bounded(max_entries=64, deadline=deadline)
+        for project in projects:
+            if time.monotonic() >= deadline:
+                raise ProjectRegistryError(
+                    "Context-budget project enumeration exceeded its time bound"
+                )
+            root = project.root.resolve()
+            if root not in configs:
+                configs[root] = load_config(root)
+    report = build_context_budget_report(
+        [configs[root] for root in sorted(configs, key=str)],
+        scope=args.scope,
+        sample_paths=args.path or None,
+        deadline_monotonic=deadline,
+    )
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        print(render_context_budget_text(report))
+    return 0 if report["complete"] else 3
+
+
 def cmd_instance_register(args: argparse.Namespace) -> int:
     config = load_config()
     participant = args.participant.strip()
     actor = _authoring_actor(config, explicit_actor=args.actor)
     _ensure_participant(config, participant, role="instance participant")
     _ensure_participant(config, actor, role="actor")
-    label = normalize_instance_label(args.label)
+    label = normalize_new_instance_handle(args.label, participant=participant)
     provider = args.provider.strip().lower()
     if not provider:
         raise ConfigError("instance provider must be non-empty")
@@ -822,8 +1099,8 @@ def cmd_instance_register(args: argparse.Namespace) -> int:
                 "label": label,
                 "workstream": args.workstream.strip(),
                 "runtime_profile": args.runtime_profile.strip(),
-                "external_session_ref_digest": digest_external_session_ref(
-                    args.external_session_ref
+                "external_session_ref_digest": validate_external_session_ref_digest(
+                    args.external_session_ref_digest
                 ),
             },
         )
@@ -831,7 +1108,7 @@ def cmd_instance_register(args: argparse.Namespace) -> int:
         last_event_seq = result.event.event_seq
     finally:
         lock_handle.release(last_event_seq=last_event_seq)
-    print(f"{instance_id}\t{label}\t{participant}\tactive")
+    print(f"registered {label}\tactive")
     return 0
 
 
@@ -853,7 +1130,9 @@ def cmd_instance_update(args: argparse.Namespace) -> int:
         instance_id = current["id"]
         fields_changed: dict[str, list[str]] = {}
         if args.label is not None:
-            label = normalize_instance_label(args.label)
+            label = normalize_new_instance_handle(
+                args.label, participant=str(current["participant"])
+            )
             if label != current["label"]:
                 fields_changed["label"] = [current["label"], label]
         if args.workstream is not None:
@@ -868,8 +1147,8 @@ def cmd_instance_update(args: argparse.Namespace) -> int:
                     current["runtime_profile"],
                     runtime_profile,
                 ]
-        if args.external_session_ref is not None:
-            digest = digest_external_session_ref(args.external_session_ref)
+        if args.external_session_ref_digest is not None:
+            digest = validate_external_session_ref_digest(args.external_session_ref_digest)
             if digest != current["external_session_ref_digest"]:
                 fields_changed["external_session_ref_digest"] = [
                     current["external_session_ref_digest"],
@@ -895,7 +1174,7 @@ def cmd_instance_update(args: argparse.Namespace) -> int:
             last_event_seq = int(current["event_seq"])
     finally:
         lock_handle.release(last_event_seq=last_event_seq)
-    print(f"{'updated' if did_update else 'unchanged'} {instance_id}")
+    print(f"{'updated' if did_update else 'unchanged'} {current['label']}")
     return 0
 
 
@@ -926,7 +1205,7 @@ def cmd_instance_retire(args: argparse.Namespace) -> int:
         last_event_seq = result.event.event_seq
     finally:
         lock_handle.release(last_event_seq=last_event_seq)
-    print(f"retired {instance_id}")
+    print(f"retired {current['label']}")
     return 0
 
 
@@ -944,14 +1223,21 @@ def cmd_adopt(args: argparse.Namespace) -> int:
                 "project identity: current "
                 f"({identity['project_key']} {identity['timezone']} {identity['store_id']})"
             )
+        elif identity.get("migration_kind"):
+            detail = identity.get("error") or ",".join(identity.get("missing", []))
+            print(
+                "project identity: migration required "
+                f"({detail}; run `agent-mesh adopt --repo {shlex.quote(str(root))}`)"
+            )
         else:
             detail = identity.get("error") or ",".join(identity.get("missing", []))
-            print(f"project identity: incomplete ({detail})")
+            print(f"project identity: error ({detail}; edit .agent-mesh/config.toml)")
         print(
             "agent contract: "
             + ("healthy" if status["healthy"] else "incomplete or conflicting")
             + f" (v{status['version']} {status['digest']})"
         )
+        _print_context_delivery_status(status)
         return 0 if status["healthy"] else 1
 
     identity_update = ensure_project_identity_config(
@@ -981,6 +1267,40 @@ def cmd_adopt(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"agent contract: healthy (v{status['version']} {status['digest']})")
+    _print_context_delivery_status(status)
+    return 0
+
+
+def _print_context_delivery_status(status: dict[str, Any]) -> None:
+    report = status.get("context_delivery")
+    if not isinstance(report, dict):
+        print("context delivery: unavailable (does not change agent-contract health)")
+        return
+    counts = capability_state_counts(report)
+    print(
+        "context delivery: available "
+        f"(unreported={counts['unreported']}, unsupported={counts['unsupported']}, "
+        f"reported={counts['reported']}, verified={counts['verified']}; "
+        "does not change agent-contract health)"
+    )
+
+
+def cmd_drivers_scaffold(args: argparse.Namespace) -> int:
+    config = load_config()
+    result = scaffold_project_local_driver(
+        project_root=config.project_root,
+        output=args.output,
+        driver_id=args.driver_id,
+        provider=args.provider,
+    )
+    manifest = result.manifest_path.relative_to(config.project_root)
+    print(f"created\t{result.entrypoint_path.relative_to(config.project_root)}")
+    print(f"created\t{manifest}")
+    print('driver_source = "project-local"')
+    print('driver_protocol = "agent-mesh.runtime-driver.v1"')
+    print(f'driver_manifest = "{manifest.as_posix()}"')
+    print(f'driver_manifest_sha256 = "{result.manifest_sha256}"')
+    print("scaffold is fail-closed until probe and launch are implemented")
     return 0
 
 
@@ -997,8 +1317,67 @@ def cmd_projects_register(args: argparse.Namespace) -> int:
     return 0
 
 
+def _confirm_destructive_cli_action(
+    *,
+    title: str,
+    scope: str,
+    consequences: tuple[str, ...],
+    confirmation: str,
+) -> bool:
+    if not sys.stdin.isatty():
+        raise ConfigError(
+            f"{title} requires direct human action in an interactive terminal; "
+            "automation flags cannot bypass destructive confirmation"
+        )
+    print(f"Destructive action: {title}")
+    print(f"Scope: {scope}")
+    for consequence in consequences:
+        print(f"Consequence: {consequence}")
+    try:
+        first_confirmation = input("Continue to the final confirmation? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        print("destructive action cancelled; no information was removed", file=sys.stderr)
+        return False
+    if first_confirmation.strip().casefold() not in {
+        "y",
+        "yes",
+    }:
+        print("destructive action cancelled; no information was removed", file=sys.stderr)
+        return False
+    try:
+        final_confirmation = input(f"Type {confirmation} to confirm this exact scope: ")
+    except (EOFError, KeyboardInterrupt):
+        print("destructive action cancelled; no information was removed", file=sys.stderr)
+        return False
+    if final_confirmation.strip() != confirmation:
+        print("destructive action cancelled; no information was removed", file=sys.stderr)
+        return False
+    return True
+
+
 def cmd_projects_unregister(args: argparse.Namespace) -> int:
-    removed = unregister_project(args.repo)
+    root = args.repo.expanduser().resolve()
+    plan = prepare_project_unregistration(root)
+    if not plan.records:
+        print("not registered")
+        return 0
+    registered_ids = ", ".join(plan.record_ids)
+    escaped_root = json.dumps(str(root), ensure_ascii=True)
+    if not _confirm_destructive_cli_action(
+        title="unregister an Agent Mesh project",
+        scope=(
+            f"the machine-local Workbench registry entry IDs {registered_ids} "
+            f"for path {escaped_root}"
+        ),
+        consequences=(
+            "the project will disappear from this user's Workbench registry until registered again",
+            "no repository file or canonical Agent Mesh event will be deleted",
+            "other registries, clones, caches, backups, and external copies are not changed",
+        ),
+        confirmation=f"UNREGISTER {registered_ids}",
+    ):
+        return 1
+    removed = apply_project_unregistration(plan)
     print("unregistered" if removed else "not registered")
     return 0
 
@@ -1097,7 +1476,7 @@ def cmd_request(args: argparse.Namespace) -> int:
     if provenance is None:
         return 2
     raw_to = (args.to or "").strip()
-    instance_addresses = list(dict.fromkeys(args.to_instance or []))
+    instance_addresses = list(args.to_instance or [])
     if not raw_to and not instance_addresses:
         raise ConfigError("request requires --to or at least one --to-instance")
     recipients = config.canonical_recipients(raw_to) if raw_to else []
@@ -1110,7 +1489,7 @@ def cmd_request(args: argparse.Namespace) -> int:
             recipients.append(str(instance["participant"]))
     recipients = list(dict.fromkeys(recipients))
     _ensure_participants(config, recipients, role="recipient")
-    request_id = _new_public_id("REQ", sender)
+    request_id = new_public_message_id("REQ", sender)
     refs = refs_with_workflow_origin(args.ref, args.workflow_origin)
     payload: dict[str, Any] = {
         "from": sender,
@@ -1257,7 +1636,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
             _ensure_response_allowed(
                 config, request_id=parent["request_id"], request_payload=request_payload
             )
-        response_id = _new_public_id("RES", sender)
+        response_id = new_public_message_id("RES", sender)
         refs = refs_with_workflow_origin(args.ref, args.workflow_origin)
         event = Event(
             event_id=generate_event_id(),
@@ -1341,41 +1720,30 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_workbench(args: argparse.Namespace) -> int:
-    from agent_mesh.workbench import WorkbenchError, _validate_workbench_host, serve_workbench
-
     if args.workbench_mode == "service":
         return _cmd_workbench_service(args)
     if args.service_action is not None:
         print("agent-mesh: Workbench service action requires 'workbench service'", file=sys.stderr)
         return 2
+    command = [
+        sys.executable,
+        "-m",
+        "agent_mesh.workbench_runner",
+        "--repo",
+        str(args.repo),
+        "--host",
+        str(args.host),
+        "--port",
+        str(args.port if args.port is not None else 8765),
+    ]
+    if args.open:
+        command.append("--open")
     if args.managed_service:
-        os.environ["AGENT_MESH_WORKBENCH_SERVICE"] = "1"
-        if args.config_home is not None:
-            os.environ["AGENT_MESH_CONFIG_HOME"] = str(args.config_home.expanduser().resolve())
-
-    repo = args.repo
-    port = args.port if args.port is not None else 8765
-    if args.managed_service:
-        try:
-            load_config(repo)
-        except ConfigError:
-            projects = list_registered_projects()
-            if not projects:
-                raise
-            repo = projects[0].root
-
-    try:
-        _validate_workbench_host(args.host)
-        serve_workbench(
-            repo=repo,
-            host=args.host,
-            port=port,
-            open_browser=args.open,
-        )
-    except WorkbenchError as exc:
-        print(f"agent-mesh: {exc}", file=sys.stderr)
-        return 2
-    return 0
+        command.append("--managed-service")
+    if args.config_home is not None:
+        command.extend(("--config-home", str(args.config_home)))
+    os.execv(sys.executable, command)
+    return 2  # pragma: no cover - os.execv replaces the process
 
 
 def _cmd_workbench_service(args: argparse.Namespace) -> int:
@@ -1390,7 +1758,9 @@ def _cmd_workbench_service(args: argparse.Namespace) -> int:
     from agent_mesh.workbench_service import (
         WorkbenchServiceError,
         install_workbench_service,
+        managed_workbench_authority,
         make_service_spec,
+        relinquish_workbench_service,
         restart_workbench_service,
         start_workbench_service,
         uninstall_workbench_service,
@@ -1402,7 +1772,7 @@ def _cmd_workbench_service(args: argparse.Namespace) -> int:
     if action is None:
         print(
             "agent-mesh: choose a Workbench service action: "
-            "install, status, open, start, restart, or uninstall",
+            "install, repair, status, open, start, restart, relinquish, or uninstall",
             file=sys.stderr,
         )
         return 2
@@ -1410,17 +1780,34 @@ def _cmd_workbench_service(args: argparse.Namespace) -> int:
     bookmark_path: Path | None = None
     anchor_config: AgentMeshConfig | None = None
     try:
-        if action == "install":
+        if action in {"install", "repair"}:
             _validate_workbench_host(args.host)
             config = load_config(args.repo)
             anchor_config = config
-            register_project(config.project_root)
             spec = make_service_spec(
                 repo=config.project_root,
                 host=args.host,
                 port=args.port if args.port is not None else 8767,
             )
-            status = install_workbench_service(spec)
+            authority = managed_workbench_authority(include_health=False)
+            reactivating = authority.mode == "relinquished"
+            if reactivating and action == "repair":
+                raise WorkbenchServiceError(
+                    "relinquished ownership must be reactivated with the explicit "
+                    "service start or service install action"
+                )
+            if reactivating and not _confirm_workbench_reactivation(action):
+                return 2
+            register_project(config.project_root)
+            if action == "repair":
+                status = install_workbench_service(spec, repair=True)
+            elif reactivating:
+                status = install_workbench_service(
+                    spec,
+                    direct_human_reactivation=True,
+                )
+            else:
+                status = install_workbench_service(spec)
             bookmark_path = managed_workbench_bookmark_path(spec.config_home)
         elif action == "status":
             status = workbench_service_status()
@@ -1434,10 +1821,22 @@ def _cmd_workbench_service(args: argparse.Namespace) -> int:
             if status.running is not True:
                 status = start_workbench_service()
         elif action == "start":
-            status = start_workbench_service()
+            authority = managed_workbench_authority(include_health=False)
+            reactivating = authority.mode == "relinquished"
+            if reactivating and not _confirm_workbench_reactivation(action):
+                return 2
+            status = start_workbench_service(
+                direct_human_reactivation=reactivating,
+            )
         elif action == "restart":
             status = restart_workbench_service()
+        elif action == "relinquish":
+            if not _confirm_workbench_relinquish(action):
+                return 2
+            status = relinquish_workbench_service()
         else:
+            if not _confirm_workbench_relinquish(action):
+                return 2
             status = uninstall_workbench_service()
     except (ConfigError, ProjectRegistryError, WorkbenchServiceError, WorkbenchError) as exc:
         print(f"agent-mesh: {exc}", file=sys.stderr)
@@ -1446,7 +1845,7 @@ def _cmd_workbench_service(args: argparse.Namespace) -> int:
     if bookmark_path is None:
         bookmark_path = _service_bookmark_path(status, managed_workbench_bookmark_path)
     _print_workbench_service_status(status, bookmark_path=bookmark_path)
-    if action in {"install", "open", "start", "restart"}:
+    if action in {"install", "repair", "open", "start", "restart"}:
         if bookmark_path is not None:
             if not wait_for_managed_workbench(bookmark_path):
                 print(
@@ -1457,14 +1856,15 @@ def _cmd_workbench_service(args: argparse.Namespace) -> int:
                 return 2
             if anchor_config is None:
                 anchor_config = _service_anchor_config(status)
-            if anchor_config is not None:
-                try:
-                    write_managed_bookmark_pointer(anchor_config, bookmark_path)
-                except OSError as exc:
-                    print(
-                        f"agent-mesh: warning: could not update the project bookmark: {exc}",
-                        file=sys.stderr,
-                    )
+            _write_registered_managed_bookmark_pointers(
+                bookmark_path,
+                anchor_config=anchor_config,
+                pointer_writer=lambda config, path: write_managed_bookmark_pointer(
+                    config,
+                    path,
+                    _validated=True,
+                ),
+            )
             if args.open or action == "open":
                 webbrowser.open(bookmark_path.resolve().as_uri())
         elif args.open:
@@ -1475,6 +1875,38 @@ def _cmd_workbench_service(args: argparse.Namespace) -> int:
             )
             return 2
     return 0
+
+
+def _confirm_workbench_relinquish(action: str) -> bool:
+    prompt = (
+        f"{action} disables automatic Workbench ownership and restores manual server access. "
+        "Type RELINQUISH to continue: "
+    )
+    try:
+        answer = input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print("agent-mesh: Workbench ownership was not changed", file=sys.stderr)
+        return False
+    if answer.strip() != "RELINQUISH":
+        print("agent-mesh: Workbench ownership was not changed", file=sys.stderr)
+        return False
+    return True
+
+
+def _confirm_workbench_reactivation(action: str) -> bool:
+    prompt = (
+        f"{action} will reclaim managed Workbench ownership after explicit relinquishment. "
+        "Type ACTIVATE to continue: "
+    )
+    try:
+        answer = input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print("agent-mesh: Workbench ownership was not changed", file=sys.stderr)
+        return False
+    if answer.strip() != "ACTIVATE":
+        print("agent-mesh: Workbench ownership was not changed", file=sys.stderr)
+        return False
+    return True
 
 
 def _service_bookmark_path(status: Any, resolver: Any) -> Path | None:
@@ -1501,6 +1933,91 @@ def _service_anchor_config(status: Any) -> AgentMeshConfig | None:
         return None
 
 
+def _write_registered_managed_bookmark_pointers(
+    bookmark_path: Path,
+    *,
+    anchor_config: AgentMeshConfig | None,
+    pointer_writer: Any,
+) -> None:
+    """Route every valid registered repo bookmark to one managed bookmark."""
+
+    from agent_mesh.workbench_service import (
+        MAX_REGISTERED_POINTERS,
+        REGISTERED_POINTER_DEADLINE_SECONDS,
+        _managed_bookmark_target,
+    )
+
+    configs: dict[Path, AgentMeshConfig] = {}
+    deadline = time.monotonic() + REGISTERED_POINTER_DEADLINE_SECONDS
+    if _managed_bookmark_target(bookmark_path) is None:
+        print(
+            "agent-mesh: warning: managed bookmark validation failed; project pointers were "
+            "not changed",
+            file=sys.stderr,
+        )
+        return
+    if time.monotonic() >= deadline:
+        print(
+            "agent-mesh: warning: managed bookmark validation reached the pointer time bound; "
+            "project pointers were not changed",
+            file=sys.stderr,
+        )
+        return
+    if anchor_config is not None:
+        configs[anchor_config.project_root.resolve()] = anchor_config
+    try:
+        projects = list_registered_projects_bounded(
+            max_entries=MAX_REGISTERED_POINTERS,
+            deadline=deadline,
+        )
+    except ProjectRegistryError as exc:
+        print(
+            f"agent-mesh: warning: could not enumerate registered project bookmarks: {exc}",
+            file=sys.stderr,
+        )
+        projects = []
+    for project in projects:
+        if time.monotonic() >= deadline:
+            print(
+                "agent-mesh: warning: registered project bookmark update reached its time bound; "
+                "remaining pointers were not changed",
+                file=sys.stderr,
+            )
+            break
+        root = project.root.resolve()
+        if root in configs:
+            continue
+        if len(configs) >= MAX_REGISTERED_POINTERS:
+            print(
+                "agent-mesh: warning: registered project bookmark update reached its entry "
+                f"bound ({MAX_REGISTERED_POINTERS}); remaining pointers were not changed",
+                file=sys.stderr,
+            )
+            break
+        try:
+            configs[root] = load_config(root)
+        except ConfigError as exc:
+            print(
+                f"agent-mesh: warning: could not load registered project {project.key}: {exc}",
+                file=sys.stderr,
+            )
+    for root in sorted(configs, key=str):
+        if time.monotonic() >= deadline:
+            print(
+                "agent-mesh: warning: registered project bookmark update reached its time bound; "
+                "remaining pointers were not changed",
+                file=sys.stderr,
+            )
+            break
+        try:
+            pointer_writer(configs[root], bookmark_path)
+        except OSError as exc:
+            print(
+                f"agent-mesh: warning: could not update project bookmark for {root}: {exc}",
+                file=sys.stderr,
+            )
+
+
 def _print_workbench_service_status(
     status: Any,
     *,
@@ -1515,6 +2032,13 @@ def _print_workbench_service_status(
     else:
         summary = status.state
     print(f"workbench service: {summary}")
+    if status.api_state is not None:
+        print(f"api: {status.api_state}")
+    if status.ownership is not None:
+        print(f"ownership: {status.ownership.state}")
+        if status.ownership.generation:
+            print(f"ownership generation: {status.ownership.generation}")
+            print(f"ownership revision: {status.ownership.ownership_revision}")
     print(f"platform: {status.platform}")
     print(f"definition: {status.definition}")
     if status.metadata:
@@ -1532,6 +2056,28 @@ def cmd_decision_propose(args: argparse.Namespace) -> int:
     dec_ulid = _new_decision_id()
     body = _decision_body_from_args(args)
     verification = normalize_decision_verification(args.verify_command, reject_unsafe=True)
+    try:
+        assumptions = normalize_decision_assumptions(args.assumption)
+        evidence = parse_decision_evidence_entries(args.evidence)
+        review_policy = normalize_decision_review_policy(
+            {
+                "required_reviewers": args.required_reviewer,
+                "approval_quorum": args.approval_quorum,
+            },
+            participants=config.decision_approval_identities,
+        )
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    applicability_scope = applicability_scope_for(args.applicability_scope, args.affects)
+    applicability_issues = decision_applicability_issues(
+        applicability_scope=applicability_scope,
+        tier=args.tier,
+        affected_code_globs=args.affects,
+        exemptions=args.exempt,
+        generated_artifact_paths=args.generated_artifact_paths,
+    )
+    if applicability_issues:
+        raise ConfigError("; ".join(applicability_issues))
     lock_handle = acquire(config.agent_dir / ".mail-lock")
     last_event_seq = None
     try:
@@ -1550,28 +2096,35 @@ def cmd_decision_propose(args: argparse.Namespace) -> int:
 
         body_path, body_sha, body_bytes = _write_body(config, body)
         payload = {
+            "decision_contract_version": 5,
             "human_id": args.human_id,
             "aliases": [],
             "title": args.title,
             "tier": args.tier,
+            "applicability_scope": applicability_scope,
             "context": args.context,
             "decision": args.decision,
             "rejected_alternatives": [],
             "consequences": [],
             "affected_code_globs": normalize_decision_strings(args.affects),
-            "exemptions": [],
-            "generated_artifact_paths": [],
-            "assumptions": [],
-            "evidence": {},
+            "exemptions": normalize_decision_strings(args.exempt),
+            "generated_artifact_paths": normalize_decision_strings(args.generated_artifact_paths),
+            "assumptions": assumptions,
+            "evidence": evidence,
             "supersedes": None,
             "owner": args.owner,
-            "review_policy": {},
+            "review_policy": review_policy,
             "required_checks": normalize_decision_strings(args.required_check),
             "verification": verification,
             "tags": normalize_decision_strings(args.tag),
             "body_sha": body_sha,
             "body_path": body_path,
             "body_bytes": body_bytes,
+            "body_format": (
+                DECISION_BODY_FORMAT_CUSTOM
+                if args.from_file is not None
+                else DECISION_BODY_FORMAT_GENERATED_V1
+            ),
         }
         event = Event(
             event_id=generate_event_id(),
@@ -1596,9 +2149,23 @@ def cmd_decision_amend(args: argparse.Namespace) -> int:
         raise ConfigError("decision amendment requires a non-empty reason")
     _reject_conflicting_clear_flag(args, "owner")
     _reject_conflicting_clear_flag(args, "affects")
+    _reject_conflicting_clear_flag(args, "exemptions", value_name="exempt")
+    _reject_conflicting_clear_flag(args, "generated_artifact_paths")
     _reject_conflicting_clear_flag(args, "required_checks", value_name="required_check")
     _reject_conflicting_clear_flag(args, "verification", value_name="verify_command")
     _reject_conflicting_clear_flag(args, "tags", value_name="tag")
+    _reject_conflicting_clear_flag(args, "assumptions", value_name="assumption")
+    _reject_conflicting_clear_flag(args, "evidence")
+    if args.clear_review_policy and (
+        args.required_reviewer is not None or args.approval_quorum is not None
+    ):
+        raise ConfigError(
+            "--clear-review-policy cannot be combined with --required-reviewer or --approval-quorum"
+        )
+    if args.approval_quorum is not None and args.required_reviewer is None:
+        raise ConfigError(
+            "--approval-quorum requires the full replacement reviewer set via --required-reviewer"
+        )
 
     lock_handle = acquire(config.agent_dir / ".mail-lock")
     last_event_seq = None
@@ -1632,6 +2199,15 @@ def cmd_decision_amend(args: argparse.Namespace) -> int:
             if normalized_owner != current["owner"]:
                 fields_changed["owner"] = [current["owner"], normalized_owner]
 
+        if (
+            args.applicability_scope is not None
+            and args.applicability_scope != current["applicability_scope"]
+        ):
+            fields_changed["applicability_scope"] = [
+                current["applicability_scope"],
+                args.applicability_scope,
+            ]
+
         collection_requests = (
             (
                 "affected_code_globs",
@@ -1644,30 +2220,124 @@ def cmd_decision_amend(args: argparse.Namespace) -> int:
                 normalize_decision_strings,
             ),
             (
+                "exemptions",
+                [] if args.clear_exemptions else args.exempt,
+                normalize_decision_strings,
+            ),
+            (
+                "generated_artifact_paths",
+                ([] if args.clear_generated_artifact_paths else args.generated_artifact_paths),
+                normalize_decision_strings,
+            ),
+            (
                 "verification",
                 [] if args.clear_verification else args.verify_command,
                 lambda values: normalize_decision_verification(values, reject_unsafe=True),
+            ),
+            (
+                "assumptions",
+                [] if args.clear_assumptions else args.assumption,
+                normalize_decision_assumptions,
+            ),
+            (
+                "evidence",
+                [] if args.clear_evidence else args.evidence,
+                parse_decision_evidence_entries,
             ),
             ("tags", [] if args.clear_tags else args.tag, normalize_decision_strings),
         )
         for field_name, requested, normalizer in collection_requests:
             if requested is None:
                 continue
-            normalized_values = normalizer(requested)
+            try:
+                normalized_values = normalizer(requested)
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from exc
             if normalized_values != current[field_name]:
                 fields_changed[field_name] = [current[field_name], normalized_values]
 
+        if args.clear_review_policy:
+            requested_review_policy: dict[str, Any] | None = {}
+        elif args.required_reviewer is not None:
+            try:
+                requested_review_policy = normalize_decision_review_policy(
+                    {
+                        "required_reviewers": args.required_reviewer,
+                        "approval_quorum": args.approval_quorum,
+                    },
+                    participants=config.decision_approval_identities,
+                )
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from exc
+        else:
+            requested_review_policy = None
+        if (
+            requested_review_policy is not None
+            and requested_review_policy != current["review_policy"]
+        ):
+            fields_changed["review_policy"] = [
+                current["review_policy"],
+                requested_review_policy,
+            ]
+
+        prospective_scope = fields_changed.get(
+            "applicability_scope", [None, current["applicability_scope"]]
+        )[1]
+        prospective_tier = fields_changed.get("tier", [None, current["tier"]])[1]
+        prospective_globs = fields_changed.get(
+            "affected_code_globs", [None, current["affected_code_globs"]]
+        )[1]
+        prospective_exemptions = fields_changed.get("exemptions", [None, current["exemptions"]])[1]
+        prospective_generated = fields_changed.get(
+            "generated_artifact_paths", [None, current["generated_artifact_paths"]]
+        )[1]
+        applicability_issues = decision_applicability_issues(
+            applicability_scope=prospective_scope,
+            tier=str(prospective_tier),
+            affected_code_globs=prospective_globs,
+            exemptions=prospective_exemptions,
+            generated_artifact_paths=prospective_generated,
+        )
+        if applicability_issues:
+            raise ConfigError("; ".join(applicability_issues))
+
+        canonical_fields_requested = any(
+            getattr(args, field_name) is not None for field_name in ("title", "context", "decision")
+        )
         if args.from_file is not None:
             body = args.from_file.read_text(encoding="utf-8")
-            if body != current["body"]:
-                body_path, body_sha, body_bytes = _write_body(config, body)
-                fields_changed.update(
-                    {
-                        "body_path": [current["body_path"], body_path],
-                        "body_sha": [current["body_sha"], body_sha],
-                        "body_bytes": [current["body_bytes"], body_bytes],
-                    }
+        elif canonical_fields_requested:
+            body_missing = not current["body_path"] and int(current["body_bytes"] or 0) == 0
+            if current["body_format"] != DECISION_BODY_FORMAT_GENERATED_V1 and not body_missing:
+                raise ConfigError(
+                    f"{human_id} has custom canonical Markdown; amend title, context, or "
+                    "decision with --from-file so the metadata and reviewed body change together"
                 )
+            body = generated_decision_body(
+                human_id,
+                title=str(fields_changed.get("title", [None, current["title"]])[1]),
+                context=str(fields_changed.get("context", [None, current["context"]])[1]),
+                decision=str(fields_changed.get("decision", [None, current["decision"]])[1]),
+            )
+        else:
+            body = current["body"]
+
+        body_changed = body != current["body"]
+        if body_changed:
+            body_path, body_sha, body_bytes = _write_body(config, body)
+            body_format = (
+                DECISION_BODY_FORMAT_CUSTOM
+                if args.from_file is not None
+                else DECISION_BODY_FORMAT_GENERATED_V1
+            )
+            fields_changed.update(
+                {
+                    "body_path": [current["body_path"], body_path],
+                    "body_sha": [current["body_sha"], body_sha],
+                    "body_bytes": [current["body_bytes"], body_bytes],
+                    "body_format": [current["body_format"], body_format],
+                }
+            )
 
         if fields_changed:
             if status in {"accepted", "in_force"}:
@@ -1679,10 +2349,13 @@ def cmd_decision_amend(args: argparse.Namespace) -> int:
                 entity_id=current["dec_ulid"],
                 thread_id=current["dec_ulid"],
                 payload={
+                    "decision_contract_version": 5,
                     "decision_id": current["dec_ulid"],
                     "reason": reason,
                     "change_kind": (
-                        "content_revision" if status in {"accepted", "in_force"} else "content_update"
+                        "content_revision"
+                        if body_changed or status in {"accepted", "in_force"}
+                        else "content_update"
                     ),
                     "fields_changed": fields_changed,
                 },
@@ -1710,6 +2383,11 @@ def cmd_decision_accept(args: argparse.Namespace) -> int:
     approver = args.by.strip()
     notes = args.notes.strip()
     _ensure_participant(config, approver, role="approving human")
+    if approver not in config.decision_approval_identities:
+        raise ConfigError(
+            f"DECISION_APPROVER_UNAUTHORIZED: {approver!r} is not in the configured "
+            "direct-human approval authority"
+        )
     if not notes:
         raise ConfigError("decision acceptance requires a non-empty approval note")
     if not sys.stdin.isatty():
@@ -1727,11 +2405,41 @@ def cmd_decision_accept(args: argparse.Namespace) -> int:
         raise ConfigError(
             f"cannot accept {preview['human_id']} while status is {preview['status']}"
         )
+    required_reviewers = preview["review_policy"].get("required_reviewers", [])
+    if required_reviewers and approver not in required_reviewers:
+        raise ConfigError(f"approver {approver!r} is not a required reviewer")
+    if approver in preview["review_progress"]["approved_reviewers"]:
+        print(f"already approved by {approver} for {preview['human_id']}")
+        return 0
     _require_complete_decision(preview)
 
     confirmation = f"ACCEPT {preview['human_id']}"
     print(f"Decision: {preview['human_id']} - {preview['title']}")
     print(f"Body SHA-256: {preview['body_sha']}")
+    print(f"Revision SHA-256: {preview['revision_sha']}")
+    print(f"Tier: {preview['tier']}")
+    print(f"Owner: {preview['owner']}")
+    print(f"Applicability scope: {preview['applicability_scope']}")
+    for pattern in preview["affected_code_globs"]:
+        print(f"Affected code glob: {pattern}")
+    for pattern in preview["exemptions"]:
+        print(f"Exemption glob: {pattern}")
+    for pattern in preview["generated_artifact_paths"]:
+        print(f"Generated-artifact glob: {pattern}")
+    for check in preview["required_checks"]:
+        print(f"Required check: {check}")
+    for verification in preview["verification"]:
+        print(f"Verification command: {verification['command']}")
+    for assumption in preview["assumptions"]:
+        print(f"Assumption {assumption['id']}: {assumption['text']}")
+        for reference in assumption.get("references", []):
+            print(f"Assumption {assumption['id']} reference: {reference}")
+    for kind, references in preview["evidence"].items():
+        for reference in references:
+            print(f"Evidence {kind}: {reference}")
+    if preview["review_policy"]:
+        print("Required reviewers: " + ", ".join(preview["review_policy"]["required_reviewers"]))
+        print(f"Approval quorum: {preview['review_policy']['approval_quorum']}")
     print(f"Approver: {approver}")
     print(f"Approval note: {notes}")
     if input(f"Type {confirmation} to approve this exact revision: ").strip() != confirmation:
@@ -1749,7 +2457,10 @@ def cmd_decision_accept(args: argparse.Namespace) -> int:
                 f"cannot accept {current['human_id']} while status is {current['status']}"
             )
         _require_complete_decision(current)
-        if current["dec_ulid"] != preview["dec_ulid"] or current["body_sha"] != preview["body_sha"]:
+        if (
+            current["dec_ulid"] != preview["dec_ulid"]
+            or current["revision_sha"] != preview["revision_sha"]
+        ):
             raise ConfigError(
                 "decision changed after it was shown for approval; review the current revision "
                 "and try again"
@@ -1763,12 +2474,16 @@ def cmd_decision_accept(args: argparse.Namespace) -> int:
             entity_id=current["dec_ulid"],
             thread_id=current["dec_ulid"],
             payload={
+                "decision_contract_version": 5,
                 "decision_id": current["dec_ulid"],
                 "accepted_by": approver,
                 "notes": notes,
                 "approval_source": "interactive_cli",
                 "approved_utc": approved_utc,
                 "approved_body_sha": current["body_sha"],
+                "approved_revision_sha": current["revision_sha"],
+                "approval_authority_mode": config.decision_approval_authority_mode,
+                "approval_authority_revision": (config.decision_approval_authority_revision),
             },
         )
         result = append_event(config.events_path, event, lock_acquired=True)
@@ -1902,12 +2617,17 @@ def cmd_backlog_upsert(args: argparse.Namespace) -> int:
         existing = _backlog_item_payload_from_projection(config, item_id)
         if write_mode == "update" and existing is None:
             raise ConfigError(f"backlog item not found: {item_id}")
+        if write_mode == "upsert" and requested_item_id and existing is not None:
+            raise ConfigError(
+                f"{BACKLOG_ID_COLLISION}: {item_id} already exists; "
+                f"use backlog update {item_id} for an intentional change"
+            )
         if mint_item_id:
             write_intent = "create"
-        elif existing is not None:
+        elif write_mode == "update":
             write_intent = "update"
         else:
-            write_intent = "upsert"
+            write_intent = "create"
         payload = _merge_backlog_payload(existing, json_payload, args, item_id=item_id)
         if not payload.get("title"):
             raise ConfigError(
@@ -2051,9 +2771,7 @@ def cmd_backlog_refer(args: argparse.Namespace) -> int:
                 "duplicate_candidates": duplicate_candidates,
             },
         )
-        choices = ", ".join(
-            f"{target_project.key}:{item_id}" for item_id in duplicate_candidates
-        )
+        choices = ", ".join(f"{target_project.key}:{item_id}" for item_id in duplicate_candidates)
         raise ConfigError(
             f"possible target duplicate(s): {choices}. Requested action: review them and rerun "
             "with --use-existing TARGET-BKL-ID --apply, or change the proposed title"
@@ -2066,34 +2784,43 @@ def cmd_backlog_refer(args: argparse.Namespace) -> int:
         target_item_id = existing_target
 
     try:
-        target_actor = _cross_project_authoring_actor(source_config, target_config)
-        if target_item_id is None:
-            target_item_id = _promote_referral_to_target(
-                target_config,
-                actor=target_actor,
-                source_project=source_project,
-                source_item=source_item,
-                source_qualified=source_qualified,
-                target_project=target_project,
-                referral_id=referral_id,
-                intent_event_id=intent_event_id,
-                title=proposed_title,
-                summary=(args.summary or str(source_item.get("summary") or "")).strip(),
-                priority=(args.priority or str(source_item.get("priority") or "")).strip(),
-                reason=reason,
-                source_events=args.source_event,
-                extra_refs=args.ref,
-            )
-        else:
-            _link_existing_target_referral(
-                target_config,
-                actor=target_actor,
-                target_item_id=target_item_id,
-                source_project=source_project,
-                source_qualified=source_qualified,
-                referral_id=referral_id,
-                intent_event_id=intent_event_id,
-            )
+        target_actor, target_instance_handle = _cross_project_authoring_actor(
+            source_config, target_config
+        )
+        target_instance_token = (
+            bind_agent_instance(target_instance_handle) if target_instance_handle else None
+        )
+        try:
+            if target_item_id is None:
+                target_item_id = _promote_referral_to_target(
+                    target_config,
+                    actor=target_actor,
+                    source_project=source_project,
+                    source_item=source_item,
+                    source_qualified=source_qualified,
+                    target_project=target_project,
+                    referral_id=referral_id,
+                    intent_event_id=intent_event_id,
+                    title=proposed_title,
+                    summary=(args.summary or str(source_item.get("summary") or "")).strip(),
+                    priority=(args.priority or str(source_item.get("priority") or "")).strip(),
+                    reason=reason,
+                    source_events=args.source_event,
+                    extra_refs=args.ref,
+                )
+            else:
+                _link_existing_target_referral(
+                    target_config,
+                    actor=target_actor,
+                    target_item_id=target_item_id,
+                    source_project=source_project,
+                    source_qualified=source_qualified,
+                    referral_id=referral_id,
+                    intent_event_id=intent_event_id,
+                )
+        finally:
+            if target_instance_token is not None:
+                reset_agent_instance(target_instance_token)
     except Exception as exc:
         _record_source_referral_status(
             source_config,
@@ -2121,10 +2848,7 @@ def cmd_backlog_refer(args: argparse.Namespace) -> int:
         target_project=target_project,
         target_item_id=target_item_id,
     )
-    print(
-        f"promoted {source_qualified} -> {target_project.key}:{target_item_id} "
-        f"({referral_id})"
-    )
+    print(f"promoted {source_qualified} -> {target_project.key}:{target_item_id} ({referral_id})")
     return 0
 
 
@@ -2190,54 +2914,60 @@ def cmd_backlog_record(args: argparse.Namespace) -> int:
 
 def cmd_check_refs(args: argparse.Namespace) -> int:
     config = load_config()
-    _rebuild_all_locked(config)
-    paths = _tracked_paths(config, args)
-    conn = connect(config.db_path)
-    dangling: list[dict[str, Any]] = []
-    warnings: list[dict[str, Any]] = []
+    if args.record_scan and args.read_stdin:
+        raise ConfigError("--record-scan cannot be combined with --stdin")
+    occurrences, paths, input_warnings, input_source_count = _check_reference_inputs(
+        config,
+        args,
+    )
     try:
-        initialize_schema(conn)
-        for path in paths:
-            rel = path.relative_to(config.project_root).as_posix()
-            if config.checks.is_exempt(rel):
-                continue
-            try:
-                text = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
-            for line_no, line in enumerate(text.splitlines(), start=1):
-                for match in REF_RE.finditer(line):
-                    token = match.group(1)
-                    kind = _ref_kind(token)
-                    if kind == "decision":
-                        base = token.split("-§", 1)[0]
-                        if resolve_decision(conn, base) is None:
-                            dangling.append({"ref": token, "file": rel, "line": line_no})
-                    elif kind in {"request", "response"}:
-                        if resolve_message(conn, token) is None:
-                            dangling.append({"ref": token, "file": rel, "line": line_no})
-                    elif kind == "backlog":
-                        if (
-                            conn.execute(
-                                "SELECT 1 FROM backlog_items WHERE id=?", (token,)
-                            ).fetchone()
-                            is None
-                        ):
-                            dangling.append({"ref": token, "file": rel, "line": line_no})
-                    elif kind == "agent_instance":
-                        if resolve_agent_instance(conn, token) is None:
-                            dangling.append({"ref": token, "file": rel, "line": line_no})
-                    else:
-                        warnings.append(
-                            {
-                                "ref": token,
-                                "file": rel,
-                                "line": line_no,
-                                "reason": "unknown ref kind",
-                            }
-                        )
-    finally:
-        conn.close()
+        with open_read_model(
+            config,
+            max_bytes=MAX_REFERENCE_SNAPSHOT_BYTES,
+            max_events=MAX_REFERENCE_SNAPSHOT_EVENTS,
+            deadline_monotonic=time.monotonic() + MAX_REFERENCE_SNAPSHOT_SECONDS,
+        ) as snapshot:
+            result = build_reference_context(
+                config,
+                snapshot,
+                occurrences,
+                boundary="check_refs",
+            )
+    except ReadModelUnavailable as exc:
+        unavailable = build_unavailable_reference_context(
+            boundary="check_refs",
+            occurrence_count=len(occurrences),
+            source_count=input_source_count,
+            diagnostic=str(exc),
+        )
+        unavailable["scan"] = {
+            "paths_scanned": [path.relative_to(config.project_root).as_posix() for path in paths],
+            "input_warnings": input_warnings,
+        }
+        if args.json:
+            rendered, _ = render_bounded_reference_context_json(unavailable)
+            print(rendered)
+        else:
+            print(f"agent-mesh check refs: canonical state unavailable: {exc}", file=sys.stderr)
+        return 3
+
+    result["scan"] = {
+        "paths_scanned": [path.relative_to(config.project_root).as_posix() for path in paths],
+        "input_warnings": input_warnings,
+    }
+    if result.get("complete") is not True:
+        rendered, _ = render_bounded_reference_context_json(result)
+        if args.json:
+            print(rendered)
+        else:
+            for diagnostic in result.get("diagnostics", []):
+                print(f"agent-mesh check refs: {diagnostic}", file=sys.stderr)
+        return 3
+
+    dangling, warnings, partial_count = _reference_check_findings(
+        result,
+        input_warnings=input_warnings,
+    )
 
     if args.record_scan:
         scanner_run_id = "scan_" + secrets.token_hex(8)
@@ -2259,15 +2989,399 @@ def cmd_check_refs(args: argparse.Namespace) -> int:
         )
         append_event(config.events_path, event, lock_acquired=False)
 
+    if args.json:
+        rendered, complete = render_bounded_reference_context_json(result)
+        print(rendered)
+        if not complete:
+            return 3
+    else:
+        resolution_warning_count = sum(
+            1
+            for resolution in result.get("resolutions", [])
+            for warning in resolution.get("warnings", [])
+            if resolution.get("resolution_status") in {"resolved", "partial"}
+            and not (
+                resolution.get("resolution_status") == "partial"
+                and str(warning).startswith("decision fragment is unvalidated")
+            )
+        )
+        summary = (
+            f"refs: scanned={len(paths) + int(args.read_stdin)} "
+            f"resolved={result['resolution_counts']['resolved']} "
+            f"partial={partial_count} "
+            f"dangling={len(dangling)} "
+            f"warnings={len(warnings) + resolution_warning_count}"
+        )
+        stdout_text, stderr_text, text_complete = _render_reference_check(
+            result,
+            dangling=dangling,
+            warnings=warnings,
+            summary=summary,
+        )
+        if not text_complete:
+            print(
+                "agent-mesh check refs: reference context exceeds the "
+                f"{MAX_REFERENCE_CONTEXT_TEXT_BYTES}-byte text output bound; "
+                "narrow the input set or use --json",
+                file=sys.stderr,
+            )
+            return 3
+        sys.stdout.write(stdout_text)
+        sys.stderr.write(stderr_text)
+    return 1 if dangling or partial_count else 0
+
+
+def _check_reference_inputs(
+    config: AgentMeshConfig,
+    args: argparse.Namespace,
+) -> tuple[list[ReferenceOccurrence], list[Path], list[dict[str, Any]], int]:
+    paths = _explicit_reference_paths(config, args.file) if args.file else []
+    if not args.file and not args.read_stdin:
+        paths = _tracked_paths(config, args)
+    occurrences: list[ReferenceOccurrence] = []
+    warnings: list[dict[str, Any]] = []
+    total_bytes = 0
+    for path in paths:
+        relative = path.relative_to(config.project_root).as_posix()
+        if not args.file and config.checks.is_exempt(relative):
+            continue
+        text, warning = _read_reference_check_file(config, path, relative=relative)
+        if warning is not None:
+            if args.file:
+                raise ConfigError(
+                    f"cannot scan explicit reference file {relative}: {warning['reason']}"
+                )
+            warnings.append(warning)
+            continue
+        if text is None:
+            raise ConfigError(f"reference input produced no text or warning: {relative}")
+        total_bytes += len(text.encode("utf-8"))
+        if total_bytes > MAX_REFERENCE_CHECK_INPUT_BYTES:
+            raise ConfigError(
+                f"reference scan exceeds {MAX_REFERENCE_CHECK_INPUT_BYTES} UTF-8 bytes; "
+                "narrow --paths or --file inputs"
+            )
+        occurrences.extend(
+            extract_reference_occurrences(
+                text,
+                source=relative,
+                source_kind="file",
+                max_occurrences=max(
+                    0,
+                    MAX_REFERENCE_CONTEXT_OCCURRENCES + 1 - len(occurrences),
+                ),
+            )
+        )
+    if args.read_stdin:
+        text = _read_reference_check_stdin()
+        total_bytes += len(text.encode("utf-8"))
+        if total_bytes > MAX_REFERENCE_CHECK_INPUT_BYTES:
+            raise ConfigError(
+                f"reference scan exceeds {MAX_REFERENCE_CHECK_INPUT_BYTES} UTF-8 bytes"
+            )
+        occurrences.extend(
+            extract_reference_occurrences(
+                text,
+                source="<stdin>",
+                source_kind="stdin",
+                max_occurrences=max(
+                    0,
+                    MAX_REFERENCE_CONTEXT_OCCURRENCES + 1 - len(occurrences),
+                ),
+            )
+        )
+    return occurrences, paths, warnings, len(paths) + int(args.read_stdin)
+
+
+def _explicit_reference_paths(config: AgentMeshConfig, requested: list[Path]) -> list[Path]:
+    if len(requested) > MAX_REFERENCE_CHECK_PATHS:
+        raise ConfigError(f"check refs accepts at most {MAX_REFERENCE_CHECK_PATHS} explicit files")
+    root = config.project_root.resolve()
+    paths: list[Path] = []
+    for path in requested:
+        if len(str(path).encode("utf-8")) > MAX_REFERENCE_CHECK_PATH_BYTES:
+            raise ConfigError(
+                f"reference input path exceeds {MAX_REFERENCE_CHECK_PATH_BYTES} UTF-8 bytes"
+            )
+        candidate = path if path.is_absolute() else root / path
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise ConfigError(f"cannot read reference file {path}: {exc}") from exc
+        try:
+            relative = resolved.relative_to(root)
+        except ValueError as exc:
+            raise ConfigError(
+                f"reference file must remain inside the project root: {path}"
+            ) from exc
+        if not resolved.is_file():
+            raise ConfigError(f"reference input is not a file: {path}")
+        paths.append(config.project_root / relative)
+    return sorted(set(paths))
+
+
+def _read_reference_check_file(
+    config: AgentMeshConfig,
+    path: Path,
+    *,
+    relative: str,
+) -> tuple[str | None, dict[str, Any] | None]:
+    root = config.project_root.resolve()
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None, {"file": relative, "line": None, "ref": "", "reason": "path escape"}
+    try:
+        with resolved.open("rb") as stream:
+            raw_bytes = stream.read(MAX_REFERENCE_CHECK_FILE_BYTES + 1)
+    except OSError as exc:
+        return None, {
+            "file": relative,
+            "line": None,
+            "ref": "",
+            "reason": f"cannot read file: {exc}",
+        }
+    if len(raw_bytes) > MAX_REFERENCE_CHECK_FILE_BYTES:
+        return None, {
+            "file": relative,
+            "line": None,
+            "ref": "",
+            "reason": f"file exceeds {MAX_REFERENCE_CHECK_FILE_BYTES} bytes",
+        }
+    try:
+        return raw_bytes.decode("utf-8"), None
+    except UnicodeDecodeError:
+        return None, {
+            "file": relative,
+            "line": None,
+            "ref": "",
+            "reason": "file is not valid UTF-8 text",
+        }
+
+
+def _read_reference_check_stdin() -> str:
+    if sys.stdin.isatty():
+        raise ConfigError("--stdin requires piped UTF-8 text")
+    binary_stream = getattr(sys.stdin, "buffer", None)
+    if binary_stream is not None:
+        raw_bytes = binary_stream.read(MAX_REFERENCE_CHECK_INPUT_BYTES + 1)
+    else:
+        raw_text = sys.stdin.read(MAX_REFERENCE_CHECK_INPUT_BYTES + 1)
+        raw_bytes = raw_text.encode("utf-8")
+    if len(raw_bytes) > MAX_REFERENCE_CHECK_INPUT_BYTES:
+        raise ConfigError(f"stdin exceeds {MAX_REFERENCE_CHECK_INPUT_BYTES} UTF-8 bytes")
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigError("stdin must be valid UTF-8 text") from exc
+
+
+def _reference_check_findings(
+    result: dict[str, Any],
+    *,
+    input_warnings: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    dangling: list[dict[str, Any]] = []
+    warnings = list(input_warnings)
+    partial_count = 0
+    occurrences_by_resolution: dict[int, list[dict[str, Any]]] = {}
+    for occurrence in result.get("occurrences", []):
+        occurrences_by_resolution.setdefault(int(occurrence["resolution_index"]), []).append(
+            occurrence
+        )
+    for index, resolution in enumerate(result.get("resolutions", [])):
+        state = str(resolution["resolution_status"])
+        if state == "partial":
+            for occurrence in occurrences_by_resolution.get(index, []):
+                partial_count += 1
+                warnings.append(
+                    {
+                        "ref": str(resolution["requested_id"]),
+                        "file": str(occurrence["source"]),
+                        "line": occurrence["line"],
+                        "column": occurrence["column"],
+                        "reason": "decision fragment is unvalidated; only the base resolved",
+                    }
+                )
+            continue
+        if state not in {"not_found", "unsupported"}:
+            continue
+        for occurrence in occurrences_by_resolution.get(index, []):
+            finding = {
+                "ref": str(resolution["requested_id"]),
+                "file": str(occurrence["source"]),
+                "line": occurrence["line"],
+                "column": occurrence["column"],
+            }
+            if state == "not_found":
+                dangling.append(finding)
+            else:
+                finding["reason"] = "reference kind has no canonical resolver"
+                warnings.append(finding)
+    return dangling, warnings, partial_count
+
+
+def _render_reference_check(
+    result: dict[str, Any],
+    *,
+    dangling: list[dict[str, Any]],
+    warnings: list[dict[str, Any]],
+    summary: str,
+) -> tuple[str, str, bool]:
+    output = BoundedReferenceText()
+    occurrences_by_resolution: dict[int, list[dict[str, Any]]] = {}
+    for occurrence in result.get("occurrences", []):
+        occurrences_by_resolution.setdefault(int(occurrence["resolution_index"]), []).append(
+            occurrence
+        )
+    for index, resolution in enumerate(result.get("resolutions", [])):
+        if resolution["resolution_status"] not in {"resolved", "partial"}:
+            continue
+        canonical_id = _reference_check_single_line(resolution["canonical_id"])
+        status = _reference_check_single_line(resolution["status"] or resolution["kind"])
+        title = _reference_check_single_line(resolution["title"])
+        revision = str(resolution.get("revision_sha256") or "")
+        suffix = f" revision={revision[:12]}" if revision else ""
+        fragment = _reference_check_single_line(resolution.get("fragment"))
+        if fragment:
+            suffix += f" fragment={fragment}:unvalidated"
+        for occurrence in occurrences_by_resolution.get(index, []):
+            location = _reference_check_location(occurrence)
+            output.add_stdout(
+                f"resolved: {location} {canonical_id} [{status}] {title}{suffix}".rstrip()
+            )
+        for warning in resolution.get("warnings", []):
+            if resolution["resolution_status"] == "partial" and str(warning).startswith(
+                "decision fragment is unvalidated"
+            ):
+                continue
+            output.add_stderr(f"warning: {canonical_id}: {_reference_check_single_line(warning)}")
     for warning in warnings:
-        print(
-            f"warning: {warning['file']}:{warning['line']} unknown ref kind {warning['ref']}",
-            file=sys.stderr,
+        location = _reference_check_location(warning)
+        output.add_stderr(
+            f"warning: {location} {_reference_check_single_line(warning.get('ref'))} "
+            f"{_reference_check_single_line(warning.get('reason'))}".rstrip()
         )
     for item in dangling:
-        print(f"dangling: {item['file']}:{item['line']} {item['ref']}", file=sys.stderr)
-    print(f"refs: scanned={len(paths)} dangling={len(dangling)} warnings={len(warnings)}")
-    return 1 if dangling else 0
+        output.add_stderr(
+            f"dangling: {_reference_check_location(item)} "
+            f"{_reference_check_single_line(item['ref'])}"
+        )
+    output.add_stdout(summary)
+    return output.render()
+
+
+def _reference_check_location(value: dict[str, Any]) -> str:
+    location = _reference_check_single_line(value.get("source") or value.get("file"))
+    if value.get("line") is not None:
+        location += f":{value['line']}"
+    if value.get("column") is not None:
+        location += f":{value['column']}"
+    return location
+
+
+def _reference_check_single_line(value: object) -> str:
+    return " ".join(
+        "".join(
+            character if character.isprintable() else " " for character in str(value or "")
+        ).split()
+    )
+
+
+def cmd_check_decisions(args: argparse.Namespace) -> int:
+    """Evaluate the actual local Git change set without mutating Agent Mesh state."""
+
+    config = load_config()
+    change_set = collect_git_changes(
+        config.project_root,
+        mode=args.mode,
+        base=args.base,
+    )
+    with open_read_model(config) as snapshot:
+        result = build_decision_context(
+            config,
+            snapshot,
+            change_set.paths,
+            boundary="change_review",
+            change_set=change_set,
+        )
+        if args.json:
+            rendered, complete = render_bounded_decision_context_json(result)
+            print(rendered)
+            return 0 if complete else 3
+
+        if result.get("complete") is not True:
+            diagnostic = next(iter(result.get("diagnostics") or []), "context is incomplete")
+            print(
+                f"agent-mesh check decisions: context incomplete: {diagnostic}; use --json",
+                file=sys.stderr,
+            )
+            return 3
+
+        decisions = result["decisions"]
+        writer = _BoundedDecisionCheckText(MAX_DECISION_CHECK_TEXT_BYTES)
+        try:
+            writer.append(
+                f"decision-check: mode={change_set.mode} paths={len(change_set.paths)} "
+                f"decisions={len(decisions)} policy=advisory"
+            )
+            for decision in decisions:
+                writer.append(
+                    f"\n{_decision_check_cell(decision['id'])}\t{decision['status']}\t"
+                    f"{decision['configured_enforcement']}->{decision['effective_enforcement']}\t"
+                )
+                for index, match in enumerate(decision["matches"]):
+                    if index:
+                        writer.append(", ")
+                    if match["path"] is None:
+                        writer.append("<repository>")
+                    else:
+                        writer.append(
+                            f"{_decision_check_cell(match.get('comparison') or 'selected')}:"
+                            f"{_decision_check_cell(match.get('change_kind') or 'selected')}:"
+                            f"{_decision_check_cell(match['path'])}"
+                        )
+                writer.append(f"\t{_decision_check_cell(decision['title'])}")
+            if not decisions:
+                writer.append("\nNo applicable decisions for this Git change set.")
+        except _DecisionCheckTextOverflow:
+            print(
+                "agent-mesh check decisions: context incomplete: output exceeds the text "
+                "bound; use --json",
+                file=sys.stderr,
+            )
+            return 3
+        print(writer.render())
+        for warning in snapshot.warnings:
+            print(f"warning: {warning}", file=sys.stderr)
+    return 0
+
+
+def _decision_check_cell(value: Any) -> str:
+    sanitized = "".join(character if character.isprintable() else " " for character in str(value))
+    return " ".join(sanitized.split())[:1000]
+
+
+class _DecisionCheckTextOverflow(RuntimeError):
+    pass
+
+
+class _BoundedDecisionCheckText:
+    def __init__(self, max_bytes: int) -> None:
+        self._max_bytes = max_bytes
+        self._size = 0
+        self._chunks: list[str] = []
+
+    def append(self, value: str) -> None:
+        size = len(value.encode("utf-8"))
+        if self._size + size > self._max_bytes:
+            raise _DecisionCheckTextOverflow
+        self._chunks.append(value)
+        self._size += size
+
+    def render(self) -> str:
+        return "".join(self._chunks)
 
 
 def _status_event(config: AgentMeshConfig, args: argparse.Namespace, *, to_status: str) -> None:
@@ -2832,8 +3946,7 @@ def _print_backlog_referral_plan(
     source_qualified = f"{source_project.key}:{source_item['id']}"
     mode = "apply" if apply else "record-only" if record_only else "preview"
     duplicates = (
-        ", ".join(f"{target_project.key}:{item_id}" for item_id in duplicate_candidates)
-        or "none"
+        ", ".join(f"{target_project.key}:{item_id}" for item_id in duplicate_candidates) or "none"
     )
     target_record = (
         f"reuse {target_project.key}:{existing_target}"
@@ -2843,9 +3956,7 @@ def _print_backlog_referral_plan(
     print(f"referral: {referral_id}")
     print(f"mode: {mode}")
     print(f"found: {source_qualified} - {source_item.get('title') or ''}")
-    print(
-        f"proposed target: {target_project.key} ({target_project.id}) at {target_project.root}"
-    )
+    print(f"proposed target: {target_project.key} ({target_project.id}) at {target_project.root}")
     print(f"why ownership differs: {reason}")
     print(f"target record: {target_record}; title={title}")
     print("source records: durable intent, qualified target receipt, and completion event")
@@ -3043,7 +4154,18 @@ def _decision_acceptance_snapshot(
     config: AgentMeshConfig,
     identifier: str,
 ) -> dict[str, Any]:
-    return _decision_metadata_snapshot(config, identifier)
+    snapshot = _decision_metadata_snapshot(config, identifier)
+    try:
+        data = read_verified_decision_body(
+            config.agent_dir,
+            body_path=str(snapshot["body_path"]),
+            body_sha=str(snapshot["body_sha"]),
+            body_bytes=int(snapshot["body_bytes"]),
+        )
+        snapshot["body"] = data.decode("utf-8")
+    except (DecisionBodyIntegrityError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"decision body integrity check failed: {exc}") from exc
+    return snapshot
 
 
 def _decision_metadata_snapshot(
@@ -3078,9 +4200,12 @@ def _decision_metadata_snapshot(
                 "execution_mode": str(item["execution_mode"]),
                 "argv": json_loads(item["argv_json"], None),
                 "expected_signal": str(item["expected_signal"]),
+                "runtime_cost": item["runtime_cost"],
+                "drift_risk": item["drift_risk"],
             }
             for item in conn.execute(
-                "SELECT command, execution_mode, argv_json, expected_signal "
+                "SELECT command, execution_mode, argv_json, expected_signal, "
+                "runtime_cost, drift_risk "
                 "FROM decision_verifications "
                 "WHERE dec_ulid=? ORDER BY rowid",
                 (dec_ulid,),
@@ -3093,6 +4218,25 @@ def _decision_metadata_snapshot(
                 (dec_ulid,),
             )
         ]
+        assumptions = [
+            {
+                "id": str(item["assumption_id"]),
+                "text": str(item["text"]),
+                "references": json_loads(item["references_json"], []),
+            }
+            for item in conn.execute(
+                "SELECT assumption_id, text, references_json FROM decision_assumptions "
+                "WHERE dec_ulid=? ORDER BY rowid",
+                (dec_ulid,),
+            )
+        ]
+        evidence: dict[str, list[str]] = {}
+        for item in conn.execute(
+            "SELECT evidence_kind, ref_value FROM decision_evidence "
+            "WHERE dec_ulid=? ORDER BY evidence_kind, ref_value",
+            (dec_ulid,),
+        ):
+            evidence.setdefault(str(item["evidence_kind"]), []).append(str(item["ref_value"]))
     finally:
         conn.close()
     if row is None:
@@ -3106,12 +4250,14 @@ def _decision_metadata_snapshot(
         candidate = config.agent_dir / body_path
         if candidate.exists():
             body = candidate.read_text(encoding="utf-8")
-    return {
+    snapshot: dict[str, Any] = {
         "dec_ulid": str(row["dec_ulid"]),
         "human_id": str(row["human_id"]),
         "title": str(row["title"]),
         "tier": str(row["tier"]),
         "status": str(row["status"]),
+        "contract_version": int(row["contract_version"] or 0),
+        "applicability_scope": str(row["applicability_scope"]),
         "owner": str(row["owner"] or ""),
         "context": str(meta.get("context") or ""),
         "decision": str(meta.get("decision") or ""),
@@ -3119,12 +4265,49 @@ def _decision_metadata_snapshot(
         "body_path": body_path,
         "body_bytes": int(row["body_bytes"] or 0),
         "body": body,
+        "body_format": str(meta.get("body_format") or DECISION_BODY_FORMAT_UNKNOWN),
         "affected_code_globs": globs,
+        "exemptions": normalize_decision_strings(meta.get("exemptions", [])),
+        "generated_artifact_paths": normalize_decision_strings(
+            meta.get("generated_artifact_paths", [])
+        ),
         "required_checks": checks,
         "verification": verification,
+        "assumptions": assumptions,
+        "evidence": evidence,
+        "review_policy": normalize_decision_review_policy(
+            meta.get("review_policy", {}), allow_extensions=True
+        ),
         "tags": tags,
         "event_seq": int(row["event_seq"]),
     }
+    digest_kwargs: dict[str, Any] = {}
+    if snapshot["contract_version"] >= 5:
+        digest_kwargs = {
+            "assumptions": snapshot["assumptions"],
+            "evidence": snapshot["evidence"],
+            "review_policy": meta.get("review_policy", {}),
+        }
+    snapshot["revision_sha"] = decision_revision_digest(
+        decision_id=snapshot["dec_ulid"],
+        human_id=snapshot["human_id"],
+        title=snapshot["title"],
+        tier=snapshot["tier"],
+        applicability_scope=snapshot["applicability_scope"],
+        owner=snapshot["owner"],
+        context=snapshot["context"],
+        decision=snapshot["decision"],
+        body_sha=snapshot["body_sha"],
+        affected_code_globs=snapshot["affected_code_globs"],
+        exemptions=snapshot["exemptions"],
+        generated_artifact_paths=snapshot["generated_artifact_paths"],
+        required_checks=snapshot["required_checks"],
+        verification=snapshot["verification"],
+        tags=snapshot["tags"],
+        **digest_kwargs,
+    )
+    snapshot["review_progress"] = decision_review_progress(meta, snapshot["revision_sha"])
+    return snapshot
 
 
 def _require_complete_decision(snapshot: dict[str, Any]) -> None:
@@ -3133,6 +4316,9 @@ def _require_complete_decision(snapshot: dict[str, Any]) -> None:
         owner=str(snapshot["owner"]),
         affected_code_globs=snapshot["affected_code_globs"],
         verification=snapshot["verification"],
+        applicability_scope=snapshot["applicability_scope"],
+        exemptions=snapshot["exemptions"],
+        generated_artifact_paths=snapshot["generated_artifact_paths"],
     )
     if issues:
         detail = "; ".join(issues)
@@ -3160,10 +4346,11 @@ def _reject_conflicting_clear_flag(
 def _decision_body_from_args(args: argparse.Namespace) -> str:
     if args.from_file:
         return args.from_file.read_text(encoding="utf-8")
-    return (
-        f"# {args.human_id} — {args.title}\n\n"
-        f"## Context\n{args.context}\n\n"
-        f"## Decision\n{args.decision}\n"
+    return generated_decision_body(
+        args.human_id,
+        title=args.title,
+        context=args.context,
+        decision=args.decision,
     )
 
 
@@ -3180,12 +4367,6 @@ def _write_body(config: AgentMeshConfig, body: str) -> tuple[str, str, int]:
             os.fsync(handle.fileno())
         os.replace(tmp, target)
     return relative.as_posix(), body_sha, len(data)
-
-
-def _new_public_id(prefix: str, actor: str) -> str:
-    stamp = utc_now().replace("-", "").replace(":", "")
-    safe_actor = re.sub(r"[^A-Za-z0-9_-]+", "-", actor).upper()[:20] or "ACTOR"
-    return f"{prefix}-{stamp}-{safe_actor}-{secrets.randbelow(100000):05d}"
 
 
 def _new_decision_id() -> str:
@@ -3240,6 +4421,8 @@ def _allocate_agent_instance_id(config: AgentMeshConfig, *, occurred_utc: str) -
 def _agent_instance_snapshot(
     config: AgentMeshConfig, identifier: str, *, require_active: bool = False
 ) -> dict[str, Any]:
+    if INSTANCE_ID_RE.fullmatch(identifier.strip()):
+        raise ConfigError("raw AI instance IDs are diagnostic-only; use the instance handle")
     conn = connect(config.db_path)
     try:
         initialize_schema(conn)
@@ -3250,7 +4433,7 @@ def _agent_instance_snapshot(
     finally:
         conn.close()
     if require_active and snapshot["status"] != "active":
-        raise ConfigError(f"AGENT_INSTANCE_RETIRED: {snapshot['id']}")
+        raise ConfigError(f"AGENT_INSTANCE_RETIRED: {snapshot['label']}")
     return snapshot
 
 
@@ -3275,21 +4458,17 @@ def _tracked_paths(config: AgentMeshConfig, args: argparse.Namespace) -> list[Pa
         names = _pr_diff_names(config, args.base)
         candidates = [config.project_root / name for name in names]
     else:
-        result = subprocess.run(
-            ["git", "ls-files"],
-            cwd=config.project_root,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode == 0:
-            candidates = [
-                config.project_root / line.strip()
-                for line in result.stdout.splitlines()
-                if line.strip()
-            ]
+        try:
+            raw_paths = read_bounded_git_tracked_paths(config.project_root)
+        except GitChangeUnavailable as exc:
+            if (config.project_root / ".git").exists():
+                raise ConfigError(f"cannot enumerate tracked reference inputs: {exc}") from exc
+            candidates = _bounded_reference_filesystem_paths(config.project_root)
         else:
-            candidates = [path for path in config.project_root.rglob("*") if path.is_file()]
+            candidates = [
+                config.project_root / name
+                for name in _decode_reference_git_paths(raw_paths, operation="git ls-files")
+            ]
 
     patterns = [item.strip() for item in args.paths.split(",") if item.strip()] or ["**/*"]
     return sorted(
@@ -3298,7 +4477,8 @@ def _tracked_paths(config: AgentMeshConfig, args: argparse.Namespace) -> list[Pa
             for path in candidates
             if path.is_file()
             and any(
-                fnmatch.fnmatch(path.relative_to(config.project_root).as_posix(), pattern)
+                pattern == "**/*"
+                or fnmatch.fnmatch(path.relative_to(config.project_root).as_posix(), pattern)
                 for pattern in patterns
             )
         }
@@ -3306,31 +4486,122 @@ def _tracked_paths(config: AgentMeshConfig, args: argparse.Namespace) -> list[Pa
 
 
 def _pr_diff_names(config: AgentMeshConfig, base: str) -> list[str]:
+    failures: list[str] = []
     for ref in (f"origin/{base}", base):
-        result = subprocess.run(
-            ["git", "diff", "--name-only", f"{ref}..HEAD"],
-            cwd=config.project_root,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode == 0:
-            return [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    return []
+        try:
+            raw_paths = read_bounded_git_diff_paths(
+                config.project_root,
+                base_ref=ref,
+            )
+        except GitChangeUnavailable as exc:
+            failures.append(str(exc))
+            continue
+        return _decode_reference_git_paths(raw_paths, operation="git diff")
+    detail = next((item for item in failures if item), "git diff failed")
+    raise ConfigError(f"cannot enumerate PR reference inputs: {detail[:500]}")
 
 
-def _ref_kind(token: str) -> str:
-    if token.startswith("D"):
-        return "decision"
-    if token.startswith("REQ-"):
-        return "request"
-    if token.startswith("RES-"):
-        return "response"
-    if token.startswith("BKL-"):
-        return "backlog"
-    if token.startswith("AI-"):
-        return "agent_instance"
-    return "unknown"
+def _decode_reference_git_paths(raw_paths: bytes, *, operation: str) -> list[str]:
+    if raw_paths and not raw_paths.endswith(b"\0"):
+        raise ConfigError(f"{operation} returned an incomplete NUL-delimited path list")
+    paths: list[str] = []
+    for raw_path in raw_paths.split(b"\0"):
+        if not raw_path:
+            continue
+        if len(paths) >= MAX_REFERENCE_CHECK_PATHS:
+            raise ConfigError(
+                f"{operation} exceeds {MAX_REFERENCE_CHECK_PATHS} reference input paths"
+            )
+        if len(raw_path) > MAX_REFERENCE_CHECK_PATH_BYTES:
+            raise ConfigError(
+                f"{operation} returned a path longer than "
+                f"{MAX_REFERENCE_CHECK_PATH_BYTES} UTF-8 bytes"
+            )
+        try:
+            path = raw_path.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ConfigError(f"{operation} returned a non-UTF-8 path") from exc
+        candidate = Path(path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ConfigError(f"{operation} returned a path outside the project root")
+        paths.append(path)
+    return paths
+
+
+def _bounded_reference_filesystem_paths(
+    project_root: Path,
+    *,
+    max_entries: int = MAX_REFERENCE_CHECK_FILESYSTEM_ENTRIES,
+    deadline_monotonic: float | None = None,
+) -> list[Path]:
+    """Enumerate regular files without following symlinks or walking without bounds."""
+
+    root = project_root.resolve()
+    deadline = (
+        deadline_monotonic
+        if deadline_monotonic is not None
+        else time.monotonic() + MAX_REFERENCE_CHECK_FILESYSTEM_SECONDS
+    )
+    paths: list[Path] = []
+    pending = [root]
+    visited_entries = 0
+    while pending:
+        if time.monotonic() >= deadline:
+            raise ConfigError(
+                "filesystem reference scan exceeded its time budget; use explicit --file inputs"
+            )
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as stream:
+                entries: list[os.DirEntry[str]] = []
+                for entry in stream:
+                    if time.monotonic() >= deadline:
+                        raise ConfigError(
+                            "filesystem reference scan exceeded its time budget; "
+                            "use explicit --file inputs"
+                        )
+                    if visited_entries >= max_entries:
+                        raise ConfigError(
+                            f"filesystem reference scan exceeds {max_entries} visited entries; "
+                            "use explicit --file inputs"
+                        )
+                    visited_entries += 1
+                    entries.append(entry)
+                entries.sort(key=lambda entry: entry.name, reverse=True)
+        except OSError as exc:
+            raise ConfigError(f"cannot enumerate reference inputs in {directory}: {exc}") from exc
+        for entry in entries:
+            if time.monotonic() >= deadline:
+                raise ConfigError(
+                    "filesystem reference scan exceeded its time budget; use explicit --file inputs"
+                )
+            path = Path(entry.path)
+            relative = path.relative_to(root)
+            try:
+                relative_bytes = relative.as_posix().encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ConfigError("filesystem reference scan found a non-UTF-8 path") from exc
+            if len(relative_bytes) > MAX_REFERENCE_CHECK_PATH_BYTES:
+                raise ConfigError(
+                    "reference scan found a path longer than "
+                    f"{MAX_REFERENCE_CHECK_PATH_BYTES} UTF-8 bytes"
+                )
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+            except OSError as exc:
+                raise ConfigError(f"cannot inspect reference input {path}: {exc}") from exc
+            if len(paths) >= MAX_REFERENCE_CHECK_PATHS:
+                raise ConfigError(
+                    f"reference scan exceeds {MAX_REFERENCE_CHECK_PATHS} filesystem paths"
+                )
+            paths.append(project_root / relative)
+    return paths
 
 
 # ---------------------------------------------------------------------------

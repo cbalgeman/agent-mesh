@@ -6,10 +6,16 @@ the source of truth, inspect the target repository yourself, and ask the human
 only for project-local choices that cannot be inferred.
 In short: ask the human only for project-local choices that cannot be inferred.
 
-The human should be able to use either flow:
+The human should be able to use either flow. The PyPI wheel installs the runtime
+and command-line tools; the official GitHub repository supplies the adoption
+documents:
 
-1. Pull or download this repository, then point an agent at the local checkout.
-2. Point an agent at the GitHub repository URL and let the agent fetch or read it.
+1. Install `my-agent-mesh` from PyPI, give the agent the target repository, and
+   require it to read the official sources at
+   <https://github.com/cbalgeman/agent-mesh/blob/main/README.md> and
+   <https://github.com/cbalgeman/agent-mesh/tree/main/docs> before setup.
+2. Point an agent at the GitHub repository URL and let the agent read these
+   adoption instructions before installing the package.
 
 If you cannot access the URL because network access is unavailable, ask the
 human to provide a local clone, download, or archive. Continue from the local
@@ -33,51 +39,62 @@ and implement.
 If the human gives you only the repository path or URL, treat this as the task:
 
 ```text
-Add agent-mesh to my target repository. Use the agent-mesh repo I gave you as
-the implementation source. Read its README, adoption, configuration, privacy,
-and migration docs, inspect my target repo, summarize the setup decisions I need to
-make, and ask me only for missing choices. Wait for my response, record my
-durable approved choices in the Agent Mesh decision log, then implement the
-approved setup, run verification, create a smoke-test request, start the
-Workbench as an automatic per-user service, and give me the Workbench bookmark.
-Show me where to review my recorded choices in the Workbench's Decisions tab.
+Add Agent Mesh to my target repository. Install or upgrade `my-agent-mesh` from
+PyPI. Read the official README and adoption, configuration, privacy, and
+migration docs from https://github.com/cbalgeman/agent-mesh/tree/main; those
+documents are not bundled in the installed wheel. Inspect my target repo;
+summarize the setup decisions I need to make; and ask me only for missing
+choices. Wait for my response, record my durable choices as Proposed Agent Mesh
+decisions, then implement the approved setup, run verification, create a
+smoke-test request, start the Workbench as an automatic per-user service, and
+give me the Workbench bookmark. Show me where to review and approve my recorded
+choices in the Workbench's Decisions tab.
 ```
 
 ## Required Source Reading
 
-Read these files from the `agent-mesh` repository before modifying the target
-repo:
+Read these files from the `agent-mesh` repository—the official GitHub source—
+before modifying the target repo:
 
-- `README.md`
-- `docs/adoption.md`
-- `docs/configuration.md`
-- `docs/privacy.md`
-- `docs/migration.md`
+- [`README.md`](https://github.com/cbalgeman/agent-mesh/blob/main/README.md)
+- [`docs/adoption.md`](https://github.com/cbalgeman/agent-mesh/blob/main/docs/adoption.md)
+- [`docs/configuration.md`](https://github.com/cbalgeman/agent-mesh/blob/main/docs/configuration.md)
+- [`docs/dispatch-contract.md`](https://github.com/cbalgeman/agent-mesh/blob/main/docs/dispatch-contract.md)
+- [`docs/review-assurance-contract.md`](https://github.com/cbalgeman/agent-mesh/blob/main/docs/review-assurance-contract.md)
+- [`docs/privacy.md`](https://github.com/cbalgeman/agent-mesh/blob/main/docs/privacy.md)
+- [`docs/migration.md`](https://github.com/cbalgeman/agent-mesh/blob/main/docs/migration.md)
 
 Use `docs/migration.md` when the target repository already has coordination
 scripts, markdown queues, issue labels, chat exports, or task boards. Use
 `docs/configuration.md` for participant names, aliases, identity defaults, and
 generated compatibility views.
 
-## Adoption Modes and Workflow Boundaries
+## Adoption Boundaries
 
-Normal adoption adds Agent Mesh to a separate consumer repository. Self-hosting
-is the special case where the `agent-mesh` package repository is also the
-consumer. When self-hosting, keep tracked product files separate from the local
-canonical coordination state in `.agent-mesh/events.jsonl`, and record material
-workflow friction or uncertainty as linked package backlog work.
-
-Runtime integration is a separate operation from adoption: a participant name
+Runtime integration is separate from adoption: a participant name
 is a routing identity, not proof that a CLI/model is installed, authenticated,
 correctly billed, or able to access the repo, tools, and internet. External
 relays are separate again: preserve them as read-only evidence and explicitly
 triage and reproduce their findings before promoting them into the target repo.
 
-Requests, responses, and backlog items can record one of these lanes in the
-first-class `workflow_origin` field: `self-hosting`, `runtime-integration`, or
-`external-input`. The CLI exposes this as `--origin`; compatibility records may
-also use `origin:<lane>` references. Do not overload backlog scheduling fields
-to represent where a finding came from.
+Requests, responses, and backlog items can preserve their source in the
+first-class `workflow_origin` field exposed by the CLI as `--origin`. Use
+`runtime-integration` for findings about an executable agent integration and
+`external-input` for relayed findings from another repository. Do not overload
+backlog scheduling fields to represent provenance.
+
+Explicit durable delegation should use the high-level Dispatch flow when the
+selected runtime integration supports it. This remains portable across models
+and harnesses because enforcement depends on the frozen canonical policy,
+current RES, and assurance evidence—not on an agent remembering a particular
+hook. Harness-native and external/manual delegation remain valid when labelled
+truthfully; they are not managed launches.
+
+For detailed reviews, specifications, test reports, and design documents, use
+project-owned files rather than stretching REQ/RES into document storage. Keep
+the REQ as the concise contract and the RES as the concise material outcome,
+then record typed, content-bound artifact references through `review.v1`.
+Agent Mesh does not publish, copy, or grant access to a referenced file.
 
 ## Default Selective Chat-to-Mesh Policy
 
@@ -133,7 +150,7 @@ chat session as an adoption default.
 
 ## Backlog ID Allocation
 
-Create a normal package backlog item without manually coordinating a
+Create a normal project backlog item without manually coordinating a
 date/sequence number. `backlog create` atomically allocates
 `BKL-YYYYMMDD-NN` in the project's persisted human-user IANA timezone and
 prints the new human-facing ID:
@@ -143,11 +160,26 @@ agent-mesh backlog create --title "Investigate the reproduced issue" \
   --status open --lane next-up --priority P1
 ```
 
-New items require `--title` or JSON field `title`. Use `backlog upsert --id`
-when updating an existing item or preserving an externally allocated/imported
-ID. The compatibility `upsert` surface can also allocate an ID when omitted,
-but normal creation should use `backlog create`. Existing arbitrary or temporary
-ULID-form backlog IDs remain valid without format-specific compatibility code.
+New items require `--title` or JSON field `title`. Use `backlog update BKL-ID`
+when updating an existing item. `backlog upsert --id` is only for preserving a
+missing externally allocated/imported ID and fails with `BACKLOG_ID_COLLISION`
+if that ID already exists. The compatibility `upsert` surface can also allocate
+an ID when omitted, but normal creation should use `backlog create`. Existing
+arbitrary or temporary ULID-form backlog IDs remain valid without format-specific
+compatibility code.
+
+## Legacy Project Identity Migration
+
+Repositories created before the `[project]` table remain readable. `agent-mesh
+adopt --repo <path> --check` identifies that shape as a project-identity
+migration, separately from stale or conflicting managed instructions. Running
+`agent-mesh adopt --repo <path>` holds the project-identity lock, preserves the
+existing config text and file mode, and appends one canonical `[project]` table
+with the existing effective name and sender/recipient identities plus a stable
+timezone, project key, and `store_...` ID. Repeated or concurrent runs reuse the
+same result. Same-root legacy Workbench registry rows are upgraded through the
+normal collision-safe registry path; a store ID claimed by another live root is
+never reassigned.
 
 ## Target-Repo Procedure
 
@@ -159,8 +191,8 @@ ULID-form backlog IDs remain valid without format-specific compatibility code.
    `agent-mesh` project that only needs configuration changes.
 5. Summarize the setup decisions for the human before implementation:
    - participant names and roles;
-   - whether parallel long-running chats need distinct instance labels and
-     workstreams under the same participant;
+   - whether parallel work contexts need distinct public instance handles and
+     durable roles under the same participant;
    - default human/user sender identity;
    - default recipient agent;
    - optional aliases such as `reviewers` or `all`;
@@ -168,22 +200,33 @@ ULID-form backlog IDs remain valid without format-specific compatibility code.
    - whether compatibility views are needed;
    - whether Agent Mesh state stays `local-only` or is explicitly `git-shared`;
    - whether to add `CLAUDE.md` / `AGENTS.md` workflow instructions;
-   - whether to suggest hooks or install agent skills.
+   - whether to suggest hooks or install agent skills;
+   - whether managed dispatch is needed, which runtime profiles are eligible,
+     and whether subject-bound review is advisory or blocking;
+   - which human identities—not agent participants—may directly approve
+     decisions.
 6. Ask the human only for choices that cannot be inferred; then wait for the human's response before implementing the setup.
-7. Install or run `agent-mesh` from the source checkout.
+7. Install or upgrade the published package with
+   `python -m pip install --upgrade my-agent-mesh`, then run
+   `agent-mesh --help` and `agent-q --help`.
 8. Initialize or update the target repo using the approved participants and
    defaults so the decision log is available.
-9. If parallel long-running chats need direct attribution or handoffs, register
-   each active chat with `agent-mesh instance register`. Give each chat its own
-   ID or label binding; do not infer that two windows are one instance merely
-   because they use the same provider. Record only a digest when an external
-   provider session reference is supplied.
+9. If parallel work contexts need direct attribution or handoffs, configure a
+   trusted runtime integration to perform the automatic identity handshake. Use
+   `agent-mesh instance register --handle <participant>-<durable-role>` only as
+   an unmanaged compatibility fallback. Bind and address normal commands by
+   public handle, never by the hidden project-local ID. Do not infer provider
+   continuity from a process name or window; if a provider reference is needed,
+   compute its project-scoped digest privately and supply only the digest.
 10. Run `agent-mesh adopt --repo .` to install the versioned managed instruction
    contract, then run `agent-mesh adopt --repo . --check`. Remove or rewrite any
    conflicting legacy instruction that still tells an agent to write a Markdown
    decision log. Tell the human that ordinary chat remains chat-only, durable
    coordination is promoted selectively, and ambiguous promotion waits for
-   their explicit confirmation.
+   their explicit confirmation. If a supported runtime will perform durable
+   delegation, direct agents to the Workbench Dispatch flow or
+   `agent-q dispatches run`; do not present an optional hook as the delegation
+   transport or as assurance evidence.
 11. Ensure the repo is in the machine-local Workbench registry. `agent-mesh init`
    does this automatically; for an existing initialized repo, run
    `agent-mesh projects register --repo .`. Registration is inferred operational
@@ -286,6 +329,17 @@ that every repository reader may see it. For that case only, initialize with
 `--state-sharing git-shared`. Git-shared mode allowlists config, events, and
 externalized bodies; attachments and generated runtime state remain local.
 
+Append-only corrections do not remove prior bytes, and current Agent Mesh has no
+automatic redaction, retention, or privacy-export command. Before recording
+sensitive material or sharing a repository, read `docs/privacy.md` and the
+`docs/privacy-lifecycle.md` contract. Development provenance is tracked by
+decision `D008` in the full development checkout. Public packages do not include
+that canonical decision state. Current CLI help and release notes must
+independently advertise any capability that later lands.
+Emergency canonical or Git-history rewriting, attachment deletion, remote
+updates, and backup destruction always require a separate reviewed plan and
+direct human authorization.
+
 ## Fresh Setup Commands
 
 Run from the target repository. Replace the source path and identities with the
@@ -321,12 +375,16 @@ agent-mesh workbench service install --repo . --host 127.0.0.1 --port 8767 --ope
 agent-mesh workbench service status
 ```
 
-This is an install-once, per-user service. It uses the native user supervisor on
-macOS (`launchd`), Linux (`systemd --user`), or Windows (Task Scheduler), starts
-at sign-in, and restarts after a process failure. It does not require an
-administrator account in the normal desktop setup. Re-running `service install`
-is safe and updates the existing definition, so each adopting agent should run
-it instead of asking whether another repo already installed the service.
+Agent Mesh defines native supervisor formats for macOS (`launchd`), Linux
+(`systemd --user`), or Windows (Task Scheduler). D015 activates the install-once,
+per-user service only on macOS and Linux, where it starts at sign-in and restarts
+after a process failure. Activation fails closed on Windows before filesystem or
+Task Scheduler mutation. Windows support is deferred until reparse-safe relative
+handles, durable replacement, and an installed recovery vertical are separately
+approved and verified. The supported desktop setup does not require an
+administrator account. Re-running `service install` is safe and updates the
+existing definition, so each adopting agent should run it instead of asking
+whether another repo already installed the service.
 
 There is one service and one multi-repo Workbench per user, not one background
 process per project. Registered repositories appear in the repository selector.
@@ -336,9 +394,53 @@ automatic-startup status and a `Reconnect` button. When a restart leaves an
 already-open page with the prior access token, the page automatically reloads
 the latest private bookmark once. A successful health check clears that bounded
 attempt so a later restart can recover too; `Reconnect` remains the explicit
-fallback. It does not execute a shell command. Browser pages cannot safely and
-portably launch arbitrary native processes, so native supervision is the
-cross-platform startup boundary.
+fallback. When an endpoint-capable managed process reports exact
+`WORKBENCH_RESTART_REQUIRED`, the bookmark first records one attempt in its URL,
+then sends one authenticated zero-body request to the fixed restart endpoint.
+The server closes new POST admission, waits at most ten seconds for admitted
+writes to finish and flush their responses, flushes a fixed acceptance, and
+returns runner exit code 75. The bookmark does not retry an indeterminate POST;
+it polls health at most 45 times over 90 seconds, with a two-second bound on each
+request. A replacement-token 403 carries the attempt marker through the existing
+single bookmark reload, and only a successful authenticated health response
+clears both markers. It does not execute a shell command. Browser pages cannot
+safely and portably launch arbitrary native processes, so native supervision is
+the cross-platform startup boundary.
+
+The server fingerprints the installed Agent Mesh Python package when it starts.
+If drift is present when a request is admitted, the health endpoint reports
+`WORKBENCH_RESTART_REQUIRED` and POST fails before its request body is read. The
+server checks again after parsing and before dispatch, then latches the
+restart-required state so an older in-flight response cannot re-enable controls.
+These checks are fail-closed drift detection, not filesystem-update/request
+synchronization. A process from before the restart endpoint needs one final
+explicit stop followed by service installation to establish D015 ownership.
+Endpoint-capable reachable managed processes can retire through the bounded
+protocol; offline or broken configured services still require restart, repair,
+or direct-human relinquishment/uninstall. Stop/start an authorized manual server
+around an upgrade. `agent-mesh workbench service status` reports native
+supervisor, ownership, and authenticated API state separately.
+
+launchd `KeepAlive` and systemd `Restart=on-failure` are rendered supervisor
+intent. The macOS definition also makes launchd own the exact IPv4 loopback
+listener; the runner adopts only the single named listening socket matching its
+configured host and port. A bounded bookmark health request can therefore
+provide on-demand relaunch pressure after exit `75`, even when the GUI domain
+defers unconditional `KeepAlive` work. Existing launchd installations need
+`agent-mesh workbench service repair --repo <path>` or a fresh install to receive
+that definition. Task Scheduler output is conformance-only while D015 Windows
+activation is deferred. Rendered intent is not evidence that an installed
+supervisor actually relaunched exit 75. The release evidence matrix is:
+
+| Platform | Endpoint and runner evidence | Installed-supervisor relaunch |
+|---|---|---|
+| macOS | Two controlled live source-drift requests returned `202` and each old runner exited `75`. | Verified on 2026-09-01: launchd retained the named listener, started a replacement, rotated the private bookmark token, and authenticated health returned ready. |
+| Linux | Not exercised in the release environment. | Unverified. |
+| Windows | Rendered task uses schema-valid retry count `3`; D015 activation rejects lifecycle mutation. | Deferred by D015. |
+
+The managed panel keeps exact status, start, restart, and install commands
+visible and copyable when recovery is unavailable. A platform becomes verified
+only after a named installed vertical proves exactly one relaunch.
 
 Use these lifecycle commands for diagnosis or removal:
 
@@ -347,11 +449,24 @@ agent-mesh workbench service status
 agent-mesh workbench service open
 agent-mesh workbench service start --open
 agent-mesh workbench service restart --open
+agent-mesh workbench service repair --repo . --open
+agent-mesh workbench service relinquish
 agent-mesh workbench service uninstall
 ```
 
-If the platform does not provide a supported per-user supervisor, preserve the
-manual fallback and report that limitation clearly:
+`relinquish` and `uninstall` require the direct human to type `RELINQUISH`.
+Relinquishment closes new Workbench admission, waits at most ten seconds for
+admitted requests, disables native supervisor relaunch, and only then records
+manual authority. A timeout or supervisor-removal failure changes no ownership
+state. If an interrupted Workbench dispatch has a canonical run ID, the command
+returns the exact direct-CLI `agent-q recover --resolve-dispatch=...` action;
+dispatch recovery remains a separate D014 operation.
+After relinquishment, only explicit `service start` or `service install` can
+reclaim managed ownership, and the human must type `ACTIVATE`. `service open`
+does not implicitly reactivate, and `repair` cannot replace that human action.
+
+Use the manual server only after ownership is positively `absent` or the human
+has explicitly relinquished it:
 
 ```bash
 agent-mesh workbench --repo . --host 127.0.0.1 --port 8767
@@ -373,9 +488,15 @@ runtime state outside project repositories. Manual project bookmarks remain
 ignored by Git. Registered project state and attachment paths must remain
 physically inside the selected repo and must not traverse symlinks.
 The native service definition stores the Python executable, anchor repo,
-loopback host, port, and machine-local config path; it does not store the
-Workbench access token. A fresh token is generated when the process starts and
-is written only to the private bookmark.
+loopback host, port, machine-local config path, and non-secret ownership
+generation; it does not store the Workbench access token. A fresh token is
+generated when the process starts and is written only to the private bookmark.
+The ownership record and lock live in one deterministic OS-user authority root
+independent of repository, virtual environment, and `AGENT_MESH_CONFIG_HOME`.
+Its persisted modes are `absent`, `activating`, `configured`, and `relinquished`;
+`verified`, `configured_unavailable`, `invalid`, and `legacy_uninitialized` are
+observations, not persisted modes. `service status` prints the current generation
+and monotonic ownership revision without exposing the token.
 
 For the automatic service, report these outputs to the human:
 
@@ -386,10 +507,70 @@ For the automatic service, report these outputs to the human:
   definition and the managed health check passed.
 
 Installing, starting, restarting, or opening the managed service rewrites the
-anchor repo's old `.agent-mesh/workbench.html` as a token-free pointer page. It
-must identify itself as the manual project bookmark and link to the stable
-private managed bookmark. This prevents an old repo-local bookmark from silently
-steering the human back to a stale manual port or copied restart command.
+old `.agent-mesh/workbench.html` for every valid registered repository as a
+token-free pointer page. It identifies itself as the manual project bookmark and
+links to the stable private managed bookmark. A later manual-server start must
+preserve that pointer while current ownership supplies the valid managed target.
+Invalid ownership renders recovery guidance without inventing a link. This prevents an
+old repo-local bookmark from silently steering the human back to a stale manual
+port or copied restart command.
+
+Every authenticated health response identifies the server as managed or manual
+and reports its installed package root, optional positively detected source
+checkout, anchor repository, loopback endpoint, and port without returning the
+access token. The page shows those facts above the workflow tabs. A manual server
+reads the current ownership record for every project API without a negative
+authorization cache. When a managed service is `activating` or `configured`, the
+manual server refuses all live reads and writes before reading project state;
+an authenticated generation-bound health response is shown as verified
+authority, while missing or unreachable managed health is shown only as
+configured-unavailable. The latter is not represented as a live listener and
+does not restore manual access.
+
+The recovery surface does not scan for or kill operating-system PIDs. Open the
+private managed bookmark and stop a verified manual server from the terminal
+that launched it. If managed authority is configured but unavailable, run
+`agent-mesh workbench service status`, use `restart` or `repair`, or have the
+human explicitly run `service relinquish`/`uninstall` before starting the manual
+server. Missing or malformed ownership state is fail-closed. On the first D015
+upgrade, explicitly stop every pre-D015 Workbench process, then run `service
+install`; a manual launch initializes `absent` only after bounded proof that no
+managed definition, metadata, bookmark, or prior activation marker exists.
+The production authority root is derived from the OS account and ignores
+inherited `HOME`, XDG, and Agent Mesh configuration overrides. The account-home
+lock anchor is accepted only when its complete parent ancestry is neither owned
+nor writable by that account, so the anchor inode cannot be replaced by a second
+compliant process. Native-service
+transitions use a stable OS-account lock plus a nonce-bound quiesce claim. The
+kernel lock is released while already-admitted requests and marker-bound child
+appends drain, then reacquired before the claim, generation, revision, descriptor
+chain, and empty inventories are revalidated for definition, metadata,
+supervisor, or final-record work. Reinstall and repair quiesce and drain an
+existing managed generation before replacing it.
+
+Every project-backed Workbench read or in-process mutation holds a generation
+and ownership-revision lease through project access and response flush. A
+Workbench-launched CLI subprocess carries a closed, bounded, expiring envelope
+with that binding, repository identity, operation, and parent identity; it
+consumes the envelope before launching probes or provider/model grandchildren
+and revalidates before every canonical append. Direct terminal invocations of
+`agent-mesh` and `agent-q` do not carry this envelope and retain their existing
+canonical authority. The repository mail lock, semantic replay, D014 assurance,
+and direct-human approval remain separate controls.
+
+Managed admission requires an exact match on both the final configured
+generation and `ownership_revision`; a same-generation stale runner is rejected
+by health, reads, mutations, and child append admission. Incomplete dispatch
+markers survive subprocess failure or parent loss. When relinquishment reports
+`dispatch_recovery_required`, run its exact
+`agent-q recover --resolve-dispatch=<run-id>` command from the named repository.
+It performs bounded, idempotent D014 terminal/suffix reconciliation, rebuilds,
+verifies the canonical lifecycle, and retires only the matching marker. Then
+retry relinquishment; a repeated recovery command performs no canonical write.
+Registered bookmark routing uses a non-mutating byte-, entry-, and
+deadline-bounded registry read. A managed bookmark path is shown or copied into
+a token-free project pointer only after a bounded no-follow read proves its
+loopback endpoint matches the ownership record.
 
 For the manual fallback, also report the restart command, shell-quoted if the
 repository path contains spaces.
@@ -406,8 +587,13 @@ Tell the human to bookmark the Workbench file path. With the automatic service,
 the native supervisor starts the server at sign-in and the page retries its
 connection when opened or focused. An exact managed-token mismatch triggers one
 automatic reload of that private bookmark; other authorization failures remain
-visible and do not auto-navigate. With the manual fallback, the human or an agent
-must run the restart command before using live actions.
+visible and do not auto-navigate. Exact stale-code output may additionally
+trigger the single bounded supervised-restart attempt described above. A drain
+timeout, a stale replacement, or an expired relaunch window stops automatic
+recovery and displays status, restart, repair, and direct-human relinquishment
+surfaces. Reopening the unmarked bookmark is a new direct user action. With an
+authorized manual server, the human or an agent must run the restart command
+before using live actions.
 
 Explain that the bookmark is a static launcher and viewer shell: live queries,
 uploads, drafts, and submissions require the local server. The connection banner
@@ -494,16 +680,13 @@ feedback as human-authored observations:
 
 1. Read the full request packet and thread.
 2. Preserve the raw human notes.
-3. Identify the workflow origin: self-hosting, runtime integration, or external
-   input. Preserve a source path or URI for external input.
+3. Identify the workflow origin and preserve a source path or URI for external
+   input.
 4. Classify durable findings into current work, backlog, future, duplicate,
    known issue, needs investigation, or no action.
-5. Create or update backlog items only for durable findings. During
-   self-hosting, every material challenge or unresolved uncertainty is durable
-   enough to record, even if the immediate request can use a workaround.
-6. Link backlog items to the originating request or response and set the
-   applicable `--origin` value: `self-hosting`, `runtime-integration`, or
-   `external-input`.
+5. Create or update backlog items only for durable findings.
+6. Link backlog items to the originating request or response and preserve the
+   applicable `--origin` value.
 7. Reply with a concise summary and a structured triage block.
 8. Close the feedback request only after triage is complete or the human says to
    close it.
@@ -520,8 +703,104 @@ Run the smallest useful set for the setup:
 agent-q status
 agent-q list --status open
 agent-q packet --id <REQ-id>
+agent-q context bootstrap --pretty
+agent-q decisions preflight --path <repo-relative-path> --json
+agent-q decisions preflight --path <repo-relative-path> --digest
+agent-mesh doctor --context-budget
 agent-q verify-chain .agent-mesh/events.jsonl
 ```
+
+Repeat `--path` for the initial planned file set. A complete response with
+`decisions=[]` is a valid empty result. An unavailable or incomplete response is
+not evidence that no decisions apply; report it before continuing and rerun the
+preflight if the path set materially expands.
+
+### Zero-hook context bootstrap
+
+`agent-q context bootstrap` is the portable discovery and freshness boundary
+for model or harness changes. It reads one verified canonical snapshot and only
+the fixed managed-contract targets. It does not scan `.claude`, install hooks,
+copy decision meanings, or mutate `.agent-mesh`.
+
+Exit `0` means retrieval was complete, not that lifecycle integration exists.
+The sibling context-delivery report may truthfully show every capability as
+`unreported` without changing adoption health or exit codes. Exit `2` means an
+explicit prior cursor, delivery report, or mapping fixture was invalid. Exit
+`3` means context was unavailable or incomplete; never treat it as an empty
+result.
+
+Harnesses can retain only the structured cursor and supply it later with
+`--prior-cursor`. The cursor is project-private, forgeable comparison metadata,
+not an authentication or integrity credential. See
+[Canonical Context Delivery Contract](context-delivery-contract.md) and the
+wheel-available `--builtin-mapping claude|codex-hermes|generic-local` fixtures.
+The GitHub repository retains matching reviewable JSON under
+`examples/context-delivery/`.
+
+### Optional edit/write retrieval
+
+Harnesses that can observe edits or writes may call `agent-q decisions hook`
+when a task first touches a path outside its initial preflight set. The command
+reads a bounded `agent-mesh.decision-hook-request.v1` JSON object from stdin and
+returns the same `agent-mesh.decision-context.v1` envelope as task preflight.
+Exit `0` means complete context, `2` means invalid input, and `3` means context
+is unavailable or incomplete. Exit `3` is never a valid empty result.
+
+This integration is optional and provider-neutral. Agent Mesh does not install
+the hook, launch a provider, or turn an advisory result into a blocking edit.
+See [Decision Edit/Write Hook Contract](decision-hook-contract.md) and the
+reference adapter in `examples/decision-hook/harness.py`. That contract also
+ships a Claude Code `PreToolUse` recipe which injects the compact digest for the
+actual `Edit` or `Write` path without making a permission decision.
+
+### Context-budget inventory
+
+`agent-mesh doctor --context-budget` measures the configured repository-root
+instruction files plus representative `preflight --digest` output. The default
+files are `AGENTS.md`, `CLAUDE.md`, and `MEMORY.md`; missing files contribute
+zero bytes and unsafe or changing files make the report incomplete. Token counts
+use a transparent four-bytes-per-token estimate rather than claiming a provider
+tokenizer result. `residency_status` remains `unknown` for files and `potential`
+for hook samples because Agent Mesh cannot prove what a harness actually loaded.
+
+Use `--scope registered-projects` only when you deliberately want a machine-wide
+comparison across the explicit Agent Mesh project registry. The command does not
+walk project trees, `.claude`, user home directories, transcripts, or credentials,
+and it does not append canonical events. Exact duplicate hashes identify review
+candidates without claiming that differently worded instructions are equivalent.
+The command exits `0` for a complete report and `3` when a safety or inspection
+bound makes the report incomplete. Registry enumeration, instruction reads, and
+in-memory canonical replay share one wall-clock, byte, and event budget.
+
+Configure each repository independently:
+
+```toml
+[context_budget]
+ceiling_bytes = 131072
+instruction_paths = ["AGENTS.md", "CLAUDE.md", "MEMORY.md"]
+hook_sample_paths = ["AGENTS.md"]
+```
+
+Instruction paths are intentionally limited to repository-root files. Hook sample
+paths are repository-relative lexical paths used only for decision applicability;
+they are not opened as files. Exceeding the ceiling is report-only in 0.4.0.
+
+### Canonical decision tiers
+
+Tier IDs are fixed protocol semantics in 0.4.0. Projects may use decision tags for
+their own categories but cannot rename, remove, or weaken the five canonical tier
+IDs. Preserved historical values remain readable with `tier_valid=false` and no
+effective enforcement. Audit and normalize them explicitly:
+
+```bash
+agent-q decisions list --invalid-tier
+agent-mesh decision amend D123 --tier architecture_contract \
+  --reason "Normalize the imported historical tier"
+```
+
+An accepted or in-force record returns to Proposed after this revision and needs
+fresh direct-human approval. Agent Mesh never silently rewrites the historical
+event that supplied the invalid value.
 
 If backlog or decision domains are used:
 

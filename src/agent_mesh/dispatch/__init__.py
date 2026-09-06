@@ -54,6 +54,7 @@ from .emitter import (
 )
 from .eval import GATE_HALTS, case_set_digest, eval_fingerprint, gate, run_evals
 from .execution import AgentLauncher, execute_launch_plan
+from .assurance import AssuranceGateResult, evaluate_review_assurance
 from .grounding import (
     GroundingResult,
     Section,
@@ -64,7 +65,23 @@ from .grounding import (
 )
 from .guard import GUARD_VERSION, artifact_hash, guarded_apply
 from .output_policy import ResponseCandidateDecision, extract_response_candidate
+from .policy import (
+    DispatchOutcome,
+    DispatchPolicyError,
+    DispatchPolicySnapshot,
+    append_dispatch_policy,
+    build_dispatch_policy,
+    current_dispatch_outcome,
+)
 from .runtime import DEFAULT_CODEX_BINARY, AgentProcessLauncher, CodexCliRuntimeAdapter
+from .runtime_registry import (
+    RuntimeAdapterDriver,
+    RuntimeAdapterRegistry,
+    RuntimeDriverContext,
+    RuntimePreflightCheck,
+    RuntimePreflightResult,
+    built_in_runtime_registry,
+)
 from .types import AgentLaunchResult, AgentLaunchSpec, AgentRunRequest, EvalCase, EvalSuite, Message, RunPlan, RunRecord
 
 __all__ = [
@@ -99,6 +116,14 @@ __all__ = [
     # execution seam
     "execute_launch_plan",
     "AgentLauncher",
+    "DispatchPolicyError",
+    "DispatchPolicySnapshot",
+    "DispatchOutcome",
+    "build_dispatch_policy",
+    "append_dispatch_policy",
+    "current_dispatch_outcome",
+    "AssuranceGateResult",
+    "evaluate_review_assurance",
     # dispatch engine
     "to_message",
     "responders_by_thread",
@@ -131,6 +156,12 @@ __all__ = [
     "CodexCliRuntimeAdapter",
     "AgentProcessLauncher",
     "DEFAULT_CODEX_BINARY",
+    "RuntimeAdapterDriver",
+    "RuntimeAdapterRegistry",
+    "RuntimeDriverContext",
+    "RuntimePreflightCheck",
+    "RuntimePreflightResult",
+    "built_in_runtime_registry",
     # grounding engine
     "assemble_grounding",
     "build_prompt",

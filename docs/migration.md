@@ -43,8 +43,8 @@ For each source, classify it:
 - stale/archive: useful for search but not authoritative
 
 Only one imported path should become canonical in `agent-mesh/events.jsonl`.
-Everything else should become provenance, a compatibility view, or remain outside
-the package.
+Everything else should become provenance, a compatibility view, or remain in
+its original system.
 
 ## 2. Initialize a Shadow Mesh
 
@@ -192,15 +192,11 @@ Use this order:
    manifest, restore test, and explicit approval.
 
 If a legacy date, status, or owner is wrong, correct it in the importer or append
-a migration correction event with provenance. Do not hide project-specific
-corrections in package display code.
+a migration correction event with provenance.
 
-## 7. Keep the Package Boundary Clean
+## 7. Keep Migration Code Project-Local
 
-Reusable fixes belong in `agent-mesh` when they apply to many projects: schema
-validation, chain verification, rendering, generic CLI commands, recovery
-reports, and workbench affordances.
-
-Project-specific behavior belongs in your repo: old filename conventions,
-custom date repairs, issue-tracker adapters, domain-specific backlog rules, and
-one-time import parsers.
+Keep old filename conventions, custom date repairs, issue-tracker adapters,
+domain-specific backlog rules, and one-time import parsers in the repository
+being migrated. This keeps project-specific assumptions visible to the people
+who own the migrated workflow.

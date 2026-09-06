@@ -14,11 +14,17 @@ from __future__ import annotations
 import uuid
 from abc import abstractmethod
 from contextlib import AbstractContextManager
+from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING, Callable
 
 from agent_mesh.adapters.base import Adapter
+from agent_mesh.core.agent_instances import RuntimeIdentityHandshake
 
-from .types import AgentLaunchSpec, AgentRunRequest, Message, RunRecord
+from .types import AgentLaunchResult, AgentLaunchSpec, AgentRunRequest, Message, RunRecord
+
+if TYPE_CHECKING:
+    from .output_policy import ResponseCandidateDecision
 
 
 class StoreAdapter(Adapter):
@@ -156,15 +162,81 @@ class DispatchHost(Adapter):
 class AgentRuntimeAdapter(Adapter):
     """Provider-neutral contract for launching an external agent process.
 
-    Dispatch core owns run/lease state; runtime adapters only translate an in-memory run request into
-    a sanitized launch spec. Raw prompts/responses must not appear in argv or metadata that may later
-    be recorded as dispatch telemetry.
+    Dispatch core owns run/lease state. The normal adapter translates an in-memory request into a
+    sanitized launch spec; a continuity adapter may override ``launch`` to carry a private provider
+    reference over its own process protocol. Raw prompts/responses and private provider references
+    must not appear in argv or metadata that may later be recorded as dispatch telemetry.
     """
 
     @abstractmethod
     def build_launch(self, request: AgentRunRequest) -> AgentLaunchSpec:
         """Return a process launch spec for ``request`` without executing it."""
         raise NotImplementedError
+
+    def identity_handshake(
+        self, request: AgentRunRequest
+    ) -> RuntimeIdentityHandshake | None:
+        """Return trusted identity metadata.
+
+        ``None`` marks an unmanaged adapter; the dispatch execution boundary rejects it before
+        lifecycle writes or launch.
+        """
+
+        del request
+        return None
+
+    def prepare_identity_handshake(self, request: AgentRunRequest) -> str:
+        """Return a privacy-safe provider inventory digest before canonical planning.
+
+        Most adapters have no external continuity inventory. A resumable adapter may return a
+        bounded digest that lets a retry identify one provider session created after the planned
+        event without persisting any raw provider reference.
+        """
+
+        del request
+        return ""
+
+    def launch(
+        self,
+        request: AgentRunRequest,
+        *,
+        launch_process: Callable[[AgentLaunchSpec], AgentLaunchResult],
+        child_instance_handle: str,
+    ) -> AgentLaunchResult:
+        """Launch ``request`` through the host process boundary.
+
+        The default preserves the ordinary sanitized launch-spec path. A runtime whose trusted
+        continuity protocol cannot place its private provider reference in argv, environment, or
+        metadata may override this hook and keep that reference inside its own process protocol.
+        """
+
+        launch_spec = replace(
+            self.build_launch(request), child_instance_handle=child_instance_handle
+        )
+        return launch_process(launch_spec)
+
+    def abort_identity_handshake(self, request: AgentRunRequest) -> None:
+        """Discard private preparation after a pre-launch failure.
+
+        The default has no state to release. Stateful continuity adapters override this so a raw
+        provider reference never survives a failed execution attempt in adapter memory.
+        """
+
+        del request
+
+    def response_candidate(
+        self, result: AgentLaunchResult, *, max_body_chars: int = 20_000
+    ) -> ResponseCandidateDecision:
+        """Extract a response from ordinary process stdout using explicit markers.
+
+        A built-in adapter whose provider protocol structurally separates the
+        final assistant message may override this method. Project-local and
+        generic process adapters retain the explicit-fence default.
+        """
+
+        from .output_policy import extract_response_candidate
+
+        return extract_response_candidate(result, max_body_chars=max_body_chars)
 
 
 class RunRecorder(Adapter):

@@ -13,7 +13,7 @@ from typing import Any
 from agent_mesh.config import ConfigError, load_config, project_identity_status
 
 
-CONTRACT_VERSION = "4"
+CONTRACT_VERSION = "7"
 CONTRACT_TARGETS = {
     "agents": Path("AGENTS.md"),
     "claude": Path("CLAUDE.md"),
@@ -24,8 +24,14 @@ CONTRACT_BODY = """\
 - When `.agent-mesh/` exists, its append-only event log is the canonical
   coordination and decision source. Workbench and the Agent Mesh CLI are the
   supported write surfaces.
-- Read decisions with `agent-q decisions list` and
-  `agent-q decisions show <decision-id>` before making a related durable choice.
+- Before code changes, run
+  `agent-q decisions preflight --path <repo-relative-path> --json` for the
+  initial planned paths, repeating `--path` as needed. A complete result with an
+  empty `decisions` list is valid. Unavailable or incomplete context is not an
+  empty result; report it before continuing, and rerun preflight if the path set
+  materially expands.
+- Use `agent-q decisions list` and `agent-q decisions show <decision-id>` for
+  decision lifecycle and metadata follow-up.
 - Create decisions in Workbench's Decisions tab or with
   `agent-mesh decision propose`. Do not allocate an ID from memory.
 - A decision remains Proposed until a human directly approves it. Agents may
@@ -48,20 +54,35 @@ CONTRACT_BODY = """\
   not every assistant reply. Never mirror a complete chat transcript by default.
   Use concise bodies plus source context, body authority/fidelity, causal edges,
   and references to preserve provenance.
-- Treat participant, provider, runtime profile, and AI-agent instance as
-  separate identities. When your participant has active registered instances,
-  bind every Agent Mesh command issued by this chat with the instance ID or
-  label assigned to it, using global `--instance` or
-  `AGENT_MESH_INSTANCE_ID`, and use that instance's participant as the event
-  sender/actor; never borrow another chat's instance identity.
-- Read instance-addressed work with `agent-q list --to-instance <ID-or-label>`
-  and `agent-q backlog list --owner-instance <ID-or-label>`. Hand durable work
-  to another active instance with request `--to-instance` or backlog
-  `--owner-instance`; generic runtime dispatch does not launch work addressed
-  to a specific existing chat.
-- An AI-agent instance ID attributes canonical Agent Mesh events and survives
-  process restarts until retired. It is not cryptographic authentication, does
-  not preserve a provider's context window, and does not copy ordinary chat.
+- When a configured runtime supports it, route explicit durable delegation
+  through Workbench Dispatch or `agent-q dispatches run` so the frozen policy,
+  attempt, and material RES remain linked. Do not claim Agent Mesh intercepts
+  every harness-native subagent; label addressed-instance, harness-native, and
+  external/manual work truthfully instead of representing it as managed launch.
+- Keep detailed reviews, specifications, and reports in project-owned files.
+  A concise RES or `review.v1` assurance may carry typed, content-bound
+  references to those artifacts; the reference does not publish, copy, or grant
+  access to the file. Review assurance never approves a decision for the human.
+- Treat participant and AI-agent instance as the two identity layers. The sole
+  normal instance identity is its public `<participant>-<durable-role>` handle;
+  the hidden project-local `AI-...` ID is canonical attribution. Provider,
+  runtime profile, role, capabilities, authentication, and billing are separate
+  registration facts, not additional identities.
+- A trusted configured integration must complete the automatic identity
+  handshake before the chat's first canonical write or instance-addressed read.
+  It binds the resolved public handle without human registration. For an
+  unmanaged compatibility fallback, bind every Agent Mesh command from the chat
+  with its public handle through global `--instance` or
+  `AGENT_MESH_INSTANCE_ID`; never use a raw `AI-...` ID or borrow another chat's
+  handle.
+- Read instance-addressed work with `agent-q list --to-instance <handle>` and
+  `agent-q backlog list --owner-instance <handle>`. Hand durable work to another
+  active instance with request `--to-instance` or backlog `--owner-instance`;
+  generic runtime dispatch does not launch work addressed to a specific existing
+  chat.
+- A public instance handle survives process restarts until retired. It is not
+  cryptographic authentication, does not preserve a provider's context window,
+  and does not copy ordinary chat.
 - Use `agent-mesh promote` for chat-sourced REQ/RES records. Use the native
   backlog and decision commands for those domains; do not squeeze them into
   mail events.
@@ -154,6 +175,8 @@ def contract_status(
     *,
     targets: list[str] | None = None,
 ) -> dict[str, Any]:
+    from agent_mesh.core.context_delivery import default_delivery_report
+
     config = load_config(repo)
     selected = _normalize_targets(targets or default_contract_targets(config.project_root))
     files = []
@@ -179,6 +202,7 @@ def contract_status(
         "files": files,
         "conflicts": conflicts,
         "project_identity": identity,
+        "context_delivery": default_delivery_report(),
     }
 
 
@@ -191,6 +215,12 @@ def contract_file_status(path: Path) -> str:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return "unreadable"
+    return contract_text_status(text)
+
+
+def contract_text_status(text: str) -> str:
+    """Classify managed-contract text already captured by a stable reader."""
+
     start = text.find(START_PREFIX)
     end = text.find(END_MARKER)
     if start < 0 and end < 0:

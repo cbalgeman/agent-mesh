@@ -16,6 +16,7 @@ Live emission (leases + started/completed/failed) is defined here for completene
 remains NO-GO until human signoff; the audit path (``record_plan``) emits only planned/blocked and
 acquires no lease.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -24,7 +25,13 @@ import json
 from agent_mesh.core.chain import ChainAnchor, ChainResult, capture_anchor, verify_chain
 from agent_mesh.core.dispatch_schema import validate_dispatch_payload
 from agent_mesh.core.agent_instances import resolve_authoring_actor
-from agent_mesh.core.events import AppendResult, Event, append_event, generate_event_id
+from agent_mesh.core.events import (
+    AppendResult,
+    Event,
+    _CapabilityAppendReceipt,
+    append_event,
+    generate_event_id,
+)
 from agent_mesh.store.rebuild import read_event_records
 
 from .types import RunPlan
@@ -40,6 +47,8 @@ __all__ = [
     "emit_run_started",
     "emit_run_completed",
     "emit_run_failed",
+    "emit_run_terminated",
+    "emit_retry_exhausted",
     "capture_anchor",
     "verify_appended",
 ]
@@ -82,9 +91,17 @@ def _block_reason_codes(plan: RunPlan) -> list[str]:
 
 # --- pure payload builders (testable without I/O) ----------------------------------------------
 
-def planned_payload(plan: RunPlan, *, run_mode: str, status: str, route: dict | None = None) -> dict:
+
+def planned_payload(
+    plan: RunPlan,
+    *,
+    run_mode: str,
+    status: str,
+    route: dict | None = None,
+    provider_inventory_digest: str = "",
+) -> dict:
     route = route or {}
-    return {
+    payload = {
         "run_id": plan.run_id,
         "run_mode": run_mode,
         "input_message_id": plan.input_message_id,
@@ -110,6 +127,23 @@ def planned_payload(plan: RunPlan, *, run_mode: str, status: str, route: dict | 
         "planned_utc": plan.planned_utc,
         "status": status,
     }
+    if provider_inventory_digest:
+        payload["provider_inventory_digest"] = provider_inventory_digest
+    if plan.policy_id:
+        payload.update(
+            {
+                "policy_id": plan.policy_id,
+                "policy_digest": plan.policy_digest,
+                "attempt_number": plan.attempt_number,
+                "management_level": plan.management_level,
+                "runtime_profile": plan.runtime_profile,
+                "effective_capability_evidence_digest": (plan.effective_capability_evidence_digest),
+                "capability_receipt": plan.capability_receipt,
+            }
+        )
+        if plan.previous_attempt_id:
+            payload["previous_attempt_id"] = plan.previous_attempt_id
+    return payload
 
 
 def blocked_payload(plan: RunPlan, *, run_mode: str) -> dict:
@@ -127,6 +161,7 @@ def blocked_payload(plan: RunPlan, *, run_mode: str) -> dict:
 
 # --- append helpers ----------------------------------------------------------------------------
 
+
 def _append(
     events_path,
     kind: str,
@@ -136,6 +171,8 @@ def _append(
     payload: dict,
     actor: str,
     lock_acquired: bool = False,
+    capability_append_receipt: _CapabilityAppendReceipt | None = None,
+    lock_handle: object | None = None,
 ) -> AppendResult:
     # Fail fast at the emitter boundary; append_event re-validates as the substrate's own guard.
     validate_dispatch_payload(kind, payload)
@@ -151,7 +188,13 @@ def _append(
         payload=payload,
         actor=actor,
     )
-    return append_event(events_path, event, lock_acquired=lock_acquired)
+    return append_event(
+        events_path,
+        event,
+        lock_acquired=lock_acquired,
+        _capability_receipt=capability_append_receipt,
+        _lock_handle=lock_handle,
+    )
 
 
 def emit_run_planned(
@@ -161,11 +204,20 @@ def emit_run_planned(
     run_mode: str = "dry_run",
     status: str | None = None,
     route: dict | None = None,
+    provider_inventory_digest: str = "",
     actor: str = "dispatcher",
     lock_acquired: bool = False,
+    capability_append_receipt: _CapabilityAppendReceipt | None = None,
+    lock_handle: object | None = None,
 ) -> AppendResult:
     status = status or ("planned" if run_mode == "live" else "dry_run")
-    payload = planned_payload(plan, run_mode=run_mode, status=status, route=route)
+    payload = planned_payload(
+        plan,
+        run_mode=run_mode,
+        status=status,
+        route=route,
+        provider_inventory_digest=provider_inventory_digest,
+    )
     return _append(
         events_path,
         "dispatch_run_planned",
@@ -174,6 +226,8 @@ def emit_run_planned(
         payload=payload,
         actor=actor,
         lock_acquired=lock_acquired,
+        capability_append_receipt=capability_append_receipt,
+        lock_handle=lock_handle,
     )
 
 
@@ -212,15 +266,23 @@ def record_plan(
     status = "planned" if run_mode == "live" else "dry_run"
     results = [
         emit_run_planned(
-            plan, events_path=events_path, run_mode=run_mode, status=status, route=route, actor=actor
+            plan,
+            events_path=events_path,
+            run_mode=run_mode,
+            status=status,
+            route=route,
+            actor=actor,
         )
     ]
     if plan.gate in ("hold-for-approval", "blocked-substrate-incomplete"):
-        results.append(emit_run_blocked(plan, events_path=events_path, run_mode=run_mode, actor=actor))
+        results.append(
+            emit_run_blocked(plan, events_path=events_path, run_mode=run_mode, actor=actor)
+        )
     return results
 
 
 # --- live lifecycle emitters (DORMANT until live dispatch is signed off) ------------------------
+
 
 def emit_lease_acquired(
     *,
@@ -369,6 +431,60 @@ def emit_run_failed(
         entity_id=run_id,
         thread_id=thread_id,
         payload=payload,
+        actor=actor,
+        lock_acquired=lock_acquired,
+    )
+
+
+def emit_run_terminated(
+    *,
+    events_path,
+    run_id: str,
+    thread_id: str,
+    terminal_state: str,
+    terminated_utc: str,
+    actor: str = "dispatcher",
+    lock_acquired: bool = False,
+) -> AppendResult:
+    return _append(
+        events_path,
+        "dispatch_run_terminated",
+        entity_id=run_id,
+        thread_id=thread_id,
+        payload={
+            "run_id": run_id,
+            "terminal_state": terminal_state,
+            "terminated_utc": terminated_utc,
+        },
+        actor=actor,
+        lock_acquired=lock_acquired,
+    )
+
+
+def emit_retry_exhausted(
+    *,
+    events_path,
+    policy_id: str,
+    run_id: str,
+    thread_id: str,
+    attempt_number: int,
+    max_attempts: int,
+    exhausted_utc: str,
+    actor: str = "dispatcher",
+    lock_acquired: bool = False,
+) -> AppendResult:
+    return _append(
+        events_path,
+        "dispatch_retry_exhausted",
+        entity_id=policy_id,
+        thread_id=thread_id,
+        payload={
+            "policy_id": policy_id,
+            "run_id": run_id,
+            "attempt_number": attempt_number,
+            "max_attempts": max_attempts,
+            "exhausted_utc": exhausted_utc,
+        },
         actor=actor,
         lock_acquired=lock_acquired,
     )

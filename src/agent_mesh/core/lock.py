@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import errno
 import os
+import secrets
 import shutil
 import socket
 import subprocess
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -20,6 +22,7 @@ except ImportError:  # pragma: no cover - POSIX CI covers the lock hardening pat
 OwnerStatus = Literal["live", "stale_pid_dead", "stale_age_exceeded", "cannot_verify"]
 
 STALE_LOCK_SECONDS = 600
+_ACTIVE_LOCKS_LOCK = threading.Lock()
 
 
 def _read_boot_id() -> str:
@@ -68,9 +71,23 @@ class LockHandle:
     lock_dir: Path
     queue_depth: int
     lock_file_fd: int | None = None
+    _capability: str = field(default="", repr=False, compare=False)
 
     def release(self, last_event_seq: int | None = None) -> None:
+        if not _consume_lock_handle(self):
+            return
         release(self.lock_dir, last_event_seq=last_event_seq, lock_file_fd=self.lock_file_fd)
+
+
+@dataclass(frozen=True)
+class _ActiveLock:
+    path: Path
+    pid: int
+    thread_id: int
+    lock_file_fd: int | None
+
+
+_ACTIVE_LOCKS: dict[str, _ActiveLock] = {}
 
 
 @dataclass(frozen=True)
@@ -116,9 +133,76 @@ def acquire(lock_dir: str | Path, retries: int = 200, retry_ms: int = 50) -> Loc
             force_unlock(path, operator_action=True)
             _release_lock_file(lock_file_fd)
             raise
-        return LockHandle(lock_dir=path, queue_depth=queue_depth, lock_file_fd=lock_file_fd)
+        capability = secrets.token_urlsafe(32)
+        handle = LockHandle(
+            lock_dir=path,
+            queue_depth=queue_depth,
+            lock_file_fd=lock_file_fd,
+            _capability=capability,
+        )
+        with _ACTIVE_LOCKS_LOCK:
+            _ACTIVE_LOCKS[capability] = _ActiveLock(
+                path=path.resolve(),
+                pid=os.getpid(),
+                thread_id=threading.get_ident(),
+                lock_file_fd=lock_file_fd,
+            )
+        return handle
 
     raise MeshLockTimeout(f"could not acquire live mail lock: {path}")
+
+
+def is_active_lock_handle(handle: LockHandle, expected_path: str | Path) -> bool:
+    """Return whether this exact factory-minted handle owns the lock in this thread."""
+
+    if not handle._capability:
+        return False
+    with _ACTIVE_LOCKS_LOCK:
+        active = _ACTIVE_LOCKS.get(handle._capability)
+    return bool(
+        active is not None
+        and active.path == Path(expected_path).resolve()
+        and active.pid == os.getpid()
+        and active.thread_id == threading.get_ident()
+        and active.lock_file_fd == handle.lock_file_fd
+        and handle.lock_dir.resolve() == active.path
+        and active.path.is_dir()
+    )
+
+
+def _consume_lock_handle(handle: LockHandle) -> bool:
+    """Atomically revoke this exact active capability before releasing its resources."""
+
+    if not handle._capability:
+        return False
+    with _ACTIVE_LOCKS_LOCK:
+        active = _ACTIVE_LOCKS.get(handle._capability)
+        if (
+            active is None
+            or active.path != handle.lock_dir.resolve()
+            or active.pid != os.getpid()
+            or active.thread_id != threading.get_ident()
+            or active.lock_file_fd != handle.lock_file_fd
+        ):
+            return False
+        del _ACTIVE_LOCKS[handle._capability]
+    return True
+
+
+def _consume_lock_handles_for_path(path: Path) -> list[int | None]:
+    """Revoke process-local capabilities invalidated by an explicit path unlock."""
+
+    resolved = path.resolve()
+    with _ACTIVE_LOCKS_LOCK:
+        capabilities = [
+            capability
+            for capability, active in _ACTIVE_LOCKS.items()
+            if active.path == resolved
+        ]
+        active_fds = [
+            _ACTIVE_LOCKS.pop(capability).lock_file_fd for capability in capabilities
+        ]
+    return active_fds
 
 
 def release(
@@ -178,10 +262,14 @@ def force_unlock(lock_dir: str | Path, operator_action: bool = True) -> None:
             raise MeshLockError(f"refusing to force-unlock {status} lock: {lock_dir}")
 
     path = Path(lock_dir)
-    if not path.exists():
-        return
-    shutil.rmtree(path)
-    _fsync_dir(path.parent)
+    active_fds = _consume_lock_handles_for_path(path)
+    try:
+        if path.exists():
+            shutil.rmtree(path)
+            _fsync_dir(path.parent)
+    finally:
+        for active_fd in active_fds:
+            _release_lock_file(active_fd)
 
 
 def _write_owner(lock_dir: Path, last_event_seq: int | None) -> None:

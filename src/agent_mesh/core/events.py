@@ -2,22 +2,31 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import secrets
+import sqlite3
+import threading
 import warnings
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agent_mesh.core.agent_instances import (
     INSTANCE_EVENT_KINDS,
+    INSTANCE_ID_RE,
     AgentInstanceError,
     reduce_agent_instances,
     selected_agent_instance,
     validate_actor_shadow,
 )
-from agent_mesh.core.dispatch_schema import DispatchSchemaError, validate_dispatch_payload
+from agent_mesh.core.dispatch_schema import (
+    DISPATCH_EVENT_KINDS,
+    DispatchSchemaError,
+    validate_dispatch_payload,
+)
 from agent_mesh.core.hashing import SENTINEL_PREV_HASH, canonical_json, hash_event_line
 from agent_mesh.core.ids import new_ulid
 from agent_mesh.core.provenance import ProvenanceValidationError, validate_event_provenance
@@ -33,6 +42,15 @@ DEPRECATED_ENV_ALIASES = {
     ALLOW_NOOP_REPLAY_ENV_VAR: "AGENT_MAIL_ALLOW_NOOP_REPLAY",
 }
 _TAIL_READ_BUFFER = 64 * 1024  # 64 KiB — enough for any single event line in v1
+_DECISION_RECEIPT_LIMIT = 64
+_DECISION_RECEIPT_LOCK = threading.Lock()
+_CAPABILITY_RECEIPT_LIMIT = 64
+_CAPABILITY_RECEIPT_LOCK = threading.Lock()
+_WORKBENCH_INVOCATION_ENV = "AGENT_MESH_WORKBENCH_INVOCATION"
+# A Workbench-launched CLI receives this one process capability at exec. Consume
+# it during module bootstrap so probes, drivers, and provider grandchildren
+# cannot inherit it from the ambient environment.
+_WORKBENCH_INVOCATION = os.environ.pop(_WORKBENCH_INVOCATION_ENV, "")
 
 
 class EventProtocolError(RuntimeError):
@@ -87,6 +105,51 @@ class AppendResult:
     queue_depth: int = 0
 
 
+@dataclass(frozen=True)
+class _DecisionAppendReceipt:
+    """Opaque, process-local capability for one prepared decision append."""
+
+    token: str
+
+
+@dataclass(frozen=True)
+class _CapabilityAppendReceipt:
+    """Opaque, process-local authority for one host-verified planned run append."""
+
+    token: str
+
+
+@dataclass(frozen=True)
+class _CapabilityAppendState:
+    pid: int
+    thread_id: int
+    events_path: str
+    receipt_json: str
+    profile_digest: str
+    drift_inputs_digest: str
+    valid_until_utc: str
+
+
+@dataclass(frozen=True)
+class _DecisionAppendState:
+    lock_handle: Any
+    pid: int
+    thread_id: int
+    events_path: str
+    db_path: str
+    config_sha256: str
+    projection_version: str
+    source_log_sha256: str
+    last_event_seq: int
+    tail_event_hash: str
+    table_hashes: tuple[tuple[str, str], ...]
+    schema_sha256: str
+
+
+_DECISION_RECEIPTS: dict[str, _DecisionAppendState] = {}
+_CAPABILITY_RECEIPTS: dict[str, _CapabilityAppendState] = {}
+
+
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -97,16 +160,55 @@ def generate_event_id() -> str:
 
 
 def append_event(
-    events_path: str | Path, event: Event, lock_acquired: bool = False
+    events_path: str | Path,
+    event: Event,
+    lock_acquired: bool = False,
+    *,
+    _decision_receipt: _DecisionAppendReceipt | None = None,
+    _capability_receipt: _CapabilityAppendReceipt | None = None,
+    _lock_handle: Any = None,
+    _workbench_ownership_checked: bool = False,
+    _workbench_append_authorizer: Callable[[], None] | None = None,
 ) -> AppendResult:
     """Append one event with the durable intent/commit journal protocol.
 
     The public default acquires the mesh lock. Pass ``lock_acquired=True`` only
     from a writer that already owns ``.mail-lock`` for the entire transaction.
+    Prepared decision and capability receipts may only be used under that same
+    continuously-held lock.
     """
+    if not _workbench_ownership_checked:
+        from agent_mesh.workbench_service import (
+            WorkbenchOwnershipError,
+            workbench_invocation_append_lease,
+        )
+
+        if _WORKBENCH_INVOCATION:
+            from agent_mesh.config import load_config
+
+            try:
+                config = load_config(Path(events_path).parent)
+                with workbench_invocation_append_lease(
+                    config,
+                    event,
+                    raw_envelope=_WORKBENCH_INVOCATION,
+                ) as authorize_append:
+                    return append_event(
+                        events_path,
+                        event,
+                        lock_acquired=lock_acquired,
+                        _decision_receipt=_decision_receipt,
+                        _capability_receipt=_capability_receipt,
+                        _lock_handle=_lock_handle,
+                        _workbench_ownership_checked=True,
+                        _workbench_append_authorizer=authorize_append,
+                    )
+            except WorkbenchOwnershipError as exc:
+                raise EventProtocolError(str(exc)) from exc
     event = replace(
         event,
         actor_instance_id=selected_agent_instance(event.actor_instance_id),
+        payload=dict(event.payload),
     )
     try:
         validate_actor_shadow(event.kind, event.actor, event.payload)
@@ -129,12 +231,20 @@ def append_event(
     journal_dir = path.parent
 
     if not lock_acquired:
+        if _decision_receipt is not None or _capability_receipt is not None:
+            raise EventProtocolError("append authority requires the caller-held mesh lock")
         from agent_mesh.core.lock import acquire
 
         journal_dir.mkdir(parents=True, exist_ok=True)
         lock_handle = acquire(journal_dir / ".mail-lock")
         try:
-            result = append_event(path, event, lock_acquired=True)
+            result = append_event(
+                path,
+                event,
+                lock_acquired=True,
+                _workbench_ownership_checked=_workbench_ownership_checked,
+                _workbench_append_authorizer=_workbench_append_authorizer,
+            )
         finally:
             last_event_seq = None
             if "result" in locals():
@@ -147,7 +257,42 @@ def append_event(
 
     recover(path, journal_dir)
     event = _validate_agent_instance_before_append(event, path)
-    _validate_stateful_event_before_append(event, journal_dir)
+    if _decision_receipt is None and _capability_receipt is None:
+        projection_conn = _validate_stateful_event_before_append(event, journal_dir)
+    else:
+        projection_conn = _validate_stateful_event_before_append(
+            event,
+            journal_dir,
+            decision_receipt=_decision_receipt,
+            capability_receipt=_capability_receipt,
+            lock_handle=_lock_handle,
+        )
+    try:
+        if _workbench_append_authorizer is not None:
+            # Only a child that passed every stateless, instance, provenance,
+            # dispatch, and stateful validator may mint interrupted-run
+            # recovery authority. Keep this immediately before durable append.
+            _workbench_append_authorizer()
+        return _append_prepared_event(
+            path,
+            event,
+            journal_dir=journal_dir,
+            projection_conn=projection_conn,
+        )
+    finally:
+        if projection_conn is not None:
+            if projection_conn.in_transaction:
+                projection_conn.rollback()
+            projection_conn.close()
+
+
+def _append_prepared_event(
+    path: Path,
+    event: Event,
+    *,
+    journal_dir: Path,
+    projection_conn: sqlite3.Connection | None,
+) -> AppendResult:
 
     prev_line, prev_hash = read_tail_line(path)
     next_seq = _next_event_seq(prev_line)
@@ -193,7 +338,11 @@ def append_event(
     _fsync_dir(journal_dir)
     _fault_after("D")
 
-    _replay_event_placeholder(prepared, path.parent)
+    _replay_event_placeholder(
+        prepared,
+        path.parent,
+        projection_conn=projection_conn,
+    )
     _fault_after("E")
     _fault_after("E.done")
 
@@ -206,10 +355,129 @@ def append_event(
     return AppendResult(event=prepared, event_hash=event_hash, line_bytes=line)
 
 
+def _prepare_decision_append(config: Any, lock_handle: Any) -> _DecisionAppendReceipt:
+    """Recover and rebuild decision authority under one continuously-held mesh lock."""
+
+    from agent_mesh.core.lock import is_active_lock_handle
+    from agent_mesh.core.recovery import recover
+    from agent_mesh.store.rebuild import PROJECTION_VERSION, file_sha256, rebuild_all
+
+    expected_lock_dir = (config.agent_dir / ".mail-lock").resolve()
+    if lock_handle is None or not is_active_lock_handle(lock_handle, expected_lock_dir):
+        raise EventProtocolError("decision append preparation requires the acquired mesh lock")
+
+    events_path = config.events_path.resolve()
+    recover(events_path, config.agent_dir)
+    result = rebuild_all(config)
+    _tail_line, tail_hash = read_tail_line(events_path)
+    token = secrets.token_urlsafe(32)
+    state = _DecisionAppendState(
+        lock_handle=lock_handle,
+        pid=os.getpid(),
+        thread_id=threading.get_ident(),
+        events_path=str(events_path),
+        db_path=str(config.db_path.resolve()),
+        config_sha256=_config_sha256(config),
+        projection_version=PROJECTION_VERSION,
+        source_log_sha256=file_sha256(events_path),
+        last_event_seq=result.last_event_seq,
+        tail_event_hash=tail_hash,
+        table_hashes=tuple(sorted(result.table_hashes.items())),
+        schema_sha256=result.schema_sha256,
+    )
+    with _DECISION_RECEIPT_LOCK:
+        if len(_DECISION_RECEIPTS) >= _DECISION_RECEIPT_LIMIT:
+            raise EventProtocolError("decision append preparation capacity is exhausted")
+        _DECISION_RECEIPTS[token] = state
+    return _DecisionAppendReceipt(token=token)
+
+
+def _discard_decision_append_receipt(receipt: _DecisionAppendReceipt | None) -> None:
+    if receipt is None:
+        return
+    with _DECISION_RECEIPT_LOCK:
+        _DECISION_RECEIPTS.pop(receipt.token, None)
+
+
+def _prepare_capability_append(
+    *,
+    events_path: str | Path,
+    receipt: dict[str, Any],
+) -> _CapabilityAppendReceipt:
+    """Mint one non-transferable append authority from completed host preflight."""
+
+    receipt_copy = dict(receipt)
+    supplied_digest = str(receipt_copy.pop("receipt_digest", ""))
+    encoded_unsigned = json.dumps(receipt_copy, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    if not supplied_digest or not secrets.compare_digest(
+        supplied_digest, hashlib.sha256(encoded_unsigned).hexdigest()
+    ):
+        raise EventProtocolError("capability receipt digest is invalid")
+    if receipt_copy.get("schema") != "agent-mesh.capability-receipt.v1":
+        raise EventProtocolError("capability receipt schema is invalid")
+    valid_until = _parse_receipt_time(str(receipt_copy.get("valid_until_utc") or ""))
+    if valid_until is None or valid_until <= datetime.now(UTC):
+        raise EventProtocolError("capability receipt is expired")
+    profile_digest = str(receipt_copy.get("profile_digest") or "")
+    drift_digest = str(receipt_copy.get("drift_inputs_digest") or "")
+    if not _is_sha256(profile_digest) or not _is_sha256(drift_digest):
+        raise EventProtocolError("capability receipt binding is invalid")
+    receipt_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    token = secrets.token_urlsafe(32)
+    state = _CapabilityAppendState(
+        pid=os.getpid(),
+        thread_id=threading.get_ident(),
+        events_path=str(Path(events_path).resolve()),
+        receipt_json=receipt_json,
+        profile_digest=profile_digest,
+        drift_inputs_digest=drift_digest,
+        valid_until_utc=str(receipt_copy["valid_until_utc"]),
+    )
+    with _CAPABILITY_RECEIPT_LOCK:
+        if len(_CAPABILITY_RECEIPTS) >= _CAPABILITY_RECEIPT_LIMIT:
+            raise EventProtocolError("capability append preparation capacity is exhausted")
+        _CAPABILITY_RECEIPTS[token] = state
+    return _CapabilityAppendReceipt(token=token)
+
+
+def _discard_capability_append_receipt(
+    receipt: _CapabilityAppendReceipt | None,
+) -> None:
+    if receipt is None:
+        return
+    with _CAPABILITY_RECEIPT_LOCK:
+        _CAPABILITY_RECEIPTS.pop(receipt.token, None)
+
+
+def _parse_receipt_time(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _config_sha256(config: Any) -> str:
+    return hashlib.sha256(repr(config).encode("utf-8")).hexdigest()
+
+
 def _validate_agent_instance_before_append(event: Event, events_path: Path) -> Event:
     """Resolve and enforce durable instance attribution while holding the append lock."""
 
     from agent_mesh.config import config_from_agent_dir
+
+    config = config_from_agent_dir(events_path.parent)
+    if (
+        event.actor in config.identity.integration_registrars
+        and event.kind not in INSTANCE_EVENT_KINDS
+    ):
+        raise EventProtocolError(f"AGENT_INSTANCE_REGISTRAR_SCOPE_VIOLATION: {event.actor}")
 
     records: list[dict[str, Any]] = []
     if events_path.exists():
@@ -229,13 +497,16 @@ def _validate_agent_instance_before_append(event: Event, events_path: Path) -> E
         ]
         if len(matches) != 1:
             code = "AGENT_INSTANCE_UNKNOWN" if not matches else "AGENT_INSTANCE_LABEL_AMBIGUOUS"
-            raise EventProtocolError(f"{code}: {selected}")
+            public_selected = "[internal-id]" if INSTANCE_ID_RE.fullmatch(selected) else selected
+            raise EventProtocolError(f"{code}: {public_selected}")
         instance = matches[0]
+        if instance.status == "terminal":
+            raise EventProtocolError(f"AGENT_INSTANCE_TERMINAL: {instance.label}")
         if instance.status != "active":
-            raise EventProtocolError(f"AGENT_INSTANCE_RETIRED: {instance.id}")
+            raise EventProtocolError(f"AGENT_INSTANCE_RETIRED: {instance.label}")
         if instance.participant != event.actor:
             raise EventProtocolError(
-                f"AGENT_INSTANCE_ACTOR_MISMATCH: {instance.id} belongs to "
+                f"AGENT_INSTANCE_ACTOR_MISMATCH: {instance.label} belongs to "
                 f"{instance.participant!r}, not {event.actor!r}"
             )
         event = replace(event, actor_instance_id=instance.id)
@@ -258,19 +529,22 @@ def _validate_agent_instance_before_append(event: Event, events_path: Path) -> E
         seen_targets: set[str] = set()
         for raw_target in raw_targets:
             target_id = str(raw_target)
+            target = instances.get(target_id)
             if target_id in seen_targets:
                 raise EventProtocolError(
-                    f"AGENT_INSTANCE_ADDRESS_DUPLICATE: {target_id}"
+                    "AGENT_INSTANCE_ADDRESS_DUPLICATE: "
+                    f"{target.label if target is not None else '[unknown-instance]'}"
                 )
             seen_targets.add(target_id)
-            target = instances.get(target_id)
             if target is None:
-                raise EventProtocolError(f"AGENT_INSTANCE_UNKNOWN: {target_id}")
+                raise EventProtocolError("AGENT_INSTANCE_UNKNOWN: [unknown-instance]")
+            if target.status == "terminal":
+                raise EventProtocolError(f"AGENT_INSTANCE_TERMINAL: {target.label}")
             if target.status != "active":
-                raise EventProtocolError(f"AGENT_INSTANCE_RETIRED: {target_id}")
+                raise EventProtocolError(f"AGENT_INSTANCE_RETIRED: {target.label}")
             if target.participant not in recipient_set:
                 raise EventProtocolError(
-                    f"AGENT_INSTANCE_RECIPIENT_MISMATCH: {target_id} belongs to "
+                    f"AGENT_INSTANCE_RECIPIENT_MISMATCH: {target.label} belongs to "
                     f"{target.participant!r}"
                 )
     elif event.kind == "res_posted":
@@ -289,36 +563,47 @@ def _validate_agent_instance_before_append(event: Event, events_path: Path) -> E
             else []
         )
         addressed_participants = {
-            instances[str(target)].participant
-            for target in target_ids
-            if str(target) in instances
+            instances[str(target)].participant for target in target_ids if str(target) in instances
         }
         if event.actor in addressed_participants and event.actor_instance_id not in {
             str(target) for target in target_ids
         }:
+            actor_instance = instances.get(event.actor_instance_id)
             raise EventProtocolError(
                 f"AGENT_INSTANCE_NOT_ADDRESSED: "
-                f"{event.actor_instance_id or event.actor} is not addressed by {request_id}"
+                f"{actor_instance.label if actor_instance is not None else event.actor} "
+                f"is not addressed by {request_id}"
             )
     elif event.kind == "backlog_item_upserted":
         raw_owner_instance_id = event.payload.get("owner_instance_id")
         owner_instance_id = (
-            str(raw_owner_instance_id).strip()
-            if raw_owner_instance_id is not None
-            else ""
+            str(raw_owner_instance_id).strip() if raw_owner_instance_id is not None else ""
         )
         if owner_instance_id:
             owner = instances.get(owner_instance_id)
             if owner is None:
-                raise EventProtocolError(f"AGENT_INSTANCE_UNKNOWN: {owner_instance_id}")
+                raise EventProtocolError("AGENT_INSTANCE_UNKNOWN: [unknown-instance]")
+            if owner.status == "terminal":
+                raise EventProtocolError(f"AGENT_INSTANCE_TERMINAL: {owner.label}")
             if owner.status != "active":
-                raise EventProtocolError(f"AGENT_INSTANCE_RETIRED: {owner_instance_id}")
+                raise EventProtocolError(f"AGENT_INSTANCE_RETIRED: {owner.label}")
 
     if event.kind not in INSTANCE_EVENT_KINDS:
         return event
 
-    config = config_from_agent_dir(events_path.parent)
     payload = event.payload
+    forbidden_identity_fields = {
+        "external_session_ref",
+        "provider_session_ref",
+        "launch_attempt_key",
+        "binding_credential",
+        "registrar_credential",
+    }
+    leaked_fields = sorted(forbidden_identity_fields & set(payload))
+    if leaked_fields:
+        raise EventProtocolError(
+            "AGENT_INSTANCE_RAW_REFERENCE_FORBIDDEN: " + ", ".join(leaked_fields)
+        )
     identifier = str(payload.get("id") or event.entity_id)
     if identifier != event.entity_id or event.thread_id != event.entity_id:
         raise EventProtocolError(
@@ -340,14 +625,41 @@ def _validate_agent_instance_before_append(event: Event, events_path: Path) -> E
                     f"RUNTIME_PROFILE_TARGET_MISMATCH: {runtime_profile} targets "
                     f"{profile.target!r}, not {participant!r}"
                 )
+            contract_version = payload.get("instance_contract_version", 1)
+            if (
+                isinstance(contract_version, bool)
+                or not isinstance(contract_version, int)
+                or contract_version < 1
+            ):
+                raise EventProtocolError("AGENT_INSTANCE_CONTRACT_VERSION_INVALID")
+            if contract_version >= 2:
+                expected = {
+                    "provider": profile.provider,
+                    "durable_role": profile.durable_role,
+                    "role": profile.role,
+                    "capabilities": list(profile.required_capabilities),
+                    "permission_mode": profile.permission_mode,
+                    "authentication_mode": profile.authentication_mode,
+                    "billing_mode": profile.billing_mode,
+                    "adapter_trust": profile.adapter_trust,
+                    "session_identity_mode": profile.session_identity_mode,
+                    "resumable": profile.resumable,
+                    "concurrent_attachment": profile.concurrent_attachment,
+                    "terminal_observation": profile.terminal_observation,
+                }
+                mismatches = [
+                    name for name, value in expected.items() if payload.get(name) != value
+                ]
+                if mismatches:
+                    raise EventProtocolError(
+                        "AGENT_INSTANCE_PROFILE_MISMATCH: " + ", ".join(sorted(mismatches))
+                    )
     elif event.kind == "agent_instance_metadata_updated":
         fields = payload.get("fields_changed", {})
         if isinstance(fields, dict) and "runtime_profile" in fields:
             old_new = fields["runtime_profile"]
             runtime_profile = (
-                str(old_new[1]).strip()
-                if isinstance(old_new, list) and len(old_new) == 2
-                else ""
+                str(old_new[1]).strip() if isinstance(old_new, list) and len(old_new) == 2 else ""
             )
             if runtime_profile:
                 profile = config.runtime_profiles.get(runtime_profile)
@@ -355,9 +667,7 @@ def _validate_agent_instance_before_append(event: Event, events_path: Path) -> E
                 if profile is None:
                     raise EventProtocolError(f"RUNTIME_PROFILE_UNKNOWN: {runtime_profile}")
                 if target is None or profile.target != target.participant:
-                    raise EventProtocolError(
-                        f"RUNTIME_PROFILE_TARGET_MISMATCH: {runtime_profile}"
-                    )
+                    raise EventProtocolError(f"RUNTIME_PROFILE_TARGET_MISMATCH: {runtime_profile}")
     candidate = {
         "actor": event.actor,
         "actor_instance_id": event.actor_instance_id,
@@ -371,6 +681,15 @@ def _validate_agent_instance_before_append(event: Event, events_path: Path) -> E
     try:
         reduce_agent_instances([*records, candidate])
     except AgentInstanceError as exc:
+        raise EventProtocolError(str(exc)) from exc
+    from agent_mesh.store.rebuild import (
+        AgentInstanceStopLine,
+        validate_agent_instance_projection,
+    )
+
+    try:
+        validate_agent_instance_projection(config, [*records, candidate])
+    except (AgentInstanceStopLine, ValueError) as exc:
         raise EventProtocolError(str(exc)) from exc
     return event
 
@@ -425,22 +744,213 @@ def get_size(path: str | Path) -> int:
         return 0
 
 
-def _validate_stateful_event_before_append(event: Event, agent_dir: Path) -> None:
+def _validate_stateful_event_before_append(
+    event: Event,
+    agent_dir: Path,
+    *,
+    decision_receipt: _DecisionAppendReceipt | None = None,
+    capability_receipt: _CapabilityAppendReceipt | None = None,
+    lock_handle: Any = None,
+) -> sqlite3.Connection | None:
     """Run projection-backed invariants after recovery and before journaling."""
     from agent_mesh.config import config_from_agent_dir
     from agent_mesh.store.rebuild import (
         DECISION_EVENT_KINDS,
+        PROJECTION_VERSION,
+        file_sha256,
         rebuild_all,
+        read_event_records,
+        schema_sha256_for_connection,
+        table_hashes_for_connection,
         validate_backlog_write,
         validate_decision_event,
+        validate_event_projection,
     )
     from agent_mesh.store.sqlite import connect, initialize_schema
 
-    if event.kind not in DECISION_EVENT_KINDS | {"backlog_item_upserted"}:
-        return
+    if decision_receipt is not None and event.kind not in DECISION_EVENT_KINDS:
+        _discard_decision_append_receipt(decision_receipt)
+        raise EventProtocolError("decision append receipt cannot authorize another event domain")
+    if capability_receipt is not None and event.kind != "dispatch_run_planned":
+        _discard_capability_append_receipt(capability_receipt)
+        raise EventProtocolError("capability append receipt cannot authorize another event domain")
+    persisted_capability_receipt = event.payload.get("capability_receipt")
+    if event.kind == "dispatch_run_planned" and isinstance(persisted_capability_receipt, dict):
+        if capability_receipt is None or not _consume_capability_append_receipt(
+            capability_receipt,
+            lock_handle=lock_handle,
+            events_path=agent_dir / "events.jsonl",
+            persisted_receipt=persisted_capability_receipt,
+        ):
+            raise EventProtocolError("DISPATCH_ATTEMPT_CAPABILITY_AUTHORITY_REQUIRED")
+    if event.kind not in DECISION_EVENT_KINDS | DISPATCH_EVENT_KINDS | {
+        "backlog_item_upserted",
+        "res_posted",
+    }:
+        return None
 
     config = config_from_agent_dir(agent_dir)
-    rebuild_all(config)
+    if event.kind in DECISION_EVENT_KINDS:
+        if decision_receipt is None:
+            rebuild_result = rebuild_all(config)
+            expected_table_hashes = tuple(sorted(rebuild_result.table_hashes.items()))
+            expected_schema_sha256 = rebuild_result.schema_sha256
+        else:
+            decision_state = _consume_decision_append_receipt(
+                decision_receipt,
+                lock_handle=lock_handle,
+                config=config,
+                projection_version=PROJECTION_VERSION,
+                file_sha256=file_sha256,
+            )
+            if decision_state is None:
+                raise EventProtocolError(
+                    "prepared decision projection changed; retry the operation"
+                )
+            expected_table_hashes = decision_state.table_hashes
+            expected_schema_sha256 = decision_state.schema_sha256
+
+        conn = connect(config.db_path)
+        try:
+            initialize_schema(conn)
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            current_schema_sha256 = schema_sha256_for_connection(conn)
+            current_table_hashes = tuple(sorted(table_hashes_for_connection(conn).items()))
+            if (
+                current_schema_sha256 != expected_schema_sha256
+                or current_table_hashes != expected_table_hashes
+            ):
+                raise EventProtocolError(
+                    "prepared decision projection changed; retry the operation"
+                )
+            validate_decision_event(
+                conn,
+                kind=event.kind,
+                entity_id=event.entity_id,
+                thread_id=event.thread_id,
+                actor=event.actor,
+                occurred_utc=event.occurred_utc,
+                payload=event.payload,
+                participants=config.decision_approval_identities,
+                approval_authority_mode=config.decision_approval_authority_mode,
+                approval_authority_revision=config.decision_approval_authority_revision,
+            )
+            if event.kind == "decision_accepted":
+                from agent_mesh.core.assurance import (
+                    assurance_gate_binding,
+                    evaluate_transition_assurance,
+                )
+
+                decision_row = conn.execute(
+                    "SELECT human_id FROM decisions WHERE dec_ulid=?",
+                    (event.entity_id,),
+                ).fetchone()
+                if decision_row is None:  # pragma: no cover - lifecycle validation owns this case.
+                    raise EventProtocolError("decision approval target is unavailable")
+                gate_evaluated_utc = (
+                    datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                )
+                boundary_key = str(decision_row["human_id"])
+                gate = evaluate_transition_assurance(
+                    config,
+                    conn,
+                    boundary_kind="decision",
+                    boundary_key=boundary_key,
+                    now_utc=gate_evaluated_utc,
+                )
+                if not gate.allows_transition:
+                    raise EventProtocolError(
+                        "REVIEW_ASSURANCE_TRANSITION_BLOCKED: " + ",".join(gate.reason_codes)
+                    )
+                if gate.configured:
+                    binding = assurance_gate_binding(
+                        gate,
+                        boundary_kind="decision",
+                        boundary_key=boundary_key,
+                        gate_evaluated_utc=gate_evaluated_utc,
+                    )
+                    supplied = event.payload.get("review_gate")
+                    if supplied is not None and supplied != binding:
+                        raise EventProtocolError("REVIEW_ASSURANCE_GATE_EVIDENCE_MISMATCH")
+                    event.payload["review_gate"] = binding
+        except BaseException:
+            conn.rollback()
+            conn.close()
+            raise
+        return conn
+
+    rebuild_result = rebuild_all(config)
+    if event.kind in DISPATCH_EVENT_KINDS or event.kind == "res_posted":
+        if event.kind == "review_assurance_retired":
+            if event.actor not in config.decision_approval_identities:
+                raise EventProtocolError(
+                    f"REVIEW_ASSURANCE_HUMAN_AUTHORITY_REQUIRED: {event.actor}"
+                )
+            if (
+                event.payload.get("approval_authority_mode")
+                != config.decision_approval_authority_mode
+                or event.payload.get("approval_authority_revision")
+                != config.decision_approval_authority_revision
+            ):
+                raise EventProtocolError(
+                    f"REVIEW_ASSURANCE_HUMAN_AUTHORITY_STALE: {event.actor}"
+                )
+        if event.kind == "review_assurance_recorded":
+            from agent_mesh.core.assurance import (
+                AssuranceResolutionError,
+                validate_typed_artifact_refs,
+            )
+
+            assurance_conn = connect(config.db_path)
+            try:
+                policy = assurance_conn.execute(
+                    "SELECT artifact_contract_json, subject_json FROM dispatch_policies "
+                    "WHERE policy_id=?",
+                    (str(event.payload.get("policy_id") or ""),),
+                ).fetchone()
+                artifact_contract = (
+                    json.loads(str(policy["artifact_contract_json"]))
+                    if policy is not None
+                    else None
+                )
+                subject = (
+                    json.loads(str(policy["subject_json"]))
+                    if policy is not None and policy["subject_json"] is not None
+                    else None
+                )
+                validate_typed_artifact_refs(
+                    config,
+                    event.payload.get("artifact_refs", []),
+                    artifact_contract=(
+                        artifact_contract if isinstance(artifact_contract, dict) else None
+                    ),
+                    expected_subject_digest=(
+                        str(subject.get("digest") or "") if isinstance(subject, dict) else ""
+                    ),
+                    expected_provenance=str(event.payload.get("management_level") or ""),
+                )
+            except AssuranceResolutionError as exc:
+                raise EventProtocolError(str(exc)) from exc
+            finally:
+                assurance_conn.close()
+        records = read_event_records(config.events_path)
+        candidate = {
+            "actor": event.actor,
+            "actor_instance_id": event.actor_instance_id,
+            "entity_id": event.entity_id,
+            "event_id": event.event_id,
+            "event_seq": (int(records[-1]["event_seq"]) + 1) if records else 1,
+            "kind": event.kind,
+            "occurred_utc": event.occurred_utc,
+            "payload": event.payload,
+            "thread_id": event.thread_id,
+        }
+        try:
+            validate_event_projection(config, [*records, candidate])
+        except (RuntimeError, ValueError) as exc:
+            raise EventProtocolError(str(exc)) from exc
+        return None
     if event.kind == "backlog_item_upserted":
         item_id = str(event.payload.get("id") or event.entity_id)
         if item_id != event.entity_id or event.thread_id != event.entity_id:
@@ -451,23 +961,135 @@ def _validate_stateful_event_before_append(event: Event, agent_dir: Path) -> Non
         conn = connect(config.db_path)
         try:
             initialize_schema(conn)
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            current_schema_sha256 = schema_sha256_for_connection(conn)
+            current_table_hashes = tuple(sorted(table_hashes_for_connection(conn).items()))
+            if (
+                current_schema_sha256 != rebuild_result.schema_sha256
+                or current_table_hashes != tuple(sorted(rebuild_result.table_hashes.items()))
+            ):
+                raise EventProtocolError("prepared backlog projection changed; retry the operation")
             validate_backlog_write(conn, item_id, intent)
-        finally:
-            conn.close()
-        return
+            current = conn.execute(
+                "SELECT status FROM backlog_items WHERE id=?", (item_id,)
+            ).fetchone()
+            previous_status = str(current["status"] or "") if current is not None else "none"
+            next_status = str(event.payload.get("status") or previous_status)
+            transition = f"{previous_status}->{next_status}"
+            if previous_status != next_status:
+                from agent_mesh.core.assurance import (
+                    assurance_gate_binding,
+                    evaluate_transition_assurance,
+                )
 
-    conn = connect(config.db_path)
+                gate_evaluated_utc = (
+                    datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                )
+                gate = evaluate_transition_assurance(
+                    config,
+                    conn,
+                    boundary_kind="backlog_transition",
+                    boundary_key=transition,
+                    now_utc=gate_evaluated_utc,
+                )
+                if not gate.allows_transition:
+                    raise EventProtocolError(
+                        "REVIEW_ASSURANCE_TRANSITION_BLOCKED: " + ",".join(gate.reason_codes)
+                    )
+                if gate.configured:
+                    binding = assurance_gate_binding(
+                        gate,
+                        boundary_kind="backlog_transition",
+                        boundary_key=transition,
+                        gate_evaluated_utc=gate_evaluated_utc,
+                    )
+                    supplied = event.payload.get("review_gate")
+                    if supplied is not None and supplied != binding:
+                        raise EventProtocolError("REVIEW_ASSURANCE_GATE_EVIDENCE_MISMATCH")
+                    event.payload["review_gate"] = binding
+        except BaseException:
+            conn.rollback()
+            conn.close()
+            raise
+        return conn
+
+    return None
+
+
+def _consume_decision_append_receipt(
+    receipt: _DecisionAppendReceipt,
+    *,
+    lock_handle: Any,
+    config: Any,
+    projection_version: str,
+    file_sha256,
+) -> _DecisionAppendState | None:
+    from agent_mesh.core.lock import is_active_lock_handle
+
+    with _DECISION_RECEIPT_LOCK:
+        state = _DECISION_RECEIPTS.pop(receipt.token, None)
+    if state is None:
+        return None
     try:
-        initialize_schema(conn)
-        validate_decision_event(
-            conn,
-            kind=event.kind,
-            entity_id=event.entity_id,
-            thread_id=event.thread_id,
-            payload=event.payload,
-        )
-    finally:
-        conn.close()
+        events_path = config.events_path.resolve()
+        expected_lock_dir = (config.agent_dir / ".mail-lock").resolve()
+        if (
+            state.lock_handle is not lock_handle
+            or state.pid != os.getpid()
+            or state.thread_id != threading.get_ident()
+            or lock_handle is None
+            or not is_active_lock_handle(lock_handle, expected_lock_dir)
+            or state.events_path != str(events_path)
+            or state.db_path != str(config.db_path.resolve())
+            or state.config_sha256 != _config_sha256(config)
+            or state.projection_version != projection_version
+        ):
+            return None
+        if state.source_log_sha256 != file_sha256(events_path):
+            return None
+        tail_line, tail_hash = read_tail_line(events_path)
+        current_last_seq = _next_event_seq(tail_line) - 1
+        if state.last_event_seq != current_last_seq or state.tail_event_hash != tail_hash:
+            return None
+        return state
+    except (json.JSONDecodeError, OSError, RuntimeError, sqlite3.DatabaseError, ValueError):
+        return None
+
+
+def _consume_capability_append_receipt(
+    receipt: _CapabilityAppendReceipt,
+    *,
+    lock_handle: Any,
+    events_path: Path,
+    persisted_receipt: dict[str, Any],
+) -> bool:
+    from agent_mesh.core.lock import is_active_lock_handle
+
+    with _CAPABILITY_RECEIPT_LOCK:
+        state = _CAPABILITY_RECEIPTS.pop(receipt.token, None)
+    if state is None:
+        return False
+    expected_lock_dir = events_path.parent / ".mail-lock"
+    if (
+        state.pid != os.getpid()
+        or state.thread_id != threading.get_ident()
+        or state.events_path != str(events_path.resolve())
+        or lock_handle is None
+        or not is_active_lock_handle(lock_handle, expected_lock_dir)
+    ):
+        return False
+    valid_until = _parse_receipt_time(state.valid_until_utc)
+    if valid_until is None or valid_until <= datetime.now(UTC):
+        return False
+    if str(persisted_receipt.get("profile_digest") or "") != state.profile_digest:
+        return False
+    if str(persisted_receipt.get("drift_inputs_digest") or "") != state.drift_inputs_digest:
+        return False
+    return secrets.compare_digest(
+        json.dumps(persisted_receipt, sort_keys=True, separators=(",", ":")),
+        state.receipt_json,
+    )
 
 
 def _next_event_seq(prev_line: bytes) -> int:
@@ -600,14 +1222,31 @@ def _partial_path(events_path: Path, event_id: str) -> Path:
     return events_path.with_name(f"{events_path.name}.partial-{event_id}")
 
 
-def _replay_event_placeholder(event: Event, agent_dir: Path) -> None:
+def _replay_event_placeholder(
+    event: Event,
+    agent_dir: Path,
+    *,
+    projection_conn: sqlite3.Connection | None = None,
+) -> None:
     """Step [E] of the §6.2 pipeline — DB transaction + view regeneration."""
     from agent_mesh.config import config_from_agent_dir
-    from agent_mesh.store.rebuild import apply_event
+    from agent_mesh.store.rebuild import apply_event, apply_record, file_sha256
+    from agent_mesh.store.sqlite import set_meta
     from agent_mesh.views import render_all
 
     config = config_from_agent_dir(agent_dir)
-    apply_event(event, agent_dir=agent_dir)
+    if projection_conn is None:
+        apply_event(event, agent_dir=agent_dir)
+    else:
+        apply_record(
+            event.to_dict(),
+            config,
+            conn=projection_conn,
+            require_next=True,
+            manage_transaction=False,
+        )
+        set_meta(projection_conn, "events_jsonl_sha", file_sha256(config.events_path))
+        projection_conn.commit()
     render_all(config)
 
 

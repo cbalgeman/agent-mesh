@@ -12,6 +12,8 @@ from typing import Any, Iterator
 AGENT_INSTANCE_TABLES = (
     "agent_instances",
     "agent_instance_aliases",
+    "agent_instance_launch_attempts",
+    "agent_instance_launch_runs",
 )
 MESSAGE_TABLES = (
     "messages",
@@ -39,8 +41,12 @@ BACKLOG_TABLES = (
     "backlog_events",
 )
 DISPATCH_TABLES = (
+    "dispatch_policies",
     "dispatch_runs",
     "dispatch_leases",
+    "review_assurances",
+    "review_assurance_lifecycle",
+    "assurance_artifact_refs",
 )
 ALL_TABLES = (
     AGENT_INSTANCE_TABLES + MESSAGE_TABLES + DECISION_TABLES + BACKLOG_TABLES + DISPATCH_TABLES
@@ -76,19 +82,60 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
+def connect_read_only(db_path: str | Path) -> sqlite3.Connection:
+    """Open an existing projection without creating files, locks, or schema state."""
+
+    path = Path(db_path).resolve()
+    if not path.is_file():
+        raise StoreError(f"projection database not found: {path}")
+    uri = f"{path.as_uri()}?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     with conn:
         yield conn
 
 
-def initialize_schema(conn: sqlite3.Connection) -> None:
+def _execute_schema_script(
+    conn: sqlite3.Connection,
+    script: str,
+    *,
+    preserve_transaction: bool,
+) -> None:
+    if not preserve_transaction:
+        conn.executescript(script)
+        return
+
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            conn.execute(pending)
+            pending = ""
+    if pending.strip():
+        raise StoreError("incomplete projection schema statement")
+
+
+def initialize_schema(
+    conn: sqlite3.Connection,
+    *,
+    preserve_transaction: bool = False,
+) -> None:
     # Existing projection DBs may already have a pre-source-provenance messages
     # table. Add new columns before CREATE INDEX statements reference them.
     _migrate_messages_source_schema(conn)
     _migrate_workflow_origin_schema(conn)
     _migrate_agent_instance_schema(conn)
-    conn.executescript(
+    _migrate_dispatch_schema(conn)
+    _execute_schema_script(
+        conn,
         """
         CREATE TABLE IF NOT EXISTS agent_instances (
           id                          TEXT PRIMARY KEY,
@@ -98,6 +145,27 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
           workstream                  TEXT,
           runtime_profile             TEXT,
           external_session_ref_digest TEXT,
+          instance_contract_version   INTEGER NOT NULL DEFAULT 1,
+          durable_role                TEXT,
+          role                        TEXT,
+          capabilities_json           TEXT NOT NULL DEFAULT '[]',
+          permission_mode             TEXT,
+          authentication_mode         TEXT,
+          billing_mode                TEXT,
+          adapter_trust               TEXT NOT NULL DEFAULT 'legacy',
+          session_identity_mode       TEXT NOT NULL DEFAULT 'legacy',
+          resumable                   INTEGER NOT NULL DEFAULT 0,
+          concurrent_attachment       INTEGER NOT NULL DEFAULT 0,
+          terminal_observation        TEXT NOT NULL DEFAULT 'legacy',
+          registrar                   TEXT,
+          registration_origin         TEXT NOT NULL DEFAULT 'legacy',
+          parent_instance_id          TEXT,
+          originating_run_id          TEXT,
+          launch_attempt_digest       TEXT,
+          last_binding_source         TEXT,
+          active_launch_run_ids_json  TEXT NOT NULL DEFAULT '[]',
+          terminal_outcome            TEXT,
+          terminal_utc                TEXT,
           status                      TEXT NOT NULL,
           created_utc                 TEXT NOT NULL,
           updated_utc                 TEXT NOT NULL,
@@ -111,6 +179,13 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
           ON agent_instances(participant, status);
         CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_instances_label
           ON agent_instances(label);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_instances_active_session
+          ON agent_instances(participant, provider, external_session_ref_digest)
+          WHERE status='active' AND external_session_ref_digest IS NOT NULL
+            AND external_session_ref_digest<>'';
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_instances_launch_attempt
+          ON agent_instances(launch_attempt_digest)
+          WHERE launch_attempt_digest IS NOT NULL AND launch_attempt_digest<>'';
 
         CREATE TABLE IF NOT EXISTS agent_instance_aliases (
           label       TEXT PRIMARY KEY,
@@ -120,6 +195,26 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_agent_instance_aliases_id
           ON agent_instance_aliases(instance_id);
+
+        CREATE TABLE IF NOT EXISTS agent_instance_launch_attempts (
+          digest      TEXT PRIMARY KEY,
+          instance_id TEXT NOT NULL,
+          lifecycle_disposition TEXT NOT NULL DEFAULT '',
+          event_seq   INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_instance_launch_attempts_id
+          ON agent_instance_launch_attempts(instance_id);
+
+        CREATE TABLE IF NOT EXISTS agent_instance_launch_runs (
+          run_id             TEXT PRIMARY KEY,
+          instance_id        TEXT NOT NULL,
+          status             TEXT NOT NULL,
+          outcome            TEXT,
+          bound_event_seq    INTEGER NOT NULL,
+          released_event_seq INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_instance_launch_runs_id
+          ON agent_instance_launch_runs(instance_id, status);
 
         CREATE TABLE IF NOT EXISTS messages (
           id              TEXT PRIMARY KEY,
@@ -145,6 +240,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
           body_media_type TEXT DEFAULT 'text/markdown',
           body_authority  TEXT NOT NULL DEFAULT 'unknown',
           body_fidelity   TEXT,
+          review_envelope_json TEXT,
           status          TEXT NOT NULL DEFAULT 'open',
           resolution      TEXT,
           resolved_utc    TEXT,
@@ -247,6 +343,8 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
           tier               TEXT NOT NULL,
           tier_valid         INTEGER NOT NULL DEFAULT 1,
           status             TEXT NOT NULL,
+          contract_version   INTEGER NOT NULL DEFAULT 0,
+          applicability_scope TEXT NOT NULL DEFAULT 'manual',
           enforcement_mode   TEXT NOT NULL,
           owner              TEXT,
           body_sha           TEXT NOT NULL,
@@ -398,6 +496,36 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_backlog_events_item ON backlog_events(item_id, event_seq);
 
+        CREATE TABLE IF NOT EXISTS dispatch_policies (
+          policy_id                 TEXT PRIMARY KEY,
+          request_id                TEXT NOT NULL,
+          contract_version          TEXT NOT NULL,
+          policy_digest             TEXT NOT NULL,
+          purpose                   TEXT NOT NULL,
+          role                      TEXT NOT NULL,
+          required_capabilities_json TEXT NOT NULL,
+          permission_ceiling        TEXT NOT NULL,
+          response_contract_json    TEXT NOT NULL,
+          artifact_contract_json    TEXT NOT NULL,
+          provenance_requirements_json TEXT NOT NULL,
+          retry_json                TEXT NOT NULL,
+          response_slot_kind        TEXT NOT NULL,
+          response_slot_key         TEXT NOT NULL,
+          target_json               TEXT NOT NULL,
+          runtime_profile_revision_json TEXT NOT NULL,
+          management_level          TEXT NOT NULL,
+          subject_json              TEXT,
+          assurance_policy_json     TEXT,
+          retry_exhausted_run_id    TEXT,
+          retry_exhausted_utc       TEXT,
+          frozen_utc                TEXT NOT NULL,
+          event_seq                 INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_dispatch_policies_digest
+          ON dispatch_policies(policy_digest);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_dispatch_policies_request_slot
+          ON dispatch_policies(request_id, response_slot_kind, response_slot_key);
+
         CREATE TABLE IF NOT EXISTS dispatch_runs (
           run_id                    TEXT PRIMARY KEY,
           run_mode                  TEXT NOT NULL,
@@ -434,11 +562,23 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
           started_utc               TEXT,
           completed_utc             TEXT,
           failed_utc                TEXT,
+          policy_id                 TEXT,
+          policy_digest             TEXT,
+          attempt_number            INTEGER,
+          previous_attempt_id       TEXT,
+          management_level          TEXT,
+          runtime_profile           TEXT,
+          effective_capability_evidence_digest TEXT,
+          capability_receipt_json   TEXT,
+          terminal_code             TEXT,
           event_seq                 INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_dispatch_runs_input ON dispatch_runs(input_message_id);
         CREATE INDEX IF NOT EXISTS idx_dispatch_runs_agent_status ON dispatch_runs(target_agent, status);
         CREATE INDEX IF NOT EXISTS idx_dispatch_runs_session ON dispatch_runs(session_key);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_dispatch_runs_active_policy
+          ON dispatch_runs(policy_id)
+          WHERE policy_id IS NOT NULL AND status IN ('planned','started');
 
         CREATE TABLE IF NOT EXISTS dispatch_leases (
           lease_id             TEXT PRIMARY KEY,
@@ -457,7 +597,70 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_dispatch_leases_run ON dispatch_leases(run_id);
         CREATE UNIQUE INDEX IF NOT EXISTS uq_dispatch_leases_open
           ON dispatch_leases(input_message_id, target_agent) WHERE status='open';
-        """
+
+        CREATE TABLE IF NOT EXISTS review_assurances (
+          assurance_id              TEXT PRIMARY KEY,
+          request_id                TEXT NOT NULL,
+          attempt_id                TEXT NOT NULL,
+          bound                     INTEGER NOT NULL,
+          policy_id                 TEXT,
+          policy_digest             TEXT,
+          subject_json              TEXT NOT NULL,
+          reviewer_json             TEXT NOT NULL,
+          policy_revision           TEXT NOT NULL,
+          disposition               TEXT NOT NULL,
+          finding_counts_json       TEXT NOT NULL,
+          management_level          TEXT NOT NULL,
+          originating_response_id   TEXT,
+          recorded_utc              TEXT NOT NULL,
+          valid_until_utc           TEXT NOT NULL,
+          authoritative             INTEGER NOT NULL,
+          event_seq                 INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_review_assurances_subject
+          ON review_assurances(request_id, policy_revision, authoritative);
+        CREATE INDEX IF NOT EXISTS idx_review_assurances_policy
+          ON review_assurances(policy_id, event_seq);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_review_assurances_response
+          ON review_assurances(originating_response_id)
+          WHERE originating_response_id IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS review_assurance_lifecycle (
+          lifecycle_event_id       TEXT PRIMARY KEY,
+          assurance_id             TEXT NOT NULL,
+          lifecycle_version        INTEGER NOT NULL,
+          state                    TEXT NOT NULL,
+          reason_code              TEXT,
+          note                     TEXT,
+          actor                    TEXT NOT NULL,
+          occurred_utc             TEXT NOT NULL,
+          replacement_assurance_id TEXT,
+          operation_key            TEXT NOT NULL UNIQUE,
+          event_seq                INTEGER NOT NULL,
+          UNIQUE(assurance_id, lifecycle_version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_review_assurance_lifecycle_current
+          ON review_assurance_lifecycle(assurance_id, lifecycle_version DESC);
+
+        CREATE TABLE IF NOT EXISTS assurance_artifact_refs (
+          assurance_id      TEXT NOT NULL,
+          ref_index         INTEGER NOT NULL,
+          location_type     TEXT NOT NULL,
+          location          TEXT NOT NULL,
+          sha256            TEXT NOT NULL,
+          byte_size         INTEGER NOT NULL,
+          media_type        TEXT NOT NULL,
+          revision          TEXT NOT NULL,
+          visibility        TEXT NOT NULL,
+          provenance        TEXT NOT NULL,
+          subject_digest    TEXT NOT NULL,
+          field_privacy_json TEXT NOT NULL,
+          PRIMARY KEY (assurance_id, ref_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_assurance_artifact_digest
+          ON assurance_artifact_refs(sha256);
+        """,
+        preserve_transaction=preserve_transaction,
     )
     _migrate_messages_source_schema(conn)
     _migrate_decisions_schema(conn)
@@ -470,7 +673,7 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (
             "domain_versions",
-            '{"messages":4,"source_provenance":1,"workflow_origin":1,"decisions":4,"backlog":3,"dispatch":1,"agent_instances":1}',
+            '{"messages":4,"source_provenance":1,"workflow_origin":1,"decisions":5,"backlog":3,"dispatch":2,"agent_instances":1,"review_assurance":2}',
         ),
     )
     if conn.execute("SELECT COUNT(*) FROM events_seen").fetchone()[0] == 0:
@@ -514,6 +717,8 @@ def _migrate_messages_source_schema(conn: sqlite3.Connection) -> None:
         )
     if "body_fidelity" not in columns:
         conn.execute("ALTER TABLE messages ADD COLUMN body_fidelity TEXT")
+    if "review_envelope_json" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN review_envelope_json TEXT")
 
 
 def _migrate_workflow_origin_schema(conn: sqlite3.Connection) -> None:
@@ -535,6 +740,47 @@ def _migrate_workflow_origin_schema(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_agent_instance_schema(conn: sqlite3.Connection) -> None:
+    instance_columns = [row["name"] for row in conn.execute("PRAGMA table_info(agent_instances)")]
+    if instance_columns:
+        additions = {
+            "instance_contract_version": "INTEGER NOT NULL DEFAULT 1",
+            "durable_role": "TEXT",
+            "role": "TEXT",
+            "capabilities_json": "TEXT NOT NULL DEFAULT '[]'",
+            "permission_mode": "TEXT",
+            "authentication_mode": "TEXT",
+            "billing_mode": "TEXT",
+            "adapter_trust": "TEXT NOT NULL DEFAULT 'legacy'",
+            "session_identity_mode": "TEXT NOT NULL DEFAULT 'legacy'",
+            "resumable": "INTEGER NOT NULL DEFAULT 0",
+            "concurrent_attachment": "INTEGER NOT NULL DEFAULT 0",
+            "terminal_observation": "TEXT NOT NULL DEFAULT 'legacy'",
+            "registrar": "TEXT",
+            "registration_origin": "TEXT NOT NULL DEFAULT 'legacy'",
+            "parent_instance_id": "TEXT",
+            "originating_run_id": "TEXT",
+            "launch_attempt_digest": "TEXT",
+            "last_binding_source": "TEXT",
+            "active_launch_run_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+            "terminal_outcome": "TEXT",
+            "terminal_utc": "TEXT",
+        }
+        for column, declaration in additions.items():
+            if column not in instance_columns:
+                conn.execute(
+                    f"ALTER TABLE agent_instances ADD COLUMN {column} {declaration}"
+                )
+
+    launch_attempt_columns = [
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(agent_instance_launch_attempts)")
+    ]
+    if launch_attempt_columns and "lifecycle_disposition" not in launch_attempt_columns:
+        conn.execute(
+            "ALTER TABLE agent_instance_launch_attempts "
+            "ADD COLUMN lifecycle_disposition TEXT NOT NULL DEFAULT ''"
+        )
+
     message_columns = [row["name"] for row in conn.execute("PRAGMA table_info(messages)")]
     if message_columns:
         if "sender_instance_id" not in message_columns:
@@ -551,10 +797,29 @@ def _migrate_agent_instance_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE backlog_events ADD COLUMN actor_instance_id TEXT")
 
 
+def _migrate_dispatch_schema(conn: sqlite3.Connection) -> None:
+    columns = [row["name"] for row in conn.execute("PRAGMA table_info(dispatch_policies)")]
+    if columns:
+        additions = {
+            "runtime_profile_revision_json": "TEXT NOT NULL DEFAULT '{}'",
+            "retry_exhausted_run_id": "TEXT",
+            "retry_exhausted_utc": "TEXT",
+        }
+        for column, declaration in additions.items():
+            if column not in columns:
+                conn.execute(
+                    f"ALTER TABLE dispatch_policies ADD COLUMN {column} {declaration}"
+                )
+
+
 def _migrate_decisions_schema(conn: sqlite3.Connection) -> None:
     columns = [row["name"] for row in conn.execute("PRAGMA table_info(decisions)")]
     if columns and "tier_valid" not in columns:
         conn.execute("ALTER TABLE decisions ADD COLUMN tier_valid INTEGER NOT NULL DEFAULT 1")
+    if columns and "applicability_scope" not in columns:
+        conn.execute(
+            "ALTER TABLE decisions ADD COLUMN applicability_scope TEXT NOT NULL DEFAULT 'manual'"
+        )
     verification_columns = [
         row["name"] for row in conn.execute("PRAGMA table_info(decision_verifications)")
     ]
@@ -567,10 +832,28 @@ def _migrate_decisions_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE decision_verifications ADD COLUMN argv_json TEXT")
 
 
-def reset_schema(conn: sqlite3.Connection) -> None:
-    for table in reversed(ALL_TABLES):
-        conn.execute(f"DROP TABLE IF EXISTS {table}")
-    initialize_schema(conn)
+def _quoted_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def reset_schema(
+    conn: sqlite3.Connection,
+    *,
+    preserve_transaction: bool = False,
+) -> None:
+    """Replace the disposable projection schema, including unowned legacy objects."""
+
+    rows = conn.execute(
+        "SELECT type, name FROM sqlite_schema "
+        "WHERE name NOT LIKE 'sqlite_%' AND type IN ('trigger', 'view', 'index', 'table') "
+        "ORDER BY CASE type "
+        "WHEN 'trigger' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 ELSE 4 END, name"
+    ).fetchall()
+    for row in rows:
+        object_type = str(row["type"]).upper()
+        name = _quoted_identifier(str(row["name"]))
+        conn.execute(f"DROP {object_type} IF EXISTS {name}")
+    initialize_schema(conn, preserve_transaction=preserve_transaction)
 
 
 def get_last_event_seq(conn: sqlite3.Connection) -> int:
@@ -671,6 +954,8 @@ def _natural_order_key(table: str) -> tuple[str, ...]:
     return {
         "agent_instances": ("created_event_seq", "id"),
         "agent_instance_aliases": ("label",),
+        "agent_instance_launch_attempts": ("event_seq", "digest"),
+        "agent_instance_launch_runs": ("bound_event_seq", "run_id"),
         "messages": ("event_seq", "id"),
         "message_refs": ("message_id", "ref_type", "ref_value"),
         "message_source_context_refs": ("message_id", "ref_index"),
@@ -696,8 +981,12 @@ def _natural_order_key(table: str) -> tuple[str, ...]:
         "backlog_items": ("event_seq", "id"),
         "backlog_item_links": ("event_seq", "link_event_id"),
         "backlog_events": ("event_seq", "event_id"),
+        "dispatch_policies": ("event_seq", "policy_id"),
         "dispatch_runs": ("run_id",),
         "dispatch_leases": ("lease_id",),
+        "review_assurances": ("event_seq", "assurance_id"),
+        "review_assurance_lifecycle": ("assurance_id", "lifecycle_version"),
+        "assurance_artifact_refs": ("assurance_id", "ref_index"),
     }[table]
 
 

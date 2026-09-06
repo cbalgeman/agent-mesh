@@ -2,43 +2,71 @@
 
 from __future__ import annotations
 
-import json
 import os
+import hashlib
+import json
 import shutil
 import subprocess
-from dataclasses import dataclass
+import time
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Callable
 
 from agent_mesh.config import RuntimeProfile
 
-from .runtime import SUBSCRIPTION_API_CREDENTIALS, sanitized_child_environment
+from .runtime import (
+    PROVIDER_SESSION_ENVIRONMENT_VARIABLES,
+    SUBSCRIPTION_API_CREDENTIALS,
+    codex_child_environment,
+)
+from .runtime_registry import (
+    CommandRunner,
+    GENERIC_RUNTIME_PREFLIGHT_CHECKS,
+    MANDATORY_RUNTIME_DRIVER_CHECKS,
+    RuntimeAdapterNotFound,
+    RuntimeAdapterRegistry,
+    RuntimePreflightCheck,
+    RuntimePreflightResult,
+    _HOST_PREFLIGHT_PROOF,
+    runtime_registry_for_profile,
+)
+from .process_io import run_bounded_process
 
 
-@dataclass(frozen=True)
-class RuntimePreflightCheck:
-    name: str
-    passed: bool
-    detail: str
+RUNTIME_PREFLIGHT_TIMEOUT_SECONDS = 15.0
+MAX_RUNTIME_PREFLIGHT_STDOUT_BYTES = 1024 * 1024
+MAX_RUNTIME_PREFLIGHT_STDERR_BYTES = 64 * 1024
+RUNTIME_CAPABILITY_RECEIPT_VALIDITY_SECONDS = 300
 
 
-@dataclass(frozen=True)
-class RuntimePreflightResult:
-    profile_name: str
-    target: str
-    binary_path: Path | None
-    checks: tuple[RuntimePreflightCheck, ...]
+def runtime_profile_revision(profile: RuntimeProfile) -> dict[str, object]:
+    """Return the complete privacy-safe routing authority frozen by dispatch.v1."""
 
-    @property
-    def passed(self) -> bool:
-        return bool(self.checks) and all(check.passed for check in self.checks)
-
-    def failure_summary(self) -> str:
-        failures = [check.name for check in self.checks if not check.passed]
-        return ", ".join(failures) if failures else "none"
-
-
-CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+    authority: dict[str, object] = {
+        "name": profile.name,
+        "target": profile.target,
+        "provider": profile.provider,
+        "adapter": profile.adapter,
+        "version": profile.version,
+        "model": profile.model,
+        "durable_role": profile.durable_role,
+        "role": profile.role,
+        "permission_mode": profile.permission_mode,
+        "repository_scope": profile.repository_scope,
+        "required_capabilities": list(profile.required_capabilities),
+        "authentication_mode": profile.authentication_mode,
+        "billing_mode": profile.billing_mode,
+        "adapter_trust": profile.adapter_trust,
+        "session_identity_mode": profile.session_identity_mode,
+        "resumable": profile.resumable,
+        "concurrent_attachment": profile.concurrent_attachment,
+        "terminal_observation": profile.terminal_observation,
+        "driver_source": profile.driver_source,
+        "driver_protocol": profile.driver_protocol,
+        "driver_manifest_sha256": profile.driver_manifest_sha256,
+    }
+    encoded = json.dumps(authority, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {**authority, "digest": hashlib.sha256(encoded).hexdigest()}
 
 
 def preflight_runtime_profile(
@@ -47,16 +75,31 @@ def preflight_runtime_profile(
     project_root: str | Path,
     environ: dict[str, str] | None = None,
     runner: CommandRunner | None = None,
+    registry: RuntimeAdapterRegistry | None = None,
 ) -> RuntimePreflightResult:
     """Verify a profile without issuing a model prompt or persisting provider output."""
 
-    run = runner or subprocess.run
+    deadline = time.monotonic() + RUNTIME_PREFLIGHT_TIMEOUT_SECONDS
+    run = runner or _bounded_preflight_runner(deadline)
     root = Path(project_root).resolve()
+    observed = datetime.now(UTC).replace(microsecond=0)
     source_environment = dict(os.environ if environ is None else environ)
-    child_environment = sanitized_child_environment(
+    child_environment = codex_child_environment(
         profile.credential_denylist,
+        binary=profile.binary,
         source=source_environment,
     )
+    drivers = runtime_registry_for_profile(
+        profile,
+        project_root=root,
+        registry=registry,
+    )
+    driver = None
+    try:
+        driver = drivers.resolve(profile)
+    except RuntimeAdapterNotFound:
+        pass
+
     checks: list[RuntimePreflightCheck] = [
         RuntimePreflightCheck(
             "enabled",
@@ -65,20 +108,39 @@ def preflight_runtime_profile(
         )
     ]
 
-    adapter_supported = profile.adapter == "codex-cli" and profile.provider == "openai"
+    adapter_supported = driver is not None
+    if driver is None:
+        adapter_detail = f"{profile.provider}/{profile.adapter} has no configured live driver"
+    elif driver.ownership == "project-local":
+        adapter_detail = (
+            f"{profile.provider}/{profile.adapter} uses the explicitly selected "
+            "project-local runtime driver"
+        )
+    else:
+        adapter_detail = (
+            f"{profile.provider}/{profile.adapter} uses the Agent Mesh-owned runtime-family driver"
+        )
     checks.append(
         RuntimePreflightCheck(
             "adapter",
             adapter_supported,
-            (
-                "openai/codex-cli has a machine-verifiable live adapter"
-                if adapter_supported
-                else (
-                    f"{profile.provider}/{profile.adapter} has no machine-verifiable live adapter"
-                )
-            ),
+            adapter_detail,
         )
     )
+    driver_contract_ok = False
+    if driver is not None:
+        driver_contract_ok = driver.supports_lifecycle(profile)
+        checks.append(
+            RuntimePreflightCheck(
+                "driver_contract",
+                driver_contract_ok,
+                (
+                    "configured lifecycle combination is supported"
+                    if driver_contract_ok
+                    else f"configured lifecycle combination is not supported by {driver.adapter_id}"
+                ),
+            )
+        )
 
     binary_path = _resolve_binary(profile.binary, path=source_environment.get("PATH"))
     executable_ok = (
@@ -96,7 +158,11 @@ def preflight_runtime_profile(
         )
     )
 
-    denied = set(SUBSCRIPTION_API_CREDENTIALS) | set(profile.credential_denylist)
+    denied = (
+        set(PROVIDER_SESSION_ENVIRONMENT_VARIABLES)
+        | set(SUBSCRIPTION_API_CREDENTIALS)
+        | set(profile.credential_denylist)
+    )
     leaked = sorted(variable for variable in denied if variable in child_environment)
     checks.append(
         RuntimePreflightCheck(
@@ -125,7 +191,13 @@ def preflight_runtime_profile(
         )
     )
 
-    if not adapter_supported or not executable_ok or binary_path is None:
+    if (
+        not adapter_supported
+        or driver is None
+        or not driver_contract_ok
+        or not executable_ok
+        or binary_path is None
+    ):
         checks.extend(
             [
                 RuntimePreflightCheck("version", False, "adapter or executable unavailable"),
@@ -134,6 +206,9 @@ def preflight_runtime_profile(
                     "authentication_billing", False, "adapter or executable unavailable"
                 ),
                 RuntimePreflightCheck("capabilities", False, "adapter or executable unavailable"),
+                RuntimePreflightCheck(
+                    "effective_capabilities", False, "adapter or executable unavailable"
+                ),
                 RuntimePreflightCheck(
                     "permission_mode", False, "adapter or executable unavailable"
                 ),
@@ -144,145 +219,173 @@ def preflight_runtime_profile(
             target=profile.target,
             binary_path=binary_path,
             checks=tuple(checks),
+            _host_preflight_proof=_HOST_PREFLIGHT_PROOF,
+            **_receipt_metadata(profile, binary_path, observed),
         )
 
-    checks.extend(
-        _codex_preflight_checks(
+    assert driver is not None
+    hook_failure = ""
+    try:
+        driver_checks = driver.preflight(
             profile,
             binary_path=binary_path,
             project_root=root,
             environment=child_environment,
             runner=run,
         )
+    except Exception as exc:
+        # A provider/runtime failure is a failed proof, not an authorization to
+        # bypass preflight or surface provider-controlled exception text.
+        driver_checks = []
+        hook_failure = type(exc).__name__
+    if driver.ownership == "agent-mesh-built-in" and not any(
+        check.name == "effective_capabilities" for check in driver_checks
+    ):
+        declared = next(
+            (check for check in driver_checks if check.name == "capabilities"),
+            None,
+        )
+        if declared is not None:
+            # Built-in drivers own their probe semantics.  Drivers written for
+            # the pre-D014 interface may return one positive capability proof;
+            # adapt that proof into the explicitly named effective layer.  A
+            # project-local/self-attested driver never receives this upgrade.
+            driver_checks.append(
+                RuntimePreflightCheck(
+                    "effective_capabilities",
+                    declared.passed,
+                    "built-in driver effective proof: " + declared.detail,
+                )
+            )
+    driver_names = [check.name for check in driver_checks]
+    required_driver_checks = set(MANDATORY_RUNTIME_DRIVER_CHECKS) | set(
+        driver.additional_required_checks
     )
+    if profile.resumable:
+        if driver.resumable_check:
+            required_driver_checks.add(driver.resumable_check)
+        else:
+            required_driver_checks.add("continuity")
+    missing_driver_checks = sorted(required_driver_checks - set(driver_names))
+    duplicate_driver_checks = sorted(
+        name for name in set(driver_names) if driver_names.count(name) != 1
+    )
+    reserved_driver_checks = sorted(set(driver_names) & set(GENERIC_RUNTIME_PREFLIGHT_CHECKS))
+    evidence_ok = not (
+        hook_failure or missing_driver_checks or duplicate_driver_checks or reserved_driver_checks
+    )
+    if evidence_ok:
+        evidence_detail = "driver supplied each mandatory preflight proof exactly once"
+    else:
+        issues = []
+        if hook_failure:
+            issues.append(f"hook_failed={hook_failure}")
+        if missing_driver_checks:
+            issues.append(f"missing={','.join(missing_driver_checks)}")
+        if duplicate_driver_checks:
+            issues.append(f"duplicate={','.join(duplicate_driver_checks)}")
+        if reserved_driver_checks:
+            issues.append(f"reserved={','.join(reserved_driver_checks)}")
+        evidence_detail = "invalid driver preflight evidence: " + "; ".join(issues)
+    checks.append(RuntimePreflightCheck("driver_evidence", evidence_ok, evidence_detail))
+    generic_checks = [
+        replace(
+            check,
+            evidence_class="generic_host",
+            trust_source="agent-mesh-host",
+        )
+        for check in checks
+    ]
+    driver_evidence_class = (
+        "built_in_driver" if driver.ownership == "agent-mesh-built-in" else "self_attested"
+    )
+    classified_driver_checks = [
+        replace(
+            check,
+            evidence_class=driver_evidence_class,
+            trust_source=driver.ownership,
+        )
+        for check in driver_checks
+    ]
     return RuntimePreflightResult(
         profile_name=profile.name,
         target=profile.target,
         binary_path=binary_path,
-        checks=tuple(checks),
+        checks=tuple([*generic_checks, *classified_driver_checks]),
+        _host_preflight_proof=_HOST_PREFLIGHT_PROOF,
+        **_receipt_metadata(profile, binary_path, observed),
     )
 
 
-def _codex_preflight_checks(
+def _receipt_metadata(
     profile: RuntimeProfile,
-    *,
-    binary_path: Path,
-    project_root: Path,
-    environment: dict[str, str],
-    runner: CommandRunner,
-) -> list[RuntimePreflightCheck]:
-    version = _run(
-        runner,
-        [str(binary_path), "--version"],
-        cwd=project_root,
-        environment=environment,
-    )
-    observed_version = _codex_version(version)
-    version_ok = observed_version == profile.version
+    binary_path: Path | None,
+    observed: datetime,
+) -> dict[str, str]:
+    profile_digest = str(runtime_profile_revision(profile)["digest"])
+    binary_identity: dict[str, int | str] = {"state": "unavailable"}
+    if binary_path is not None:
+        try:
+            stat_result = binary_path.stat()
+        except OSError:
+            pass
+        else:
+            binary_identity = {
+                "state": "available",
+                "device": int(stat_result.st_dev),
+                "inode": int(stat_result.st_ino),
+                "size": int(stat_result.st_size),
+                "mtime_ns": int(stat_result.st_mtime_ns),
+            }
+    drift_payload = {
+        "profile_digest": profile_digest,
+        "binary_identity": binary_identity,
+    }
+    drift_digest = hashlib.sha256(
+        json.dumps(drift_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "observed_utc": observed.isoformat().replace("+00:00", "Z"),
+        "valid_until_utc": (
+            observed + timedelta(seconds=RUNTIME_CAPABILITY_RECEIPT_VALIDITY_SECONDS)
+        )
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "drift_inputs_digest": drift_digest,
+        "profile_digest": profile_digest,
+    }
 
-    models = _run(
-        runner,
-        [str(binary_path), "debug", "models"],
-        cwd=project_root,
-        environment=environment,
-    )
-    model_slugs = _codex_model_slugs(models)
-    model_ok = profile.model in model_slugs
 
-    auth = _run(
-        runner,
-        [str(binary_path), "login", "status"],
-        cwd=project_root,
-        environment=environment,
-    )
-    auth_lines = set()
-    if auth is not None:
-        auth_lines = {line.strip() for line in (auth.stdout + "\n" + auth.stderr).splitlines()}
-    auth_ok = (
-        profile.authentication_mode == "chatgpt"
-        and profile.billing_mode == "subscription"
-        and auth is not None
-        and auth.returncode == 0
-        and "Logged in using ChatGPT" in auth_lines
-    )
+def _bounded_preflight_runner(deadline: float):
+    """Adapt the shared bounded subprocess transport to the driver runner protocol."""
 
-    general_help = _run(
-        runner,
-        [str(binary_path), "--help"],
-        cwd=project_root,
-        environment=environment,
-    )
-    exec_help = _run(
-        runner,
-        [str(binary_path), "exec", "--help"],
-        cwd=project_root,
-        environment=environment,
-    )
-    general_text = (
-        general_help.stdout if general_help is not None and general_help.returncode == 0 else ""
-    )
-    exec_text = exec_help.stdout if exec_help is not None and exec_help.returncode == 0 else ""
-    supported_capabilities = set()
-    if "--cd <DIR>" in general_text and "--skip-git-repo-check" in exec_text:
-        supported_capabilities.add("repository")
-    if "exec" in general_text and "--sandbox <SANDBOX_MODE>" in exec_text:
-        supported_capabilities.add("tools")
-    if "--search" in general_text:
-        supported_capabilities.add("network")
-    missing_capabilities = sorted(set(profile.required_capabilities) - supported_capabilities)
-    capabilities_ok = not missing_capabilities
+    def run(argv, **kwargs):
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            return subprocess.CompletedProcess(argv, 124, stdout="", stderr="")
+        configured_timeout = float(kwargs.get("timeout", remaining))
+        result = run_bounded_process(
+            list(argv),
+            cwd=Path(kwargs["cwd"]),
+            environment=dict(kwargs["env"]),
+            stdin=b"",
+            timeout_seconds=min(remaining, configured_timeout),
+            stdout_limit=MAX_RUNTIME_PREFLIGHT_STDOUT_BYTES,
+            stderr_limit=MAX_RUNTIME_PREFLIGHT_STDERR_BYTES,
+        )
+        try:
+            stdout = result.stdout.decode("utf-8", errors="strict")
+            stderr = result.stderr.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return subprocess.CompletedProcess(argv, 125, stdout="", stderr="")
+        return subprocess.CompletedProcess(
+            argv,
+            result.returncode if result.status == "completed" else 124,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
-    permission_ok = (
-        profile.permission_mode in {"read-only", "workspace-write"}
-        and profile.permission_mode in exec_text
-    )
-    return [
-        RuntimePreflightCheck(
-            "version",
-            version_ok,
-            (
-                f"verified codex-cli {profile.version}"
-                if version_ok
-                else f"expected {profile.version}; observed {observed_version or 'unavailable'}"
-            ),
-        ),
-        RuntimePreflightCheck(
-            "model",
-            model_ok,
-            (
-                f"model catalog contains {profile.model}"
-                if model_ok
-                else f"model catalog does not contain {profile.model}"
-            ),
-        ),
-        RuntimePreflightCheck(
-            "authentication_billing",
-            auth_ok,
-            (
-                "verified ChatGPT subscription login with API credentials stripped"
-                if auth_ok
-                else "could not verify the configured ChatGPT subscription boundary"
-            ),
-        ),
-        RuntimePreflightCheck(
-            "capabilities",
-            capabilities_ok,
-            (
-                f"verified {', '.join(profile.required_capabilities)}"
-                if capabilities_ok
-                else f"missing capability proof: {', '.join(missing_capabilities)}"
-            ),
-        ),
-        RuntimePreflightCheck(
-            "permission_mode",
-            permission_ok,
-            (
-                f"verified {profile.permission_mode} sandbox"
-                if permission_ok
-                else f"permission mode {profile.permission_mode!r} is not supported"
-            ),
-        ),
-    ]
+    return run
 
 
 def _resolve_binary(binary: str, *, path: str | None) -> Path | None:
@@ -291,49 +394,3 @@ def _resolve_binary(binary: str, *, path: str | None) -> Path | None:
         return candidate.resolve()
     resolved = shutil.which(binary, path=path)
     return Path(resolved).resolve() if resolved else None
-
-
-def _run(
-    runner: CommandRunner,
-    argv: list[str],
-    *,
-    cwd: Path,
-    environment: dict[str, str],
-) -> subprocess.CompletedProcess[str] | None:
-    try:
-        return runner(
-            argv,
-            cwd=cwd,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-
-def _codex_version(result: subprocess.CompletedProcess[str] | None) -> str:
-    if result is None or result.returncode != 0:
-        return ""
-    prefix = "codex-cli "
-    output = result.stdout.strip()
-    return output[len(prefix) :] if output.startswith(prefix) else ""
-
-
-def _codex_model_slugs(result: subprocess.CompletedProcess[str] | None) -> set[str]:
-    if result is None or result.returncode != 0:
-        return set()
-    try:
-        payload = json.loads(result.stdout)
-        models = payload.get("models", [])
-    except (AttributeError, json.JSONDecodeError, TypeError):
-        return set()
-    if not isinstance(models, list):
-        return set()
-    return {
-        str(model["slug"])
-        for model in models
-        if isinstance(model, dict) and isinstance(model.get("slug"), str)
-    }

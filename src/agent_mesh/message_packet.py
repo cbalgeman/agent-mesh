@@ -40,8 +40,11 @@ def build_message_packet(
                 "kind": item["kind"],
                 "created_utc": item["created_utc"],
                 "event_seq": item["event_seq"],
-                "sender": item["sender"],
-                "sender_instance_id": item["sender_instance_id"],
+                "sender": public_message_sender(
+                    conn,
+                    str(item["sender"]),
+                    str(item["sender_instance_id"] or ""),
+                ),
                 "parent_id": item["parent_id"],
                 "request_id": item["request_id"],
                 "title": item["title"],
@@ -62,10 +65,16 @@ def build_message_packet(
             "thread_id": row["thread_id"],
             "request_id": row["request_id"],
             "parent_id": row["parent_id"],
-            "sender": row["sender"],
-            "sender_instance_id": row["sender_instance_id"],
-            "recipients": json_loads(row["recipients_json"], []),
-            "recipient_instance_ids": json_loads(row["recipient_instance_ids_json"], []),
+            "sender": public_message_sender(
+                conn,
+                str(row["sender"]),
+                str(row["sender_instance_id"] or ""),
+            ),
+            "recipients": public_message_recipients(
+                conn,
+                json_loads(row["recipients_json"], []),
+                json_loads(row["recipient_instance_ids_json"], []),
+            ),
             "feature": row["feature_id"],
             "workflow_origin": row["workflow_origin"],
             "workflow_origin_valid": bool(row["workflow_origin_valid"]),
@@ -122,3 +131,48 @@ def _message_refs(conn: sqlite3.Connection, message_id: str) -> list[dict[str, s
         (message_id,),
     ).fetchall()
     return [{"type": row["ref_type"], "value": row["ref_value"]} for row in rows]
+
+
+def public_instance_handle_for_id(conn: sqlite3.Connection, identifier: str) -> str:
+    """Resolve an internal instance ID to its sole normal public handle."""
+
+    if not identifier:
+        return ""
+    row = conn.execute(
+        "SELECT label FROM agent_instances WHERE id=?", (identifier,)
+    ).fetchone()
+    return str(row["label"]) if row is not None else "[unknown-instance]"
+
+
+def public_message_sender(
+    conn: sqlite3.Connection, sender: str, sender_instance_id: str
+) -> str:
+    """Render one sender identity, preferring its instance handle when present."""
+
+    handle = public_instance_handle_for_id(conn, sender_instance_id)
+    return handle or sender
+
+
+def public_message_recipients(
+    conn: sqlite3.Connection,
+    recipients: list[Any],
+    recipient_instance_ids: list[Any],
+) -> list[str]:
+    """Render generic participants and instance-addressed handles without duplication."""
+
+    instance_rows: list[sqlite3.Row] = []
+    for identifier in recipient_instance_ids:
+        row = conn.execute(
+            "SELECT participant, label FROM agent_instances WHERE id=?",
+            (str(identifier),),
+        ).fetchone()
+        if row is not None:
+            instance_rows.append(row)
+    targeted_participants = {str(row["participant"]) for row in instance_rows}
+    rendered = [
+        str(recipient)
+        for recipient in recipients
+        if str(recipient) not in targeted_participants
+    ]
+    rendered.extend(str(row["label"]) for row in instance_rows)
+    return list(dict.fromkeys(rendered))

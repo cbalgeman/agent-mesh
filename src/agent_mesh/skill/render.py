@@ -43,12 +43,16 @@ use the agent-mesh handoff substrate.
   responding.
 - Run `agent-q instances list --participant <your-participant>` when the project
   uses long-lived AI-agent instances. If this chat has an assigned instance,
-  read its work with `agent-q list --to-instance <ID-or-label>` and
-  `agent-q backlog list --owner-instance <ID-or-label>`.
+  read its work with `agent-q list --to-instance <handle>` and
+  `agent-q backlog list --owner-instance <handle>`.
 - Read `.agent-mesh/config.toml` to learn participants, routing defaults,
   response_mode, state sharing, and compatibility view paths before writing.
-- For code changes, run decision/quality preflight once those event domains
-  are available.
+- Before code changes, run
+  `agent-q decisions preflight --path <repo-relative-path> --json` for the
+  initial planned paths, repeating `--path` as needed. A complete result with an
+  empty `decisions` list is valid. Unavailable or incomplete context is not an
+  empty result; report it before continuing, and rerun preflight if the path set
+  materially expands.
 
 ## Privacy and Git
 - Treat `.agent-mesh/` as project data. Never force-add ignored Agent Mesh
@@ -61,14 +65,19 @@ use the agent-mesh handoff substrate.
 
 ## Write
 - Use `agent-mesh request/respond/resolve/reopen`.
-- Keep participant, provider, runtime profile, and AI-agent instance separate.
-  When your participant has active registered instances, bind every write from
-  this chat with global `--instance <ID-or-label>` or
-  `AGENT_MESH_INSTANCE_ID` and use the instance participant as `--from` or
-  `--actor`; never use another chat's identity. Use request
+- Keep participant and AI-agent instance as the two identity layers. Use the
+  public `<participant>-<durable-role>` handle as the sole normal instance
+  identity; provider, runtime profile, role, capabilities, authentication, and
+  billing are separate registration facts. A trusted integration must complete
+  the automatic identity handshake before the first canonical write or
+  instance-addressed read. For an unmanaged fallback, bind every write from this
+  chat with global `--instance <handle>` or `AGENT_MESH_INSTANCE_ID` and use the
+  instance participant as `--from` or `--actor`; never use a raw `AI-...` ID or
+  another chat's handle. Use request
   `--to-instance` or backlog `--owner-instance` for a durable handoff to a
-  named active instance. Instance IDs attribute Agent Mesh events; they are not
-  authentication and do not preserve or mirror the provider chat context.
+  named active instance. The hidden project-local ID attributes canonical Agent
+  Mesh events; it is not authentication and does not preserve or mirror the
+  provider chat context.
 - Use Workbench or `agent-mesh decision propose` for new decisions. Do not
   allocate a decision ID from memory.
 - Agents may propose or revise decisions but must never accept them. Direct the
@@ -124,16 +133,17 @@ Read side (safe, no writes):
   agent-q locate <message_id>
   agent-q body <message_id>
   agent-q instances list [--participant X]
-  agent-q list --to-instance <AI-id-or-label>
-  agent-q backlog list --owner-instance <AI-id-or-label>
+  agent-q list --to-instance <handle>
+  agent-q backlog list --owner-instance <handle>
+  agent-q decisions preflight --path <repo-relative-path> [--path <path> ...] --json
 
 Write side (append-only events):
   agent-mesh request --to <agent> "<title>" "<body>"
   agent-mesh respond <REQ-id> "<summary>" "<details>"
   agent-mesh resolve <REQ-id> "<reason>"
   agent-mesh reopen <REQ-id> "<reason>"
-  agent-mesh --instance <sender-instance> request --to-instance <target-instance> "<title>" "<body>"
-  agent-mesh --instance <sender-instance> backlog create --actor <participant> --owner-instance <target-instance> --title "<title>"
+  agent-mesh --instance <sender-handle> request --to-instance <target-handle> "<title>" "<body>"
+  agent-mesh --instance <sender-handle> backlog create --actor <participant> --owner-instance <target-handle> --title "<title>"
   agent-mesh decision propose --id <D-id> --title "<title>" --tier <tier> --decision "<choice>"
 Human-operated approval (never run this command as an agent):
   agent-mesh decision accept <D-id> --by <human> --notes "<approval reason>"

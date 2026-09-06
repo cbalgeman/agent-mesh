@@ -1,0 +1,89 @@
+{
+  "schema": "agent-mesh.context-delivery-mapping.v1",
+  "fixture_id": "codex-hermes-static",
+  "runtime_family": "codex-hermes",
+  "claim_scope": "schema_fixture",
+  "adapter_id": "agent-mesh.context-delivery",
+  "capabilities": [
+    {
+      "capability": "session_bootstrap",
+      "mapping_status": "mapped",
+      "lifecycle_event": "hermes.session.start",
+      "action": {
+        "argv": ["agent-q", "context", "bootstrap"],
+        "input_schema": null,
+        "output_schema": "agent-mesh.context-bootstrap.v1"
+      }
+    },
+    {
+      "capability": "task_preflight",
+      "mapping_status": "mapped",
+      "lifecycle_event": "hermes.task.start",
+      "action": {
+        "argv": ["agent-q", "decisions", "preflight", "--json"],
+        "input_schema": null,
+        "output_schema": "agent-mesh.decision-context.v1"
+      }
+    },
+    {
+      "capability": "pre_edit",
+      "mapping_status": "mapped",
+      "lifecycle_event": "hermes.pre_edit",
+      "action": {
+        "argv": ["agent-q", "decisions", "hook"],
+        "input_schema": "agent-mesh.decision-hook-request.v1",
+        "output_schema": "agent-mesh.decision-context.v1"
+      }
+    },
+    {
+      "capability": "pre_write",
+      "mapping_status": "mapped",
+      "lifecycle_event": "hermes.pre_write",
+      "action": {
+        "argv": ["agent-q", "decisions", "hook"],
+        "input_schema": "agent-mesh.decision-hook-request.v1",
+        "output_schema": "agent-mesh.decision-context.v1"
+      }
+    },
+    {
+      "capability": "resume_refresh",
+      "mapping_status": "mapped",
+      "lifecycle_event": "hermes.session.resume",
+      "action": {
+        "argv": ["agent-q", "context", "bootstrap"],
+        "input_schema": null,
+        "output_schema": "agent-mesh.context-bootstrap.v1"
+      }
+    },
+    {
+      "capability": "compaction_refresh",
+      "mapping_status": "mapped",
+      "lifecycle_event": "hermes.compaction.complete",
+      "action": {
+        "argv": ["agent-q", "context", "bootstrap"],
+        "input_schema": null,
+        "output_schema": "agent-mesh.context-bootstrap.v1"
+      }
+    },
+    {
+      "capability": "reference_resolution",
+      "mapping_status": "mapped",
+      "lifecycle_event": "hermes.reference_scan",
+      "action": {
+        "argv": ["agent-q", "refs", "resolve", "--json"],
+        "input_schema": null,
+        "output_schema": "agent-mesh.reference-context.v1"
+      }
+    },
+    {
+      "capability": "change_review",
+      "mapping_status": "mapped",
+      "lifecycle_event": "hermes.change_review",
+      "action": {
+        "argv": ["agent-mesh", "check", "decisions", "--json"],
+        "input_schema": null,
+        "output_schema": "agent-mesh.decision-context.v1"
+      }
+    }
+  ]
+}
