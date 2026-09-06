@@ -3,6 +3,65 @@
 All notable public changes to Agent Mesh are recorded here. Agent Mesh is
 pre-1.0, so minor releases may change command or storage contracts.
 
+## [0.4.1] - 2026-09-06
+
+Agent Mesh 0.4.1 removes upgrade traps found while adopting 0.4.0 in a mature,
+multi-agent repository. The fixes apply to any repository with existing agent
+instances, historical decisions, imported instruction files, ignored working
+files, or more than one package installation.
+
+### What is fixed for people using Agent Mesh
+
+- Register another durable agent handle without borrowing an existing chat's
+  identity. Registration is now an explicit manual bootstrap event; ordinary
+  writes by a participant with active instances still require the correct
+  public handle and remain fail-closed.
+- Run `agent-mesh doctor` for a real setup check. It reports the package version,
+  whether the running code is an editable or installed distribution, its module
+  and Python locations, managed instruction targets, and adoption migrations.
+- Keep one managed instruction contract when `CLAUDE.md` imports `AGENTS.md`.
+  Adoption recognizes the root import, persists the chosen target set in
+  `.agent-mesh/config.toml`, and removes only an Agent Mesh-owned block from a
+  target that is no longer selected. Repository-authored text is preserved.
+- See accepted or in-force decisions that no longer satisfy the current tier,
+  scope, path-pattern, owner, or verification contract during `adopt --check`
+  and `doctor`. Agent Mesh reports the repair and never rewrites the decision or
+  bypasses fresh human approval.
+- Detect identical managed contract blocks even when the surrounding instruction
+  files differ. Projects may also declare representative per-prompt context files
+  so the context budget distinguishes persistent instructions from repeated
+  injection candidates without executing hooks.
+- Include ignored or private working files explicitly with repeated
+  `agent-mesh check decisions --path <repo-relative-path>`. The Git-derived
+  comparison remains bounded and unchanged; explicit paths close only the blind
+  spots the caller names.
+- When a reference scan exceeds its budget, the diagnostic now points to
+  `--paths`, `--file`, and `--ci-mode pr` instead of only saying to narrow the
+  input.
+- Use `agent-mesh --version` and `agent-q --version` directly.
+
+### Upgrade steps
+
+1. Back up the target repository's `.agent-mesh` directory.
+2. Install `my-agent-mesh==0.4.1`, then run `agent-mesh --version` and
+   `agent-mesh doctor` to confirm which installation is active.
+3. Run `agent-mesh adopt --repo .`. Review any managed-block removal and the
+   persisted `[adoption].contract_targets` value, then run
+   `agent-mesh adopt --repo . --check`.
+4. If a decision migration is reported, inspect it with
+   `agent-q decisions show <D-id>`. Amend the invalid metadata only after review;
+   the decision returns to Proposed and requires direct human re-approval.
+5. Run `agent-q verify-chain` before new durable writes. If Git ignores governed
+   files, include each changed path explicitly in `check decisions --path` or use
+   the path-scoped preflight/hook.
+6. Refresh an installed managed Workbench with
+   `agent-mesh workbench service repair`, then verify its authenticated health.
+
+Normal upgrade and diagnostic commands do not rewrite canonical events. This
+patch does not map historical tier names automatically, infer replacement paths,
+approve decisions, execute configured hooks, or make ignored files visible to
+Git.
+
 ## [0.4.0] - 2026-09-05
 
 Agent Mesh 0.4 makes durable work easier to delegate, review, find, and continue
@@ -291,5 +350,6 @@ compatibility reader can still load their supported top-level values, but
 adoption cannot safely synthesize the missing project identity table without a
 reviewed migration.
 
+[0.4.1]: https://github.com/cbalgeman/agent-mesh/releases/tag/v0.4.1
 [0.4.0]: https://github.com/cbalgeman/agent-mesh/releases/tag/v0.4.0
 [0.3.0]: https://github.com/cbalgeman/agent-mesh/releases/tag/v0.3.0

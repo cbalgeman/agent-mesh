@@ -226,8 +226,16 @@ agent-mesh instance register \
   --provider anthropic \
   --handle claude-design \
   --workstream design-system \
+  --actor human \
   --external-session-ref-digest <project-scoped-sha256>
 ```
+
+`instance register` is the sole manual unbound bootstrap: it records
+`registration_origin = manual` and the named registrar even when that actor
+already has active instances. It does not attribute the new handle to another
+chat and it does not weaken later writes. After registration, commands authored
+by a participant with active instances still require that command's correct
+public handle through `--instance` or `AGENT_MESH_INSTANCE_ID`.
 
 Compute the digest in a private provider-side integration. Never place a raw
 provider session reference in command arguments, environment variables, logs,

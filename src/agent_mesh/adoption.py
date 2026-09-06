@@ -6,11 +6,14 @@ import hashlib
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from agent_mesh.config import ConfigError, load_config, project_identity_status
+from agent_mesh.core.decision_schema import decision_completeness_issues
+from agent_mesh.store.read_model import ReadModelUnavailable, open_read_model
 
 
 CONTRACT_VERSION = "7"
@@ -92,6 +95,9 @@ CONTRACT_BODY = """\
 """
 START_PREFIX = "<!-- agent-mesh managed contract: start"
 END_MARKER = "<!-- agent-mesh managed contract: end -->"
+MAX_ADOPTION_DECISION_EVENTS = 100_000
+MAX_ADOPTION_DECISION_BYTES = 64 * 1024 * 1024
+ADOPTION_DECISION_TIMEOUT_SECONDS = 10.0
 LEGACY_DECISION_WRITE_RE = re.compile(
     r"(?i)(?:"
     r"(?:record|document|append|update|edit|write|authoritative|source[ -]of[ -]truth)"
@@ -138,9 +144,43 @@ def managed_contract_block() -> str:
 def default_contract_targets(repo: Path) -> list[str]:
     root = repo.expanduser().resolve()
     targets = ["agents"]
-    if (root / "CLAUDE.md").exists() or (root / ".claude").exists():
+    if (
+        (root / "CLAUDE.md").exists() or (root / ".claude").exists()
+    ) and not claude_imports_agents(root):
         targets.append("claude")
     return targets
+
+
+def selected_contract_targets(
+    repo: Path,
+    targets: list[str] | None = None,
+) -> list[str]:
+    """Resolve explicit, persisted, or conservatively detected instruction targets."""
+
+    config = load_config(repo)
+    if targets is not None:
+        return _normalize_targets(targets)
+    if config.adoption.contract_targets is not None:
+        return _normalize_targets(list(config.adoption.contract_targets))
+    return _normalize_targets(default_contract_targets(config.project_root))
+
+
+def claude_imports_agents(repo: Path) -> bool:
+    """Recognize the root-level Claude instruction import without following links."""
+
+    path = repo.expanduser().resolve() / CONTRACT_TARGETS["claude"]
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        if path.stat().st_size > 2 * 1024 * 1024:
+            return False
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    return any(
+        re.fullmatch(r"\s*@(?:\./)?AGENTS\.md\s*", line) is not None
+        for line in text.splitlines()
+    )
 
 
 def install_contract(
@@ -149,7 +189,7 @@ def install_contract(
     targets: list[str] | None = None,
 ) -> list[ContractInstallResult]:
     config = load_config(repo)
-    selected = _normalize_targets(targets or default_contract_targets(config.project_root))
+    selected = selected_contract_targets(config.project_root, targets)
     results: list[ContractInstallResult] = []
     for target in selected:
         path = config.project_root / CONTRACT_TARGETS[target]
@@ -170,6 +210,40 @@ def install_contract(
     return results
 
 
+def remove_unselected_contracts(
+    repo: Path,
+    *,
+    selected_targets: list[str],
+) -> list[ContractInstallResult]:
+    """Remove only Agent Mesh-owned blocks from targets the user did not select."""
+
+    config = load_config(repo)
+    selected = set(_normalize_targets(selected_targets))
+    results: list[ContractInstallResult] = []
+    for target, relative in CONTRACT_TARGETS.items():
+        if target in selected:
+            continue
+        path = config.project_root / relative
+        status_before = contract_file_status(path)
+        if status_before in {"missing", "unsafe", "unreadable"}:
+            continue
+        if status_before == "malformed":
+            raise AdoptionContractError(
+                f"managed contract markers are malformed in {path}; repair them before retrying"
+            )
+        changed = _remove_contract(path)
+        results.append(
+            ContractInstallResult(
+                target=target,
+                path=path,
+                changed=changed,
+                status_before=status_before,
+                status_after=contract_file_status(path),
+            )
+        )
+    return results
+
+
 def contract_status(
     repo: Path,
     *,
@@ -178,7 +252,7 @@ def contract_status(
     from agent_mesh.core.context_delivery import default_delivery_report
 
     config = load_config(repo)
-    selected = _normalize_targets(targets or default_contract_targets(config.project_root))
+    selected = selected_contract_targets(config.project_root, targets)
     files = []
     for target in selected:
         path = config.project_root / CONTRACT_TARGETS[target]
@@ -191,19 +265,119 @@ def contract_status(
         )
     conflicts = legacy_decision_write_conflicts(config.project_root)
     identity = project_identity_status(config.project_root)
+    decision_health = decision_migration_status(config)
+    healthy = (
+        all(item["status"] == "current" for item in files)
+        and not conflicts
+        and bool(identity.get("complete"))
+    )
     return {
         "version": CONTRACT_VERSION,
         "digest": contract_digest(),
-        "healthy": (
-            all(item["status"] == "current" for item in files)
-            and not conflicts
-            and bool(identity.get("complete"))
+        "healthy": healthy,
+        "adoption_ready": (
+            healthy
+            and bool(decision_health["complete"])
+            and not decision_health["migration_required"]
         ),
+        "target_source": (
+            "explicit"
+            if targets is not None
+            else "persisted"
+            if config.adoption.contract_targets is not None
+            else "detected"
+        ),
+        "selected_targets": selected,
         "files": files,
         "conflicts": conflicts,
         "project_identity": identity,
+        "decision_health": decision_health,
         "context_delivery": default_delivery_report(),
     }
+
+
+def decision_migration_status(config) -> dict[str, Any]:
+    """Report authoritative historical decisions that fail the current contract."""
+
+    try:
+        with open_read_model(
+            config,
+            max_bytes=MAX_ADOPTION_DECISION_BYTES,
+            max_events=MAX_ADOPTION_DECISION_EVENTS,
+            deadline_monotonic=time.monotonic() + ADOPTION_DECISION_TIMEOUT_SECONDS,
+        ) as snapshot:
+            conn = snapshot.conn
+            migrations: list[dict[str, Any]] = []
+            rows = conn.execute(
+                "SELECT dec_ulid, human_id, status, tier, tier_valid, owner, "
+                "applicability_scope FROM decisions "
+                "WHERE status IN ('accepted', 'in_force') ORDER BY human_id"
+            ).fetchall()
+            for row in rows:
+                globs_by_kind = {
+                    kind: [
+                        item["pattern"]
+                        for item in conn.execute(
+                            "SELECT pattern FROM decision_globs "
+                            "WHERE dec_ulid=? AND kind=? ORDER BY pattern",
+                            (row["dec_ulid"], kind),
+                        )
+                    ]
+                    for kind in ("affected", "exempt", "generated")
+                }
+                verification = [
+                    {
+                        "command": item["command"],
+                        "expected_signal": item["expected_signal"],
+                    }
+                    for item in conn.execute(
+                        "SELECT command, expected_signal FROM decision_verifications "
+                        "WHERE dec_ulid=? ORDER BY command",
+                        (row["dec_ulid"],),
+                    )
+                ]
+                issues: list[str] = []
+                if not bool(row["tier_valid"]):
+                    issues.append(
+                        f"historical tier {str(row['tier'])!r} is not in the canonical tier set"
+                    )
+                issues.extend(
+                    decision_completeness_issues(
+                        tier=str(row["tier"]),
+                        owner=str(row["owner"] or ""),
+                        affected_code_globs=globs_by_kind["affected"],
+                        verification=verification,
+                        applicability_scope=str(row["applicability_scope"]),
+                        exemptions=globs_by_kind["exempt"],
+                        generated_artifact_paths=globs_by_kind["generated"],
+                    )
+                )
+                if issues:
+                    migrations.append(
+                        {
+                            "id": str(row["human_id"]),
+                            "status": str(row["status"]),
+                            "tier": str(row["tier"]),
+                            "issues": list(dict.fromkeys(issues)),
+                            "remediation": (
+                                f"agent-mesh decision amend {row['human_id']} ... --reason <reason>; "
+                                "the decision returns to Proposed for human re-approval"
+                            ),
+                        }
+                    )
+            return {
+                "complete": True,
+                "authoritative_decisions_checked": len(rows),
+                "migration_required": migrations,
+                "diagnostics": [],
+            }
+    except (ReadModelUnavailable, OSError, ValueError) as exc:
+        return {
+            "complete": False,
+            "authoritative_decisions_checked": 0,
+            "migration_required": [],
+            "diagnostics": [str(exc)[:1000]],
+        }
 
 
 def contract_file_status(path: Path) -> str:
@@ -230,6 +404,16 @@ def contract_text_status(text: str) -> str:
     end += len(END_MARKER)
     installed = text[start:end].rstrip() + "\n"
     return "current" if installed == managed_contract_block() else "stale"
+
+
+def managed_contract_text(text: str) -> str | None:
+    """Extract one complete managed block for duplicate-context measurement."""
+
+    start = text.find(START_PREFIX)
+    end = text.find(END_MARKER)
+    if start < 0 or end < start:
+        return None
+    return text[start : end + len(END_MARKER)].rstrip() + "\n"
 
 
 def legacy_decision_write_conflicts(repo: Path) -> list[dict[str, Any]]:
@@ -313,6 +497,43 @@ def _replace_or_append_contract(path: Path) -> bool:
     if updated == existing:
         return False
 
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(updated)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, file_mode)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    return True
+
+
+def _remove_contract(path: Path) -> bool:
+    if path.is_symlink():
+        raise AdoptionContractError(f"refusing to remove managed contract through symlink: {path}")
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise AdoptionContractError(f"cannot read instruction file: {path}") from exc
+    start = existing.find(START_PREFIX)
+    end = existing.find(END_MARKER)
+    if start < 0 and end < 0:
+        return False
+    if start < 0 or end < start:
+        raise AdoptionContractError(
+            f"managed contract markers are malformed in {path}; repair them before retrying"
+        )
+    end += len(END_MARKER)
+    if end < len(existing) and existing[end : end + 1] == "\n":
+        end += 1
+    updated = existing[:start] + existing[end:]
+    if updated == existing:
+        return False
+    file_mode = path.stat().st_mode & 0o777
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary_path = Path(temporary_name)
     try:

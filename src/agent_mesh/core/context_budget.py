@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from agent_mesh.adoption import managed_contract_text
 from agent_mesh.config import AgentMeshConfig
 from agent_mesh.core.decision_context import build_decision_context
 from agent_mesh.core.decision_digest import DecisionDigestOverflow, render_decision_digest
@@ -104,6 +105,19 @@ def _stable_root_file_bytes(
     if maximum_bytes < 1:
         raise _SourceReadFailure("oversize", "aggregate context-budget byte bound exhausted")
     path = root / relative
+    parent = root
+    for component in Path(relative).parts[:-1]:
+        parent /= component
+        try:
+            parent_stat = parent.lstat()
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise _SourceReadFailure("unreadable", str(exc)) from exc
+        if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(parent_stat.st_mode):
+            raise _SourceReadFailure(
+                "unsafe", "source parent is not a regular no-follow directory"
+            )
     try:
         before_path = path.lstat()
     except FileNotFoundError:
@@ -178,11 +192,14 @@ def _source_entry(
     config: AgentMeshConfig,
     relative: str,
     budget: _InspectionBudget,
+    *,
+    kind: str = "instruction_file",
+    residency_status: str = "unknown",
 ) -> dict[str, Any]:
     entry: dict[str, Any] = {
-        "kind": "instruction_file",
+        "kind": kind,
         "path": relative,
-        "residency_status": "unknown",
+        "residency_status": residency_status,
         "status": "missing",
         "bytes": 0,
         "estimated_tokens": 0,
@@ -206,6 +223,8 @@ def _source_entry(
         entry["status"] = exc.status
         entry["diagnostic"] = exc.detail[:1000]
         return entry
+    text = data.decode("utf-8")
+    managed_block = managed_contract_text(text)
     entry.update(
         {
             "status": "measured",
@@ -214,6 +233,10 @@ def _source_entry(
             "sha256": hashlib.sha256(data).hexdigest(),
         }
     )
+    if managed_block is not None:
+        encoded_block = managed_block.encode("utf-8")
+        entry["managed_contract_bytes"] = len(encoded_block)
+        entry["managed_contract_sha256"] = hashlib.sha256(encoded_block).hexdigest()
     return entry
 
 
@@ -334,6 +357,7 @@ def build_context_budget_report(
     )
     projects: list[dict[str, Any]] = []
     fingerprints: dict[str, list[dict[str, str]]] = {}
+    managed_contract_fingerprints: dict[str, list[dict[str, str]]] = {}
     complete = True
     total_bytes = 0
     total_ceiling = 0
@@ -341,6 +365,16 @@ def build_context_budget_report(
         sources = [
             _source_entry(config, relative, budget)
             for relative in config.context_budget.instruction_paths
+        ]
+        per_prompt_sources = [
+            _source_entry(
+                config,
+                relative,
+                budget,
+                kind="declared_per_prompt_context",
+                residency_status="per_prompt_candidate",
+            )
+            for relative in config.context_budget.per_prompt_paths
         ]
         try:
             hooks = _hook_entries(
@@ -363,7 +397,7 @@ def build_context_budget_report(
                     "diagnostic": str(exc)[:1000],
                 }
             ]
-        entries = [*sources, *hooks]
+        entries = [*sources, *per_prompt_sources, *hooks]
         project_bytes = sum(int(item["bytes"]) for item in entries)
         project_complete = all(
             item["status"] not in _INCOMPLETE_SOURCE_STATUSES
@@ -384,6 +418,15 @@ def build_context_budget_report(
                     "path": str(item["path"]),
                 }
             )
+            managed_digest = item.get("managed_contract_sha256")
+            if managed_digest:
+                managed_contract_fingerprints.setdefault(str(managed_digest), []).append(
+                    {
+                        "project_key": config.project_key,
+                        "kind": str(item["kind"]),
+                        "path": str(item["path"]),
+                    }
+                )
         projects.append(
             {
                 "project_key": config.project_key,
@@ -396,12 +439,18 @@ def build_context_budget_report(
                     "over" if project_bytes > config.context_budget.ceiling_bytes else "within"
                 ),
                 "sources": sources,
+                "per_prompt_sources": per_prompt_sources,
                 "hook_outputs": hooks,
             }
         )
     duplicates = [
         {"sha256": digest, "occurrences": occurrences}
         for digest, occurrences in sorted(fingerprints.items())
+        if len(occurrences) > 1
+    ]
+    managed_contract_duplicates = [
+        {"sha256": digest, "occurrences": occurrences}
+        for digest, occurrences in sorted(managed_contract_fingerprints.items())
         if len(occurrences) > 1
     ]
     return {
@@ -423,6 +472,7 @@ def build_context_budget_report(
         },
         "projects": projects,
         "exact_duplicates": duplicates,
+        "managed_contract_duplicates": managed_contract_duplicates,
     }
 
 
@@ -447,7 +497,11 @@ def render_context_budget_text(report: dict[str, Any]) -> str:
             f"\n{project['project_key']}: {project['candidate_resident_bytes']} bytes "
             f"(~{project['estimated_tokens']} tokens), ceiling={project['ceiling_status']}"
         )
-        for item in [*project["sources"], *project["hook_outputs"]]:
+        for item in [
+            *project["sources"],
+            *project["per_prompt_sources"],
+            *project["hook_outputs"],
+        ]:
             lines.append(
                 f"  {item['kind']}\t{item['status']}\t{item['bytes']}\t{item['path']}\t"
                 f"residency={item['residency_status']}"
@@ -456,6 +510,10 @@ def render_context_budget_text(report: dict[str, Any]) -> str:
                 lines.append(f"    warning: {item['diagnostic']}")
     lines.append(
         f"\nexact duplicate groups: {len(report['exact_duplicates'])}"
+    )
+    lines.append(
+        "managed contract duplicate groups: "
+        f"{len(report['managed_contract_duplicates'])}"
     )
     lines.append(
         "note: totals are candidate context, not proof that a harness loaded every source"

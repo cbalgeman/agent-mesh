@@ -554,6 +554,24 @@ narrow project-local V1 one-shot boundary above, with its trust source preserved
 as `project-local`. Do not relabel a local probe as official support or weaken an
 exact-continuity check to make a profile appear live. External/manual participation remains available without a driver.
 
+## Adoption targets
+
+The first successful `agent-mesh adopt --repo .` persists the managed instruction
+targets it selected:
+
+```toml
+[adoption]
+contract_targets = ["agents"]
+```
+
+Supported values are `agents` (`AGENTS.md`) and `claude` (`CLAUDE.md`). Repeating
+`--target` on a later adoption replaces this list deliberately. Without a
+persisted value, Agent Mesh selects `agents` and adds `claude` when Claude project
+configuration is present, except when a root `CLAUDE.md` already imports
+`AGENTS.md` with a standalone `@AGENTS.md` or `@./AGENTS.md` line. Applying a
+narrower target set removes only the marked Agent Mesh contract from unselected
+files; all repository-authored content remains.
+
 ## Context budget
 
 The report-only context inventory has conservative defaults:
@@ -563,6 +581,7 @@ The report-only context inventory has conservative defaults:
 ceiling_bytes = 131072
 instruction_paths = ["AGENTS.md", "CLAUDE.md", "MEMORY.md"]
 hook_sample_paths = ["AGENTS.md"]
+per_prompt_paths = []
 ```
 
 Run `agent-mesh doctor --context-budget`; add `--json` for the stable
@@ -570,9 +589,12 @@ Run `agent-mesh doctor --context-budget`; add `--json` for the stable
 reads of configured repository-root instruction files and generates bounded
 decision-digest samples for the configured repository-relative paths. It reports
 candidate bytes, a four-bytes-per-token estimate, ceiling status, residency
-unknowns, and exact duplicate hashes. It never recursively scans a repository or
+unknowns, exact whole-file hashes, and duplicate managed-contract blocks.
+`per_prompt_paths` may name bounded repository-relative files containing
+representative repeated-injection context. Agent Mesh measures those bytes with
+`per_prompt_candidate` residency but never executes hook code. It never recursively scans a repository or
 home directory, reads credentials, writes canonical state, or proves what a
-harness actually loaded. Ceiling overruns do not block work in 0.4.0.
+harness actually loaded. Ceiling overruns do not block work in 0.4.x.
 The command returns `0` for a complete report and `3` when a safety or inspection
 bound makes the report incomplete.
 

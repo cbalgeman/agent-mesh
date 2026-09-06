@@ -135,8 +135,11 @@ Confirm that the installed package and both command-line tools are available:
 ```bash
 python -m pip show my-agent-mesh
 python -c "import agent_mesh; print(agent_mesh.__version__)"
+agent-mesh --version
+agent-q --version
 agent-mesh --help
 agent-q --help
+agent-mesh doctor
 ```
 
 These commands inspect the installed PyPI distribution without modifying a
@@ -236,11 +239,16 @@ launches a model.
 - `agent-mesh check decisions --mode pr|staged|worktree|full --json` derives the
   actual local Git path set and evaluates it through the same mutation-free
   matcher. It keeps rename/copy and deleted paths, adds untracked paths in local
-  modes, never fetches or runs stored checks, and remains advisory in 0.4.0.
-- `agent-mesh doctor --context-budget` reports candidate resident bytes and
+  modes, never fetches or runs stored checks, and remains advisory in 0.4.x.
+  Repeat `--path <repo-relative-path>` to include a changed ignored/private file
+  that Git cannot discover.
+- `agent-mesh doctor` reports package provenance, adoption health, and historical
+  decision migrations. `agent-mesh doctor --context-budget` reports candidate resident bytes and
   estimated tokens for configured root instruction files and representative
-  decision-digest hook output. `--scope registered-projects` measures only the
-  explicit machine-local project registry; it never searches the home directory.
+  decision-digest hook output. Configured `per_prompt_paths` add representative
+  repeated-injection files without executing hooks. `--scope registered-projects`
+  measures only the explicit machine-local project registry; it never searches
+  the home directory.
 - Process a feedback REQ by retrieving it, recording findings on the same
   thread, and creating or linking backlog work when implementation is needed.
   Preserve the REQ as the provenance-bearing source for any derived backlog
@@ -263,15 +271,17 @@ another wave receives a separate durable-workstream-qualified handle and
 provider context. One-shot profiles still allocate a truthful terminal instance
 per run and never claim continuity.
 
-For an unmanaged compatibility fallback, a human can register a handle using a
-precomputed project-scoped digest. Never put a raw provider session reference in
-the command:
+For an unmanaged compatibility fallback, a human or explicitly identified local
+operator can register a handle using a precomputed project-scoped digest. Manual
+registration is a bootstrap event, so it never requires borrowing an existing
+chat's handle. It does not relax the handle requirement for later writes. Never
+put a raw provider session reference in the command:
 
 ```bash
 agent-mesh instance register --participant claude --provider anthropic \
-  --handle claude-case-study --workstream case-study
+  --handle claude-case-study --workstream case-study --actor human
 agent-mesh instance register --participant claude --provider anthropic \
-  --handle claude-design --workstream design-system
+  --handle claude-design --workstream design-system --actor human
 
 export AGENT_MESH_INSTANCE_ID=claude-case-study
 ```

@@ -489,6 +489,11 @@ def _validate_agent_instance_before_append(event: Event, events_path: Path) -> E
         raise EventProtocolError(str(exc)) from exc
 
     selected = event.actor_instance_id.strip()
+    manual_registration_bootstrap = (
+        event.kind == "agent_instance_registered"
+        and str(event.payload.get("registration_origin", "")).strip().lower() == "manual"
+        and str(event.payload.get("registrar", "")).strip() == event.actor
+    )
     if selected:
         matches = [
             item
@@ -510,7 +515,7 @@ def _validate_agent_instance_before_append(event: Event, events_path: Path) -> E
                 f"{instance.participant!r}, not {event.actor!r}"
             )
         event = replace(event, actor_instance_id=instance.id)
-    elif any(
+    elif not manual_registration_bootstrap and any(
         item.participant == event.actor and item.status == "active" for item in instances.values()
     ):
         raise EventProtocolError(
@@ -615,6 +620,10 @@ def _validate_agent_instance_before_append(event: Event, events_path: Path) -> E
             raise EventProtocolError(
                 f"PARTICIPANT_UNKNOWN: instance participant {participant!r} is not configured"
             )
+        registration_origin = str(payload.get("registration_origin", "legacy")).strip().lower()
+        registrar = str(payload.get("registrar", event.actor)).strip()
+        if registration_origin == "manual" and registrar != event.actor:
+            raise EventProtocolError("AGENT_INSTANCE_REGISTRAR_MISMATCH")
         runtime_profile = str(payload.get("runtime_profile", "")).strip()
         if runtime_profile:
             profile = config.runtime_profiles.get(runtime_profile)

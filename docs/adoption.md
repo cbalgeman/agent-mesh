@@ -208,18 +208,27 @@ never reassigned.
 6. Ask the human only for choices that cannot be inferred; then wait for the human's response before implementing the setup.
 7. Install or upgrade the published package with
    `python -m pip install --upgrade my-agent-mesh`, then run
-   `agent-mesh --help` and `agent-q --help`.
+   `agent-mesh --version`, `agent-q --version`, and `agent-mesh doctor`. The
+   doctor output distinguishes editable working-tree code from an installed
+   distribution and names the module and Python interpreter in use.
 8. Initialize or update the target repo using the approved participants and
    defaults so the decision log is available.
 9. If parallel work contexts need direct attribution or handoffs, configure a
    trusted runtime integration to perform the automatic identity handshake. Use
    `agent-mesh instance register --handle <participant>-<durable-role>` only as
-   an unmanaged compatibility fallback. Bind and address normal commands by
-   public handle, never by the hidden project-local ID. Do not infer provider
+   an unmanaged compatibility fallback. Registration itself is an unbound,
+   audited manual bootstrap and records its registrar; it never requires
+   borrowing another chat's handle. Bind and address every later command by the
+   correct public handle, never by the hidden project-local ID. Do not infer provider
    continuity from a process name or window; if a provider reference is needed,
    compute its project-scoped digest privately and supply only the digest.
 10. Run `agent-mesh adopt --repo .` to install the versioned managed instruction
-   contract, then run `agent-mesh adopt --repo . --check`. Remove or rewrite any
+   contract, persist the selected instruction targets, and report historical
+   decisions that need migration. A root `CLAUDE.md` line containing
+   `@AGENTS.md` selects one `AGENTS.md` contract by default; an explicit repeated
+   `--target` overrides detection. Agent Mesh removes only its own marked block
+   from an unselected target. Then run `agent-mesh adopt --repo . --check`.
+   Remove or rewrite any
    conflicting legacy instruction that still tells an agent to write a Markdown
    decision log. Tell the human that ordinary chat remains chat-only, durable
    coordination is promoted selectively, and ambiguous promotion waits for
@@ -756,7 +765,8 @@ actual `Edit` or `Write` path without making a permission decision.
 ### Context-budget inventory
 
 `agent-mesh doctor --context-budget` measures the configured repository-root
-instruction files plus representative `preflight --digest` output. The default
+instruction files, declared representative per-prompt context files, and
+representative `preflight --digest` output. The default
 files are `AGENTS.md`, `CLAUDE.md`, and `MEMORY.md`; missing files contribute
 zero bytes and unsafe or changing files make the report incomplete. Token counts
 use a transparent four-bytes-per-token estimate rather than claiming a provider
@@ -768,6 +778,8 @@ comparison across the explicit Agent Mesh project registry. The command does not
 walk project trees, `.claude`, user home directories, transcripts, or credentials,
 and it does not append canonical events. Exact duplicate hashes identify review
 candidates without claiming that differently worded instructions are equivalent.
+`managed_contract_duplicates` detects identical Agent Mesh-owned blocks inside
+otherwise different instruction files.
 The command exits `0` for a complete report and `3` when a safety or inspection
 bound makes the report incomplete. Registry enumeration, instruction reads, and
 in-memory canonical replay share one wall-clock, byte, and event budget.
@@ -779,18 +791,25 @@ Configure each repository independently:
 ceiling_bytes = 131072
 instruction_paths = ["AGENTS.md", "CLAUDE.md", "MEMORY.md"]
 hook_sample_paths = ["AGENTS.md"]
+per_prompt_paths = [".claude/representative-hook-output.txt"]
 ```
 
 Instruction paths are intentionally limited to repository-root files. Hook sample
 paths are repository-relative lexical paths used only for decision applicability;
-they are not opened as files. Exceeding the ceiling is report-only in 0.4.0.
+they are not opened as files. `per_prompt_paths` are bounded repository-relative
+files whose bytes represent context injected on each prompt; Agent Mesh measures
+them but never executes hook code. Dynamic hooks can maintain a safe representative
+output fixture when their actual output needs to be budgeted. Exceeding the ceiling
+is report-only in 0.4.x.
 
 ### Canonical decision tiers
 
 Tier IDs are fixed protocol semantics in 0.4.0. Projects may use decision tags for
 their own categories but cannot rename, remove, or weaken the five canonical tier
 IDs. Preserved historical values remain readable with `tier_valid=false` and no
-effective enforcement. Audit and normalize them explicitly:
+effective enforcement. `agent-mesh doctor` and `agent-mesh adopt --repo . --check`
+report accepted or in-force records that fail the current tier, scope, glob,
+owner, or verification contract. Audit and normalize them explicitly:
 
 ```bash
 agent-q decisions list --invalid-tier

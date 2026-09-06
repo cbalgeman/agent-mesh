@@ -1188,11 +1188,18 @@ def _validate_projected_instance_attribution(conn, record: dict[str, Any]) -> No
                 f"{instance_id} belongs to {row['participant']!r}, not {actor!r}",
             )
         return
+    payload = record.get("payload", {})
+    manual_registration_bootstrap = (
+        record.get("kind") == "agent_instance_registered"
+        and isinstance(payload, dict)
+        and str(payload.get("registration_origin", "")).strip().lower() == "manual"
+        and str(payload.get("registrar", "")).strip() == actor
+    )
     active = conn.execute(
         "SELECT id FROM agent_instances WHERE participant=? AND status='active' LIMIT 1",
         (actor,),
     ).fetchone()
-    if active is not None:
+    if active is not None and not manual_registration_bootstrap:
         raise AgentInstanceStopLine(
             "AGENT_INSTANCE_REQUIRED", f"participant {actor!r} has active registered instances"
         )

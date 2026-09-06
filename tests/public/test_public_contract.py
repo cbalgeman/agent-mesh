@@ -120,6 +120,64 @@ def test_context_budget_is_report_only_and_machine_readable(
     assert (tmp_path / ".agent-mesh" / "events.jsonl").read_bytes() == before
 
 
+def test_patch_upgrade_bootstraps_instances_and_persists_import_aware_adoption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert (
+        mail_cli.main(
+            [
+                "init",
+                "--participants",
+                "human,agent",
+                "--default-sender",
+                "agent",
+                "--default-recipient",
+                "human",
+                "--no-register",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    (tmp_path / "CLAUDE.md").write_text("# Runtime instructions\n\n@AGENTS.md\n", encoding="utf-8")
+    assert mail_cli.main(["adopt", "--repo", "."]) == 0
+    capsys.readouterr()
+    assert load_config(tmp_path).adoption.contract_targets == ("agents",)
+
+    for handle in ("agent-first", "agent-second"):
+        assert (
+            mail_cli.main(
+                [
+                    "instance",
+                    "register",
+                    "--participant",
+                    "agent",
+                    "--provider",
+                    "local",
+                    "--handle",
+                    handle,
+                    "--actor",
+                    "agent",
+                ]
+            )
+            == 0
+        )
+        capsys.readouterr()
+
+    assert mail_cli.main(["doctor"]) == 0
+    assert "contract targets: agents (persisted)" in capsys.readouterr().out
+    assert (
+        mail_cli.main(
+            ["request", "--from", "agent", "--to", "human", "Unbound", "must fail"]
+        )
+        == 2
+    )
+    assert "AGENT_INSTANCE_REQUIRED" in capsys.readouterr().err
+
+
 def test_context_bootstrap_zero_hook_baseline_is_complete_and_truthful(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

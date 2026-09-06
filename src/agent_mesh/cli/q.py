@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from agent_mesh import __version__
 from agent_mesh.config import AgentMeshConfig, ConfigError, load_config
 from agent_mesh.core.agent_instances import (
     INSTANCE_ID_RE,
@@ -316,6 +317,7 @@ def _authoring_actor(config, *, explicit_actor: str | None = None) -> str:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-q")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
         "--instance",
         help="authoring AI instance handle for read commands that append outcomes",

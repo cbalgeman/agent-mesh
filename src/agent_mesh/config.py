@@ -31,6 +31,7 @@ REVIEW_ASSURANCE_INDEPENDENCE_CHOICES = (
     "distinct_context",
     "distinct_instance_and_context",
 )
+ADOPTION_CONTRACT_TARGET_CHOICES = ("agents", "claude")
 DEFAULT_CONTEXT_BUDGET_BYTES = 128 * 1024
 MAX_CONTEXT_BUDGET_BYTES = 64 * 1024 * 1024
 MAX_CONTEXT_BUDGET_PATHS = 32
@@ -134,6 +135,14 @@ class ContextBudgetConfig:
     ceiling_bytes: int = DEFAULT_CONTEXT_BUDGET_BYTES
     instruction_paths: tuple[str, ...] = ("AGENTS.md", "CLAUDE.md", "MEMORY.md")
     hook_sample_paths: tuple[str, ...] = ("AGENTS.md",)
+    per_prompt_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AdoptionConfig:
+    """Persisted instruction targets selected by the repository owner."""
+
+    contract_targets: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -209,6 +218,7 @@ class AgentMeshConfig:
     decision_approval: DecisionApprovalConfig = field(default_factory=DecisionApprovalConfig)
     review_assurance: ReviewAssuranceConfig = field(default_factory=ReviewAssuranceConfig)
     context_budget: ContextBudgetConfig = field(default_factory=ContextBudgetConfig)
+    adoption: AdoptionConfig = field(default_factory=AdoptionConfig)
     adapters: dict[str, AdapterDeclaration] = field(default_factory=dict)
     runtime_profiles: dict[str, RuntimeProfile] = field(default_factory=dict)
 
@@ -669,7 +679,34 @@ def load_config(start: str | Path | None = None) -> AgentMeshConfig:
             "context_budget.hook_sample_paths",
             root_files_only=False,
         ),
+        per_prompt_paths=_context_budget_paths(
+            context_budget_data.get("per_prompt_paths", []),
+            "context_budget.per_prompt_paths",
+            root_files_only=False,
+        ),
     )
+
+    adoption_data = _table(data.get("adoption", {}), "adoption")
+    if "contract_targets" in adoption_data:
+        contract_targets = tuple(
+            _list_of_strings(
+                adoption_data.get("contract_targets"),
+                "adoption.contract_targets",
+            )
+        )
+        if not contract_targets:
+            raise ConfigError("adoption.contract_targets must contain at least one target")
+        if len(set(contract_targets)) != len(contract_targets):
+            raise ConfigError("adoption.contract_targets must not contain duplicates")
+        unknown_targets = sorted(set(contract_targets) - set(ADOPTION_CONTRACT_TARGET_CHOICES))
+        if unknown_targets:
+            raise ConfigError(
+                "adoption.contract_targets contains unknown target(s): "
+                + ", ".join(unknown_targets)
+            )
+        adoption = AdoptionConfig(contract_targets=contract_targets)
+    else:
+        adoption = AdoptionConfig()
 
     adapters = _adapter_declarations(data.get("adapters", None))
     dispatch_data = _table(data.get("dispatch", {}), "dispatch")
@@ -700,6 +737,7 @@ def load_config(start: str | Path | None = None) -> AgentMeshConfig:
         decision_approval=decision_approval,
         review_assurance=review_assurance,
         context_budget=context_budget,
+        adoption=adoption,
         adapters=adapters,
         runtime_profiles=runtime_profiles,
     )
@@ -794,6 +832,7 @@ def default_config_text(
         f"ceiling_bytes = {DEFAULT_CONTEXT_BUDGET_BYTES}\n"
         'instruction_paths = ["AGENTS.md", "CLAUDE.md", "MEMORY.md"]\n'
         'hook_sample_paths = ["AGENTS.md"]\n'
+        'per_prompt_paths = []\n'
         "\n"
         "[dispatch]\n"
         "\n"
@@ -875,6 +914,78 @@ def ensure_project_identity_config(
             timezone_name=timezone_name,
             project_key=project_key,
         )
+    finally:
+        lock.release()
+
+
+def ensure_adoption_contract_targets(
+    repo: str | Path,
+    targets: tuple[str, ...] | list[str],
+) -> bool:
+    """Persist the exact managed-instruction target set under a project lock."""
+
+    normalized = tuple(str(item).strip().lower() for item in targets)
+    if not normalized:
+        raise ConfigError("adoption.contract_targets must contain at least one target")
+    if len(set(normalized)) != len(normalized):
+        raise ConfigError("adoption.contract_targets must not contain duplicates")
+    unknown = sorted(set(normalized) - set(ADOPTION_CONTRACT_TARGET_CHOICES))
+    if unknown:
+        raise ConfigError(
+            "adoption.contract_targets contains unknown target(s): " + ", ".join(unknown)
+        )
+
+    root = find_project_root(repo)
+    lock = acquire(root / ".agent-mesh" / ".adoption-targets-lock")
+    try:
+        config_path = root / ".agent-mesh" / DEFAULT_CONFIG_NAME
+        text = config_path.read_bytes().decode("utf-8")
+        try:
+            data = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"cannot update invalid config {config_path}: {exc}") from exc
+        adoption = data.get("adoption")
+        if adoption is not None and not isinstance(adoption, dict):
+            raise ConfigError(f"cannot update non-table [adoption] in {config_path}")
+        current = adoption.get("contract_targets") if isinstance(adoption, dict) else None
+        if current is not None:
+            parsed = tuple(
+                _list_of_strings(current, "adoption.contract_targets")
+            )
+            if parsed == normalized:
+                return False
+
+        assignment = "contract_targets = " + json.dumps(list(normalized)) + "\n"
+        lines = text.splitlines(keepends=True)
+        adoption_start = next(
+            (index for index, line in enumerate(lines) if line.strip() == "[adoption]"),
+            None,
+        )
+        if adoption_start is None:
+            separator = "" if not text or text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
+            updated = f"{text}{separator}[adoption]\n{assignment}"
+        else:
+            adoption_end = len(lines)
+            for index in range(adoption_start + 1, len(lines)):
+                if lines[index].lstrip().startswith("["):
+                    adoption_end = index
+                    break
+            candidates = [
+                index
+                for index in range(adoption_start + 1, adoption_end)
+                if re.match(r"^[ \t]*contract_targets[ \t]*=", lines[index])
+            ]
+            if len(candidates) > 1:
+                raise ConfigError(
+                    f"cannot update duplicate adoption.contract_targets assignments in {config_path}"
+                )
+            if candidates:
+                lines[candidates[0]] = assignment
+            else:
+                lines.insert(adoption_end, assignment)
+            updated = "".join(lines)
+        _atomic_write_text(config_path, updated)
+        return True
     finally:
         lock.release()
 

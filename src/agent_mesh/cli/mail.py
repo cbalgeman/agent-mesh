@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -19,11 +20,14 @@ from typing import Any
 import tempfile
 from zoneinfo import ZoneInfo
 
+from agent_mesh import __version__
 from agent_mesh.adoption import (
     CONTRACT_TARGETS,
     AdoptionContractError,
     contract_status,
     install_contract,
+    remove_unselected_contracts,
+    selected_contract_targets,
 )
 from agent_mesh.config import (
     AgentMeshConfig,
@@ -32,6 +36,7 @@ from agent_mesh.config import (
     STATE_SHARING_LOCAL_ONLY,
     default_config_text,
     detect_local_timezone,
+    ensure_adoption_contract_targets,
     ensure_project_identity_config,
     ensure_project_dirs,
     load_config,
@@ -59,7 +64,7 @@ from agent_mesh.core.decision_schema import (
     parse_decision_evidence_entries,
     read_verified_decision_body,
 )
-from agent_mesh.core.decision_applicability import DecisionPathError
+from agent_mesh.core.decision_applicability import DecisionPathError, normalize_candidate_paths
 from agent_mesh.core.decision_context import (
     build_decision_context,
     build_unavailable_decision_context,
@@ -291,6 +296,7 @@ def _cross_project_authoring_actor(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-mesh")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
         "--instance",
         help="authoring AI instance handle; alternatively set AGENT_MESH_INSTANCE_ID",
@@ -343,7 +349,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default="",
         help="precomputed project-scoped SHA-256 session digest for unmanaged recovery",
     )
-    instance_register.add_argument("--actor")
+    instance_register.add_argument(
+        "--actor",
+        help="explicit local registrar for this unbound manual bootstrap event",
+    )
     instance_register.set_defaults(func=cmd_instance_register)
 
     instance_update = instance_sub.add_parser("update")
@@ -382,7 +391,10 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="targets",
         action="append",
         choices=tuple(CONTRACT_TARGETS),
-        help="instruction target; repeat to install more than one (default: AGENTS plus detected Claude)",
+        help=(
+            "instruction target; repeat to install more than one; apply persists the exact set "
+            "(default: import-aware detection, then persisted choice)"
+        ),
     )
     adopt.add_argument(
         "--check",
@@ -887,7 +899,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "decisions",
         description=(
             "Evaluate applicable decisions against one local Git change set. "
-            "Version 0.4.0 results are advisory and never execute stored verification."
+            "Version 0.4.x results are advisory and never execute stored verification."
         ),
     )
     decision_check.add_argument(
@@ -898,6 +910,15 @@ def _build_parser() -> argparse.ArgumentParser:
     decision_check.add_argument(
         "--base",
         help="local Git ref used only by pr/full mode (default: main)",
+    )
+    decision_check.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        help=(
+            "also evaluate an explicit repository-relative path, including ignored/private "
+            "files; may repeat"
+        ),
     )
     decision_check.add_argument("--json", action="store_true")
     decision_check.set_defaults(func=cmd_check_decisions)
@@ -1037,7 +1058,26 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     if not args.context_budget:
-        raise ConfigError("doctor currently requires --context-budget")
+        if args.scope != "repo" or args.path:
+            raise ConfigError("doctor --scope and --path require --context-budget")
+        config = load_config()
+        status = contract_status(config.project_root)
+        provenance = _package_provenance()
+        report = {
+            "schema": "agent-mesh.doctor.v1",
+            "package": provenance,
+            "project": {
+                "project_key": config.project_key,
+                "project_root": str(config.project_root),
+            },
+            "adoption": status,
+            "healthy": bool(status["adoption_ready"] and provenance["version_consistent"]),
+        }
+        if args.json:
+            print(json.dumps(report, sort_keys=True))
+        else:
+            print(_render_doctor_text(report))
+        return 0 if report["healthy"] else 1
     deadline = time.monotonic() + CONTEXT_BUDGET_TIMEOUT_SECONDS
     current = load_config()
     configs: dict[Path, AgentMeshConfig] = {
@@ -1064,6 +1104,96 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         print(render_context_budget_text(report))
     return 0 if report["complete"] else 3
+
+
+def _package_provenance() -> dict[str, Any]:
+    module_path = Path(__file__).resolve().parents[1]
+    distribution_version: str | None = None
+    distribution_location: str | None = None
+    install_kind = "source_tree"
+    distributions = list(importlib.metadata.distributions(name="my-agent-mesh"))
+    matching = [item for item in distributions if item.version == __version__]
+    distribution = matching[0] if matching else (distributions[0] if distributions else None)
+    if distribution is not None:
+        distribution_version = distribution.version
+        distribution_root = Path(distribution.locate_file("")).resolve()
+        distribution_location = str(distribution_root)
+        install_kind = "installed_distribution"
+        try:
+            direct_url = json.loads(distribution.read_text("direct_url.json") or "{}")
+        except (json.JSONDecodeError, UnicodeError):
+            direct_url = {}
+        if isinstance(direct_url, dict) and bool(
+            (direct_url.get("dir_info") or {}).get("editable")
+            if isinstance(direct_url.get("dir_info"), dict)
+            else False
+        ):
+            install_kind = "editable"
+        elif not module_path.is_relative_to(distribution_root):
+            install_kind = "editable_or_linked_source"
+    return {
+        "name": "my-agent-mesh",
+        "version": __version__,
+        "distribution_version": distribution_version,
+        "distribution_versions": sorted({item.version for item in distributions}),
+        "version_consistent": not distributions or bool(matching),
+        "install_kind": install_kind,
+        "module_path": str(module_path),
+        "distribution_location": distribution_location,
+        "python_executable": sys.executable,
+    }
+
+
+def _render_doctor_text(report: dict[str, Any]) -> str:
+    package = report["package"]
+    status = report["adoption"]
+    lines = [
+        f"Agent Mesh doctor: {'HEALTHY' if report['healthy'] else 'NEEDS ATTENTION'}",
+        (
+            f"package: {package['name']} {package['version']} "
+            f"({package['install_kind']}; version_consistent="
+            f"{str(bool(package['version_consistent'])).lower()})"
+        ),
+        f"module: {package['module_path']}",
+        f"python: {package['python_executable']}",
+        (
+            "contract targets: "
+            + ", ".join(status["selected_targets"])
+            + f" ({status['target_source']})"
+        ),
+    ]
+    if len(package["distribution_versions"]) > 1:
+        lines.append(
+            "distribution metadata versions: "
+            + ", ".join(package["distribution_versions"])
+        )
+    for item in status["files"]:
+        lines.append(f"  {item['target']}\t{item['status']}\t{item['path']}")
+    lines.append(
+        "agent contract: "
+        + ("healthy" if status["healthy"] else "incomplete or conflicting")
+        + f" (v{status['version']} {status['digest']})"
+    )
+    health = status["decision_health"]
+    if health["complete"]:
+        migrations = health["migration_required"]
+        lines.append(
+            "decision migration: "
+            + ("current" if not migrations else f"required ({len(migrations)})")
+        )
+        for item in migrations:
+            lines.append(
+                f"  {item['id']}\t{item['status']}\t{item['tier']}\t"
+                + "; ".join(item["issues"])
+            )
+            lines.append(f"    repair: {item['remediation']}")
+    else:
+        lines.append(
+            "decision migration: unavailable ("
+            + "; ".join(health.get("diagnostics", []))
+            + ")"
+        )
+    return "\n".join(lines)
 
 
 def cmd_instance_register(args: argparse.Namespace) -> int:
@@ -1099,6 +1229,8 @@ def cmd_instance_register(args: argparse.Namespace) -> int:
                 "label": label,
                 "workstream": args.workstream.strip(),
                 "runtime_profile": args.runtime_profile.strip(),
+                "registration_origin": "manual",
+                "registrar": actor,
                 "external_session_ref_digest": validate_external_session_ref_digest(
                     args.external_session_ref_digest
                 ),
@@ -1237,8 +1369,9 @@ def cmd_adopt(args: argparse.Namespace) -> int:
             + ("healthy" if status["healthy"] else "incomplete or conflicting")
             + f" (v{status['version']} {status['digest']})"
         )
+        _print_decision_migration_status(status)
         _print_context_delivery_status(status)
-        return 0 if status["healthy"] else 1
+        return 0 if status["adoption_ready"] else 1
 
     identity_update = ensure_project_identity_config(
         root,
@@ -1250,11 +1383,22 @@ def cmd_adopt(args: argparse.Namespace) -> int:
         f"{identity_action}\tproject-identity\t.agent-mesh/config.toml\t"
         f"{identity_update.project_key}\t{identity_update.timezone}"
     )
-    results = install_contract(root, targets=args.targets)
+    ensure_project_dirs(load_config(root))
+    selected_targets = selected_contract_targets(root, args.targets)
+    results = install_contract(root, targets=selected_targets)
     for result in results:
         action = "updated" if result.changed else "current"
         print(f"{action}\t{result.target}\t{result.path}")
-    status = contract_status(root, targets=args.targets)
+    removed = remove_unselected_contracts(root, selected_targets=selected_targets)
+    for result in removed:
+        if result.changed:
+            print(f"removed\t{result.target}\t{result.path}")
+    targets_changed = ensure_adoption_contract_targets(root, selected_targets)
+    print(
+        f"{'updated' if targets_changed else 'current'}\tcontract-targets\t"
+        + ",".join(selected_targets)
+    )
+    status = contract_status(root)
     for conflict in status["conflicts"]:
         print(
             f"warning: conflicting legacy decision-write guidance at "
@@ -1267,8 +1411,32 @@ def cmd_adopt(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"agent contract: healthy (v{status['version']} {status['digest']})")
+    _print_decision_migration_status(status)
     _print_context_delivery_status(status)
-    return 0
+    return 0 if status["adoption_ready"] else 1
+
+
+def _print_decision_migration_status(status: dict[str, Any]) -> None:
+    health = status.get("decision_health", {})
+    if not health.get("complete"):
+        diagnostics = health.get("diagnostics", [])
+        detail = diagnostics[0] if diagnostics else "canonical decision state unavailable"
+        print(f"decision migration: unavailable ({detail})")
+        return
+    migrations = health.get("migration_required", [])
+    if not migrations:
+        print(
+            "decision migration: current "
+            f"({health.get('authoritative_decisions_checked', 0)} authoritative checked)"
+        )
+        return
+    print(f"decision migration: required ({len(migrations)} authoritative decision(s))")
+    for item in migrations:
+        print(
+            f"  {item['id']}\t{item['status']}\t{item['tier']}\t"
+            + "; ".join(item["issues"])
+        )
+        print(f"    repair: {item['remediation']}")
 
 
 def _print_context_delivery_status(status: dict[str, Any]) -> None:
@@ -2956,6 +3124,14 @@ def cmd_check_refs(args: argparse.Namespace) -> int:
         "input_warnings": input_warnings,
     }
     if result.get("complete") is not True:
+        result["diagnostics"] = [
+            (
+                f"{diagnostic}; narrow with --paths <glob>, --file <path>, or --ci-mode pr"
+                if "budget" in str(diagnostic) and "--file" not in str(diagnostic)
+                else str(diagnostic)
+            )
+            for diagnostic in result.get("diagnostics", [])
+        ]
         rendered, _ = render_bounded_reference_context_json(result)
         if args.json:
             print(rendered)
@@ -3298,14 +3474,18 @@ def cmd_check_decisions(args: argparse.Namespace) -> int:
         mode=args.mode,
         base=args.base,
     )
+    explicit_paths = normalize_candidate_paths(args.path)
+    candidate_paths = normalize_candidate_paths([*change_set.paths, *explicit_paths])
     with open_read_model(config) as snapshot:
         result = build_decision_context(
             config,
             snapshot,
-            change_set.paths,
+            candidate_paths,
             boundary="change_review",
             change_set=change_set,
         )
+        if explicit_paths:
+            result["request"]["explicit_paths"] = list(explicit_paths)
         if args.json:
             rendered, complete = render_bounded_decision_context_json(result)
             print(rendered)
