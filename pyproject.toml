@@ -32,7 +32,7 @@ Changelog = "https://github.com/cbalgeman/agent-mesh/blob/main/CHANGELOG.md"
 [project.optional-dependencies]
 test = [
     "pytest>=7",
-    "ruff>=0.4",
+    "ruff==0.16.6",
 ]
 
 [project.scripts]
@@ -45,6 +45,9 @@ where = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/public"]
