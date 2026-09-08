@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -24,6 +25,7 @@ from agent_mesh.core.agent_instances import (
     selected_agent_instance,
 )
 from agent_mesh.core.decision_schema import (
+    DecisionBodyIntegrityError,
     VERIFICATION_EXECUTABLE_STATUSES,
     VERIFICATION_EXECUTION_MODE_ARGV,
     VERIFICATION_EXECUTION_MODE_LEGACY_ARGV,
@@ -31,6 +33,7 @@ from agent_mesh.core.decision_schema import (
     decision_lineage_summary,
     decision_review_progress,
     normalize_decision_review_policy,
+    read_verified_decision_body,
 )
 from agent_mesh.core.decision_projection import decision_revision_sha_from_projection
 from agent_mesh.core.decision_applicability import (
@@ -186,12 +189,29 @@ MAX_REFERENCE_INPUT_BYTES = 2 * 1024 * 1024
 MAX_REFERENCE_FILE_BYTES = 1024 * 1024
 MAX_REFERENCE_FILES = 1_000
 MAX_REFERENCE_PATH_BYTES = 4_096
+MAX_DECISION_QUERY_SOURCE_BYTES = 64 * 1024 * 1024
+MAX_DECISION_QUERY_EVENTS = 50_000
+MAX_DECISION_QUERY_SECONDS = 30.0
+MAX_DECISION_LIST_RESULTS = 500
+MAX_DECISION_BODY_OUTPUT_BYTES = 512 * 1024
 DECISION_HOOK_REQUEST_SCHEMA = "agent-mesh.decision-hook-request.v1"
 DECISION_HOOK_BOUNDARIES = frozenset({"edit", "write"})
 
 
 class DecisionHookRequestError(ValueError):
     """Raised when the provider-neutral hook request is malformed."""
+
+
+def _decision_list_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 1 <= limit <= MAX_DECISION_LIST_RESULTS:
+        raise argparse.ArgumentTypeError(
+            f"must be between 1 and {MAX_DECISION_LIST_RESULTS}"
+        )
+    return limit
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -508,6 +528,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     dec_list.add_argument("--scope")
     dec_list.add_argument("--owner")
+    dec_list.add_argument(
+        "--incomplete",
+        action="store_true",
+        help="show only decisions that are incomplete under the current contract",
+    )
+    dec_list.add_argument(
+        "--limit",
+        type=_decision_list_limit,
+        default=MAX_DECISION_LIST_RESULTS,
+        help=f"maximum rows to print (1-{MAX_DECISION_LIST_RESULTS})",
+    )
     dec_list.set_defaults(func=cmd_decisions_list)
 
     show = decision_sub.add_parser("show")
@@ -515,6 +546,11 @@ def _build_parser() -> argparse.ArgumentParser:
     show.add_argument("--references", action="store_true")
     show.add_argument("--evidence", action="store_true")
     show.add_argument("--assumptions", action="store_true")
+    show.add_argument(
+        "--body",
+        action="store_true",
+        help="include the integrity-checked canonical Markdown body",
+    )
     show.add_argument(
         "--diagnostics",
         action="store_true",
@@ -1632,7 +1668,12 @@ def _single_line(value: object) -> str:
 
 def cmd_decisions_list(args: argparse.Namespace) -> int:
     config = load_config()
-    with open_read_model(config) as snapshot:
+    with open_read_model(
+        config,
+        max_bytes=MAX_DECISION_QUERY_SOURCE_BYTES,
+        max_events=MAX_DECISION_QUERY_EVENTS,
+        deadline_monotonic=time.monotonic() + MAX_DECISION_QUERY_SECONDS,
+    ) as snapshot:
         conn = snapshot.conn
         scoped_ids: set[str] | None = None
         if args.scope:
@@ -1664,19 +1705,35 @@ def cmd_decisions_list(args: argparse.Namespace) -> int:
             sql += " AND owner=?"
             params.append(args.owner)
         sql += " ORDER BY human_id"
+        emitted = 0
         for row in conn.execute(sql, params):
             if scoped_ids is not None and str(row["human_id"]) not in scoped_ids:
                 continue
             tier = row["tier"] if row["tier_valid"] else f"{row['tier']} [INVALID]"
             issues = _decision_completeness_from_projection(conn, row)
+            if args.incomplete and not issues:
+                continue
+            if emitted >= args.limit:
+                print(
+                    f"warning: decision list truncated after {args.limit} results; "
+                    "refine the filters or request a smaller scope",
+                    file=sys.stderr,
+                )
+                break
             completeness = "complete" if not issues else "INCOMPLETE"
             print(f"{row['human_id']}\t{row['status']}\t{tier}\t{completeness}\t{row['title']}")
+            emitted += 1
     return 0
 
 
 def cmd_decisions_show(args: argparse.Namespace) -> int:
     config = load_config()
-    with open_read_model(config) as snapshot:
+    with open_read_model(
+        config,
+        max_bytes=MAX_DECISION_QUERY_SOURCE_BYTES,
+        max_events=MAX_DECISION_QUERY_EVENTS,
+        deadline_monotonic=time.monotonic() + MAX_DECISION_QUERY_SECONDS,
+    ) as snapshot:
         conn = snapshot.conn
         dec_ulid = resolve_decision(conn, args.identifier)
         if dec_ulid is None:
@@ -1784,7 +1841,74 @@ def cmd_decisions_show(args: argparse.Namespace) -> int:
                 print(
                     f"reference {item['file_path']}:{item['line_start']} {item['reference_form']}"
                 )
+        if args.body:
+            body = _decision_body_for_cli(config, row, meta)
+            print("body:")
+            sys.stdout.write(body)
+            if not body.endswith("\n"):
+                print()
     return 0
+
+
+def _decision_body_for_cli(config: AgentMeshConfig, row, meta: dict[str, Any]) -> str:
+    """Resolve the current canonical body without trusting a compatibility view."""
+
+    body_path = str(row["body_path"] or "")
+    body_sha = str(row["body_sha"] or "")
+    body_bytes = int(row["body_bytes"] or 0)
+    if body_bytes > MAX_DECISION_BODY_OUTPUT_BYTES:
+        raise ReadModelUnavailable(
+            f"decision body is {body_bytes} bytes; --body is limited to "
+            f"{MAX_DECISION_BODY_OUTPUT_BYTES} bytes"
+        )
+    if body_path:
+        try:
+            data = read_verified_decision_body(
+                config.agent_dir,
+                body_path=body_path,
+                body_sha=body_sha,
+                body_bytes=body_bytes,
+                max_bytes=MAX_DECISION_BODY_OUTPUT_BYTES,
+            )
+            return data.decode("utf-8")
+        except (DecisionBodyIntegrityError, UnicodeDecodeError) as exc:
+            raise ReadModelUnavailable(f"decision body integrity check failed: {exc}") from exc
+
+    legacy_body = meta.get("legacy_markdown_body")
+    if isinstance(legacy_body, str):
+        data = legacy_body.encode("utf-8")
+        observed_sha = hashlib.sha256(data).hexdigest()
+        if len(data) != body_bytes or observed_sha != body_sha:
+            raise ReadModelUnavailable(
+                "decision body integrity check failed: embedded legacy body does not "
+                "match the current canonical size and digest"
+            )
+        return legacy_body
+
+    if body_bytes:
+        raise ReadModelUnavailable(
+            "decision body is referenced by canonical metadata but no readable body is available"
+        )
+
+    sections: list[str] = []
+    for label, value in (
+        ("Context", meta.get("context")),
+        ("Decision", meta.get("decision")),
+        ("Consequences", meta.get("consequences")),
+        ("Rejected Alternatives", meta.get("rejected_alternatives")),
+    ):
+        if isinstance(value, list):
+            rendered = "\n".join(f"- {item}" for item in value if str(item).strip())
+        else:
+            rendered = str(value or "").strip()
+        if rendered:
+            sections.append(f"## {label}\n{rendered}")
+    body = "\n\n".join(sections) + ("\n" if sections else "")
+    if len(body.encode("utf-8")) > MAX_DECISION_BODY_OUTPUT_BYTES:
+        raise ReadModelUnavailable(
+            f"decision body exceeds the {MAX_DECISION_BODY_OUTPUT_BYTES}-byte --body limit"
+        )
+    return body
 
 
 def _decision_completeness_from_projection(conn, row) -> tuple[str, ...]:

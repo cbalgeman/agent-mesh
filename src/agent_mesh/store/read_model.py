@@ -26,6 +26,9 @@ class ReadModelUnavailable(RuntimeError):
     """Raised when a verified canonical query snapshot cannot be established safely."""
 
 
+_SNAPSHOT_READ_CHUNK_BYTES = 64 * 1024
+
+
 @dataclass(frozen=True)
 class CanonicalEventSnapshot:
     """One stable, hash-chain-verified capture of the canonical event log."""
@@ -374,25 +377,57 @@ def _stable_bytes_with_identity(
     for _ in range(attempts):
         if _deadline_expired(deadline_monotonic):
             raise ReadModelUnavailable("canonical snapshot exceeded its time budget")
+        descriptor: int | None = None
         try:
-            before = path.stat()
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path, flags)
+            before = os.fstat(descriptor)
             if not stat.S_ISREG(before.st_mode):
                 raise ReadModelUnavailable("canonical event log is not a regular file")
             if max_bytes is not None and before.st_size > max_bytes:
                 raise ReadModelUnavailable(
                     f"canonical event log exceeds the {max_bytes}-byte read budget"
                 )
-            data = path.read_bytes()
-            after = path.stat()
+            chunks: list[bytes] = []
+            captured_bytes = 0
+            while True:
+                if _deadline_expired(deadline_monotonic):
+                    raise ReadModelUnavailable("canonical snapshot exceeded its time budget")
+                read_size = _SNAPSHOT_READ_CHUNK_BYTES
+                if max_bytes is not None:
+                    read_size = min(read_size, max_bytes - captured_bytes + 1)
+                chunk = os.read(descriptor, read_size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                captured_bytes += len(chunk)
+                if max_bytes is not None and captured_bytes > max_bytes:
+                    raise ReadModelUnavailable(
+                        f"canonical event log exceeds the {max_bytes}-byte read budget"
+                    )
+                if _deadline_expired(deadline_monotonic):
+                    raise ReadModelUnavailable("canonical snapshot exceeded its time budget")
+            data = b"".join(chunks)
+            after = os.fstat(descriptor)
+            current = path.stat()
         except ReadModelUnavailable:
             raise
         except OSError as exc:
             raise ReadModelUnavailable(f"cannot read canonical event log: {exc}") from exc
+        finally:
+            if descriptor is not None:
+                _close_descriptor(descriptor)
         if _deadline_expired(deadline_monotonic):
             raise ReadModelUnavailable("canonical snapshot exceeded its time budget")
         before_identity = _source_identity(before)
         after_identity = _source_identity(after)
-        if before_identity == after_identity and len(data) == before.st_size:
+        current_identity = _source_identity(current)
+        if (
+            before_identity == after_identity == current_identity
+            and len(data) == before.st_size
+        ):
             return data, before_identity
     raise ReadModelUnavailable("canonical event log changed during bounded snapshot capture")
 

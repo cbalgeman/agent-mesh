@@ -3,6 +3,54 @@
 All notable public changes to Agent Mesh are recorded here. Agent Mesh is
 pre-1.0, so minor releases may change command or storage contracts.
 
+## [0.4.2] - 2026-09-07
+
+Agent Mesh 0.4.2 closes the remaining review and approval traps found during
+real adoption rehearsals. It is a compatibility patch for every repository
+that already has AI-agent instances or imported decision records.
+
+### What is fixed for people using Agent Mesh
+
+- Approve or reject a decision as yourself even when an AI-agent instance is
+  registered under the same participant name. Direct human controls remain
+  instance-free and cannot be attributed to an AI-agent handle; ordinary agent
+  writes still require the correct active instance.
+- Retire flagged review evidence through the same direct-human authority rule.
+  This keeps human correction controls distinct from agent identity without
+  weakening the existing authority checks.
+- Find every decision that needs repair with
+  `agent-q decisions list --incomplete`, including valid-tier records whose
+  paths, owner, scope, or verification fields do not satisfy the current
+  contract. Decision-list output is capped at 500 rows and reports when filters
+  must be narrowed.
+- Read the actual decision under review with
+  `agent-q decisions show <D-id> --body`. Native bodies are verified against
+  their stored size and digest; imported legacy bodies are read from canonical
+  event data and receive the same integrity check. Focused decision reads use a
+  bounded canonical replay, and `--body` refuses bodies larger than 512 KiB.
+  Large bodies remain opt-in so normal metadata lookups stay compact.
+- Detect writable Markdown decision registers during `adopt --check`, including
+  common files such as `DECISIONS.md` and decision/ADR documents under `docs/`.
+  Read-only compatibility guidance is not treated as a conflict.
+
+### Upgrade steps
+
+1. Back up the target repository's `.agent-mesh` directory and install
+   `my-agent-mesh==0.4.2`.
+2. Confirm the active installation with `agent-mesh --version` and
+   `agent-mesh doctor`.
+3. Run `agent-mesh adopt --repo . --check`. If it identifies a writable
+   Markdown decision register, preserve the source for migration but stop using
+   it as a second write surface.
+4. Run `agent-q decisions list --incomplete`. Review each result with
+   `agent-q decisions show <D-id> --body` before amending, rejecting, or asking
+   the human to approve it.
+5. Run `agent-q verify-chain`, then refresh an installed managed Workbench with
+   `agent-mesh workbench service repair`.
+
+This patch does not mass-approve decisions, rewrite imported history, or infer
+replacement decision metadata. Those remain explicit project and human choices.
+
 ## [0.4.1] - 2026-09-06
 
 Agent Mesh 0.4.1 removes upgrade traps found while adopting 0.4.0 in a mature,
@@ -350,6 +398,7 @@ compatibility reader can still load their supported top-level values, but
 adoption cannot safely synthesize the missing project identity table without a
 reviewed migration.
 
+[0.4.2]: https://github.com/cbalgeman/agent-mesh/releases/tag/v0.4.2
 [0.4.1]: https://github.com/cbalgeman/agent-mesh/releases/tag/v0.4.1
 [0.4.0]: https://github.com/cbalgeman/agent-mesh/releases/tag/v0.4.0
 [0.3.0]: https://github.com/cbalgeman/agent-mesh/releases/tag/v0.3.0

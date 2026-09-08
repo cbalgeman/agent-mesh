@@ -195,7 +195,9 @@ launches a model.
 - `agent-q packet --id <REQ-or-RES-id>` retrieves bounded thread context;
   `agent-q backlog get <BKL-id>` retrieves a work item; and
   `agent-q decisions show <D-id>` retrieves canonical decision metadata,
-  status, affected paths, checks, and verification state.
+  status, affected paths, checks, and verification state. Add `--body` when the
+  exact integrity-checked Markdown is needed for review; large bodies are
+  intentionally opt-in.
 - `agent-q refs resolve <ID>... --json` batch-resolves decision, request,
   response, backlog, and agent-instance references from one verified snapshot.
   It returns canonical titles or handles, lifecycle status, revision/body
@@ -362,7 +364,12 @@ visible with `tier_valid=false` and effective enforcement `none`; find them with
 `agent-q decisions list --invalid-tier`, then append an explicit correction with
 `agent-mesh decision amend <D-id> --tier <canonical-tier> --reason <reason>`.
 Correcting an accepted or in-force decision returns it to Proposed for fresh
-direct-human approval. Use decision tags for project-specific categorization.
+direct-human approval. Use `agent-q decisions list --incomplete` to find valid-tier
+records that still fail current scope, path, owner, or verification requirements.
+The list prints at most 500 results and warns when filters must be narrowed.
+`agent-q decisions show <D-id> --body` verifies the canonical body and reads at
+most 512 KiB through a bounded canonical snapshot. Use decision tags for
+project-specific categorization.
 
 Backlog references are work-item history, not normative authority. Their JSON
 resolution keeps summary, root-cause, disposition, and notes separate; consumers
@@ -512,7 +519,10 @@ opaque repo ID rather than filesystem path; all feedback, attachments,
 request-status changes, backlog updates, and decision reads/writes are resolved
 against that repo on the server. A repository Markdown decision log is not a
 second write surface: when one is needed for compatibility, it must be generated
-from Agent Mesh and treated as read-only. The bookmark is static, while live reads and writes
+from Agent Mesh and treated as read-only. `agent-mesh adopt --repo . --check`
+also reports common writable decision-register instructions, including
+`DECISIONS.md` and decision/ADR documents under `docs/`. The bookmark is static,
+while live reads and writes
 require the loopback server. With the automatic service, native supervision and
 the page's reconnect loop keep that server available. When an endpoint-capable
 managed process detects package drift, its authenticated bookmark records one

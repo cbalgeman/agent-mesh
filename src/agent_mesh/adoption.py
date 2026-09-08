@@ -101,19 +101,31 @@ ADOPTION_DECISION_TIMEOUT_SECONDS = 10.0
 LEGACY_DECISION_WRITE_RE = re.compile(
     r"(?i)(?:"
     r"(?:record|document|append|update|edit|write|authoritative|source[ -]of[ -]truth)"
-    r"[^\n]{0,140}decision[_ -]?log\.md"
-    r"|decision[_ -]?log\.md[^\n]{0,140}"
+    r"[^\n]{0,140}(?:decision[_ -]?log|decisions?)\.md"
+    r"|(?:decision[_ -]?log|decisions?)\.md[^\n]{0,140}"
     r"(?:record|document|append|update|edit|write|authoritative|source[ -]of[ -]truth)"
-    r"|\bdecisions?\b[^\n]{0,80}\|?\s*`?decision[_ -]?log\.md"
+    r"|\bdecisions?\b[^\n]{0,80}\|?\s*`?(?:decision[_ -]?log|decisions?)\.md"
     r")"
 )
 NEGATED_LEGACY_DECISION_WRITE_RE = re.compile(
     r"(?i)(?:"
     r"\b(?:do not|don't|never|must not|may not|should not)\b[^\n]{0,120}"
-    r"decision[_ -]?log\.md"
-    r"|decision[_ -]?log\.md[^\n]{0,80}\b(?:read[ -]?only|not writable)\b"
+    r"(?:decision[_ -]?log|decisions?)\.md"
+    r"|(?:decision[_ -]?log|decisions?)\.md[^\n]{0,80}"
+    r"\b(?:read[ -]?only|not writable)\b"
     r")"
 )
+LEGACY_DECISION_DOCUMENT_WRITE_RE = re.compile(
+    r"(?i)^\s*(?:(?:[-*+]\s+)|(?:\d+[.)]\s+))?"
+    r"(?:"
+    r"(?:add|create)\b[^\n]{0,80}\b(?:new|next|another)\b[^\n]{0,40}\b(?:entry|record)\b"
+    r"|(?:append|write|edit|maintain)\b[^\n]{0,120}\bthis (?:document|file|log)\b"
+    r"|update\b[^\n]{0,40}\bstatus\b[^\n]{0,80}\b(?:if|when)\b[^\n]{0,40}"
+    r"\bdecision\b"
+    r")"
+)
+SUPPORTED_DECISION_WRITE_RE = re.compile(r"(?i)\b(?:agent-mesh decision|Workbench)\b")
+DECISION_DOCUMENT_STEM_RE = re.compile(r"(?i)(?:decision|(?:^|[-_])adrs?(?:[-_]|$))")
 
 
 class AdoptionContractError(ConfigError):
@@ -144,9 +156,9 @@ def managed_contract_block() -> str:
 def default_contract_targets(repo: Path) -> list[str]:
     root = repo.expanduser().resolve()
     targets = ["agents"]
-    if (
-        (root / "CLAUDE.md").exists() or (root / ".claude").exists()
-    ) and not claude_imports_agents(root):
+    if ((root / "CLAUDE.md").exists() or (root / ".claude").exists()) and not claude_imports_agents(
+        root
+    ):
         targets.append("claude")
     return targets
 
@@ -178,8 +190,7 @@ def claude_imports_agents(repo: Path) -> bool:
     except (OSError, UnicodeError):
         return False
     return any(
-        re.fullmatch(r"\s*@(?:\./)?AGENTS\.md\s*", line) is not None
-        for line in text.splitlines()
+        re.fullmatch(r"\s*@(?:\./)?AGENTS\.md\s*", line) is not None for line in text.splitlines()
     )
 
 
@@ -309,7 +320,7 @@ def decision_migration_status(config) -> dict[str, Any]:
             conn = snapshot.conn
             migrations: list[dict[str, Any]] = []
             rows = conn.execute(
-                "SELECT dec_ulid, human_id, status, tier, tier_valid, owner, "
+                "SELECT dec_ulid, human_id, status, tier, owner, "
                 "applicability_scope FROM decisions "
                 "WHERE status IN ('accepted', 'in_force') ORDER BY human_id"
             ).fetchall()
@@ -336,12 +347,7 @@ def decision_migration_status(config) -> dict[str, Any]:
                         (row["dec_ulid"],),
                     )
                 ]
-                issues: list[str] = []
-                if not bool(row["tier_valid"]):
-                    issues.append(
-                        f"historical tier {str(row['tier'])!r} is not in the canonical tier set"
-                    )
-                issues.extend(
+                issues = list(
                     decision_completeness_issues(
                         tier=str(row["tier"]),
                         owner=str(row["owner"] or ""),
@@ -426,6 +432,9 @@ def legacy_decision_write_conflicts(repo: Path) -> list[dict[str, Any]]:
             for path in claude_root.rglob("*")
             if path.is_file() and not path.is_symlink() and path.suffix.lower() in {".md", ".py"}
         )
+    decision_documents = _legacy_decision_document_candidates(root)
+    candidates.extend(decision_documents)
+    decision_document_set = set(decision_documents)
 
     conflicts: list[dict[str, Any]] = []
     for path in sorted(set(candidates)):
@@ -441,8 +450,15 @@ def legacy_decision_write_conflicts(repo: Path) -> list[dict[str, Any]]:
                 in_managed_block = True
             if (
                 not in_managed_block
-                and LEGACY_DECISION_WRITE_RE.search(line)
+                and (
+                    LEGACY_DECISION_WRITE_RE.search(line)
+                    or (
+                        path in decision_document_set
+                        and LEGACY_DECISION_DOCUMENT_WRITE_RE.search(line)
+                    )
+                )
                 and not NEGATED_LEGACY_DECISION_WRITE_RE.search(line)
+                and not SUPPORTED_DECISION_WRITE_RE.search(line)
             ):
                 conflicts.append(
                     {
@@ -454,6 +470,30 @@ def legacy_decision_write_conflicts(repo: Path) -> list[dict[str, Any]]:
             if END_MARKER in line:
                 in_managed_block = False
     return conflicts
+
+
+def _legacy_decision_document_candidates(root: Path) -> list[Path]:
+    """Find likely writable Markdown decision registers without scanning source trees."""
+
+    search_roots = [root]
+    for relative in ("docs", "documentation"):
+        candidate = root / relative
+        if candidate.is_dir() and not candidate.is_symlink():
+            search_roots.append(candidate)
+
+    candidates: set[Path] = set()
+    for search_root in search_roots:
+        iterator = search_root.glob("*.md") if search_root == root else search_root.rglob("*.md")
+        for path in iterator:
+            if not path.is_file() or path.is_symlink():
+                continue
+            relative = path.relative_to(root)
+            normalized_parts = {part.lower() for part in relative.parts[:-1]}
+            if DECISION_DOCUMENT_STEM_RE.search(path.stem) or any(
+                DECISION_DOCUMENT_STEM_RE.search(part) for part in normalized_parts
+            ):
+                candidates.add(path)
+    return sorted(candidates)
 
 
 def _normalize_targets(targets: list[str]) -> list[str]:

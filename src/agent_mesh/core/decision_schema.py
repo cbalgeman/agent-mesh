@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
 from dataclasses import dataclass
@@ -119,6 +120,7 @@ def read_verified_decision_body(
     body_path: str,
     body_sha: str,
     body_bytes: int,
+    max_bytes: int | None = None,
 ) -> bytes:
     """Read a stable repository body only when path, size, and digest all agree."""
 
@@ -133,16 +135,27 @@ def read_verified_decision_body(
         candidate.relative_to(root)
     except ValueError as exc:
         raise DecisionBodyIntegrityError("canonical body path escapes .agent-mesh") from exc
+    if max_bytes is not None and max_bytes < 0:
+        raise DecisionBodyIntegrityError("canonical body read limit must not be negative")
     try:
-        before = candidate.stat()
-        data = candidate.read_bytes()
-        after = candidate.stat()
+        with candidate.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            if max_bytes is not None and before.st_size > max_bytes:
+                raise DecisionBodyIntegrityError(
+                    f"canonical body exceeds the {max_bytes}-byte read limit"
+                )
+            data = handle.read(-1 if max_bytes is None else max_bytes + 1)
+            after = os.fstat(handle.fileno())
     except OSError as exc:
         raise DecisionBodyIntegrityError(f"canonical body cannot be read: {exc}") from exc
     before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
     after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
     if before_identity != after_identity:
         raise DecisionBodyIntegrityError("canonical body changed during integrity verification")
+    if max_bytes is not None and len(data) > max_bytes:
+        raise DecisionBodyIntegrityError(
+            f"canonical body exceeds the {max_bytes}-byte read limit"
+        )
     if len(data) != int(body_bytes):
         raise DecisionBodyIntegrityError(
             f"canonical body size mismatch: expected {body_bytes}, found {len(data)}"
@@ -211,9 +224,7 @@ def normalize_decision_assumptions(values: Iterable[Any] | None) -> list[dict[st
             raise ValueError(f"duplicate assumption id: {assumption_id}")
         if text in seen_text:
             raise ValueError(f"duplicate assumption text: {text}")
-        normalized.append(
-            {"id": assumption_id, "text": text, "references": references}
-        )
+        normalized.append({"id": assumption_id, "text": text, "references": references})
         seen_ids.add(assumption_id)
         seen_text.add(text)
     return normalized
@@ -238,9 +249,7 @@ def normalize_decision_evidence(
             )
         if isinstance(raw_values, str):
             values = [raw_values]
-        elif isinstance(raw_values, list) and all(
-            isinstance(item, str) for item in raw_values
-        ):
+        elif isinstance(raw_values, list) and all(isinstance(item, str) for item in raw_values):
             values = raw_values
         elif allow_extensions:
             values = raw_values if isinstance(raw_values, list) else [raw_values]
@@ -300,11 +309,12 @@ def normalize_decision_review_policy(
             raise ValueError("approval_quorum requires at least one required reviewer")
         return {}
     configured = set(normalize_decision_strings(participants)) if participants is not None else None
-    unknown_reviewers = [reviewer for reviewer in reviewers if configured is not None and reviewer not in configured]
+    unknown_reviewers = [
+        reviewer for reviewer in reviewers if configured is not None and reviewer not in configured
+    ]
     if unknown_reviewers:
         raise ValueError(
-            "required reviewer(s) are not configured participants: "
-            + ", ".join(unknown_reviewers)
+            "required reviewer(s) are not configured participants: " + ", ".join(unknown_reviewers)
         )
     raw_quorum = value.get("approval_quorum")
     quorum = len(reviewers) if raw_quorum is None else raw_quorum
@@ -341,11 +351,7 @@ def decision_current_revision_events(meta: Any) -> list[Mapping[str, Any]]:
         )
         if returns_to_proposed or any(field != "status" for field in fields):
             boundary = index
-    return [
-        item
-        for item in event_log[boundary + 1 :]
-        if isinstance(item, Mapping)
-    ]
+    return [item for item in event_log[boundary + 1 :] if isinstance(item, Mapping)]
 
 
 def decision_review_progress(meta: Any, revision_sha: str) -> dict[str, Any]:
@@ -353,9 +359,7 @@ def decision_review_progress(meta: Any, revision_sha: str) -> dict[str, Any]:
 
     if not isinstance(meta, Mapping):
         meta = {}
-    policy = normalize_decision_review_policy(
-        meta.get("review_policy", {}), allow_extensions=True
-    )
+    policy = normalize_decision_review_policy(meta.get("review_policy", {}), allow_extensions=True)
     required = list(policy.get("required_reviewers", []))
     quorum = int(policy.get("approval_quorum") or 0)
     approved: set[str] = set()
@@ -410,13 +414,9 @@ def _canonical_decision_assumptions_for_digest(
         canonical: list[dict[str, Any]] = []
         for index, value in enumerate(values or (), start=1):
             if isinstance(value, Mapping):
-                assumption_id = str(
-                    value.get("id") or value.get("assumption_id") or f"A{index}"
-                )
+                assumption_id = str(value.get("id") or value.get("assumption_id") or f"A{index}")
                 text = str(value.get("text") or value.get("statement") or "")
-                references = value.get(
-                    "references", value.get("references_decisions", [])
-                )
+                references = value.get("references", value.get("references_decisions", []))
             else:
                 assumption_id = f"A{index}"
                 text = str(value)
@@ -746,6 +746,12 @@ def decision_completeness_issues(
     globs = normalize_decision_strings(affected_code_globs)
     commands = normalize_decision_verification(verification)
     scope = applicability_scope_for(applicability_scope, globs)
+
+    if not is_valid_decision_tier(tier):
+        issues.append(
+            f"historical tier {tier!r} is not in the canonical tier set; use one of: "
+            + ", ".join(DECISION_TIERS)
+        )
 
     issues.extend(
         decision_applicability_issues(

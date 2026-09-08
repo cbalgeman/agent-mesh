@@ -60,6 +60,10 @@ from agent_mesh.core.dispatch_schema import (
 )
 from agent_mesh.core.events import Event, utc_now
 from agent_mesh.core.hashing import canonical_json, hash_event_line
+from agent_mesh.core.human_authority import (
+    has_persisted_direct_human_authority,
+    is_direct_human_control_event,
+)
 from agent_mesh.core.provenance import (
     body_authority_for_payload,
     body_fidelity_for_payload,
@@ -87,7 +91,7 @@ from agent_mesh.store.sqlite import (
 # Bump this whenever replay semantics change in a way that requires existing
 # SQLite projections to be regenerated. Event-log equality alone cannot detect
 # a package upgrade that changes how historical events are interpreted.
-PROJECTION_VERSION = "15"
+PROJECTION_VERSION = "16"
 
 DECISION_PARENT_MISSING = "DECISION_PARENT_MISSING"
 DECISION_SUPERSEDE_TARGET_INVALID = "DECISION_SUPERSEDE_TARGET_INVALID"
@@ -1087,7 +1091,7 @@ def _project_record(conn, record: dict[str, Any], config: AgentMeshConfig) -> No
     except AgentInstanceError as exc:
         code, _, detail = str(exc).partition(": ")
         raise AgentInstanceStopLine(code, detail or str(exc)) from exc
-    _validate_projected_instance_attribution(conn, record)
+    _validate_projected_instance_attribution(conn, record, config)
     if kind in INSTANCE_EVENT_KINDS:
         _project_agent_instance_event(conn, record, config)
     elif kind == "req_created":
@@ -1169,10 +1173,27 @@ def _project_record(conn, record: dict[str, Any], config: AgentMeshConfig) -> No
     _project_instance_last_seen(conn, record)
 
 
-def _validate_projected_instance_attribution(conn, record: dict[str, Any]) -> None:
+def _validate_projected_instance_attribution(
+    conn, record: dict[str, Any], config: AgentMeshConfig
+) -> None:
     actor = str(record.get("actor", ""))
     instance_id = str(record.get("actor_instance_id", "")).strip()
+    kind = str(record.get("kind", ""))
+    payload = record.get("payload", {})
+    if not isinstance(payload, dict):
+        payload = {}
+    direct_human_control = is_direct_human_control_event(kind, payload)
+    direct_human_authorized = has_persisted_direct_human_authority(
+        kind=kind,
+        actor=actor,
+        payload=payload,
+    )
     if instance_id:
+        if direct_human_control:
+            raise AgentInstanceStopLine(
+                "AGENT_INSTANCE_FORBIDDEN_FOR_HUMAN_EVENT",
+                f"{kind} must record direct human authority without an AI-agent instance",
+            )
         row = conn.execute(
             "SELECT participant, status FROM agent_instances WHERE id=?", (instance_id,)
         ).fetchone()
@@ -1188,7 +1209,6 @@ def _validate_projected_instance_attribution(conn, record: dict[str, Any]) -> No
                 f"{instance_id} belongs to {row['participant']!r}, not {actor!r}",
             )
         return
-    payload = record.get("payload", {})
     manual_registration_bootstrap = (
         record.get("kind") == "agent_instance_registered"
         and isinstance(payload, dict)
@@ -1199,7 +1219,7 @@ def _validate_projected_instance_attribution(conn, record: dict[str, Any]) -> No
         "SELECT id FROM agent_instances WHERE participant=? AND status='active' LIMIT 1",
         (actor,),
     ).fetchone()
-    if active is not None and not manual_registration_bootstrap:
+    if active is not None and not direct_human_authorized and not manual_registration_bootstrap:
         raise AgentInstanceStopLine(
             "AGENT_INSTANCE_REQUIRED", f"participant {actor!r} has active registered instances"
         )
@@ -3867,6 +3887,9 @@ def _project_decision_proposed(conn, record: dict[str, Any]) -> None:
         "generated_artifact_paths": payload.get("generated_artifact_paths", []),
         "author_provenance": _decision_revision_author_provenance(conn, record),
     }
+    if isinstance(payload.get("legacy_markdown_body"), str):
+        meta["legacy_markdown_body"] = payload["legacy_markdown_body"]
+        meta["legacy_body_source"] = str(payload.get("legacy_body_source") or "")
     verification = normalize_decision_verification(payload.get("verification", []))
     drift_risk = _max_drift_risk(
         item.get("drift_risk") for item in verification if isinstance(item, dict)

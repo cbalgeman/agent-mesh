@@ -28,6 +28,11 @@ from agent_mesh.core.dispatch_schema import (
     validate_dispatch_payload,
 )
 from agent_mesh.core.hashing import SENTINEL_PREV_HASH, canonical_json, hash_event_line
+from agent_mesh.core.human_authority import (
+    has_current_direct_human_authority,
+    has_persisted_direct_human_authority,
+    is_direct_human_control_event,
+)
 from agent_mesh.core.ids import new_ulid
 from agent_mesh.core.provenance import ProvenanceValidationError, validate_event_provenance
 from agent_mesh.core.workflow_origin import (
@@ -489,12 +494,18 @@ def _validate_agent_instance_before_append(event: Event, events_path: Path) -> E
         raise EventProtocolError(str(exc)) from exc
 
     selected = event.actor_instance_id.strip()
+    direct_human_control = is_direct_human_control_event(event.kind, event.payload)
     manual_registration_bootstrap = (
         event.kind == "agent_instance_registered"
         and str(event.payload.get("registration_origin", "")).strip().lower() == "manual"
         and str(event.payload.get("registrar", "")).strip() == event.actor
     )
     if selected:
+        if direct_human_control:
+            raise EventProtocolError(
+                "AGENT_INSTANCE_FORBIDDEN_FOR_HUMAN_EVENT: "
+                f"{event.kind} must record direct human authority without an AI-agent instance"
+            )
         matches = [
             item
             for item in instances.values()
@@ -515,8 +526,13 @@ def _validate_agent_instance_before_append(event: Event, events_path: Path) -> E
                 f"{instance.participant!r}, not {event.actor!r}"
             )
         event = replace(event, actor_instance_id=instance.id)
-    elif not manual_registration_bootstrap and any(
-        item.participant == event.actor and item.status == "active" for item in instances.values()
+    elif (
+        not direct_human_control
+        and not manual_registration_bootstrap
+        and any(
+            item.participant == event.actor and item.status == "active"
+            for item in instances.values()
+        )
     ):
         raise EventProtocolError(
             f"AGENT_INSTANCE_REQUIRED: participant {event.actor!r} has active registered instances; "
@@ -800,6 +816,26 @@ def _validate_stateful_event_before_append(
 
     config = config_from_agent_dir(agent_dir)
     if event.kind in DECISION_EVENT_KINDS:
+        if (
+            event.kind in {"decision_accepted", "decision_rejected"}
+            and has_persisted_direct_human_authority(
+                kind=event.kind,
+                actor=event.actor,
+                payload=event.payload,
+            )
+            and not has_current_direct_human_authority(
+                kind=event.kind,
+                actor=event.actor,
+                payload=event.payload,
+                approval_identities=config.decision_approval_identities,
+                approval_authority_mode=config.decision_approval_authority_mode,
+                approval_authority_revision=config.decision_approval_authority_revision,
+            )
+        ):
+            raise EventProtocolError(
+                "DECISION_DIRECT_HUMAN_AUTHORITY_INVALID: "
+                f"{event.kind} must bind the current configured human authority"
+            )
         if decision_receipt is None:
             rebuild_result = rebuild_all(config)
             expected_table_hashes = tuple(sorted(rebuild_result.table_hashes.items()))
@@ -902,9 +938,7 @@ def _validate_stateful_event_before_append(
                 or event.payload.get("approval_authority_revision")
                 != config.decision_approval_authority_revision
             ):
-                raise EventProtocolError(
-                    f"REVIEW_ASSURANCE_HUMAN_AUTHORITY_STALE: {event.actor}"
-                )
+                raise EventProtocolError(f"REVIEW_ASSURANCE_HUMAN_AUTHORITY_STALE: {event.actor}")
         if event.kind == "review_assurance_recorded":
             from agent_mesh.core.assurance import (
                 AssuranceResolutionError,

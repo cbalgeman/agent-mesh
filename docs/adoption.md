@@ -591,6 +591,10 @@ revision, and Approve and accept records the human's direct approval action. An
 accepted or in-force decision that is edited must include a reason and returns
 to Proposed until the human accepts it again. Repository Markdown decision logs
 are optional generated compatibility views, never writable tracking surfaces.
+The adoption check reports imperative write instructions in common root-level
+decision registers and decision/ADR Markdown under `docs/`; preserve such files
+as migration evidence, but remove their write authority before declaring
+adoption healthy.
 
 Tell the human to bookmark the Workbench file path. With the automatic service,
 the native supervisor starts the server at sign-in and the page retries its
@@ -813,9 +817,15 @@ owner, or verification contract. Audit and normalize them explicitly:
 
 ```bash
 agent-q decisions list --invalid-tier
+agent-q decisions list --incomplete
+agent-q decisions show D123 --body
 agent-mesh decision amend D123 --tier architecture_contract \
   --reason "Normalize the imported historical tier"
 ```
+
+The incomplete list is capped at 500 results and warns when filters must be
+narrowed. Focused list and show commands use a bounded canonical snapshot;
+`--body` verifies the canonical body and refuses output larger than 512 KiB.
 
 An accepted or in-force record returns to Proposed after this revision and needs
 fresh direct-human approval. Agent Mesh never silently rewrites the historical
