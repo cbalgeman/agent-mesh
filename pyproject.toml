@@ -32,7 +32,7 @@ Changelog = "https://github.com/cbalgeman/agent-mesh/blob/main/CHANGELOG.md"
 [project.optional-dependencies]
 test = [
     "pytest>=7",
-    "ruff==0.16.6",
+    "ruff==0.16.10",
 ]
 
 [project.scripts]
